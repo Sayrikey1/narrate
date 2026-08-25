@@ -25,7 +25,7 @@ from rich.table import Table
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from narrate import audio, ledger
+from narrate import audio, ledger, templates
 from narrate import media as media_mod
 from narrate import probe as probe_mod
 from narrate import produce as produce_mod
@@ -60,7 +60,7 @@ from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
 from narrate.registry import ModelSpec, Registry, detect_drift, save_observed
 from narrate.runner import generate as run_generate
-from narrate.script_parse import format_time
+from narrate.script_parse import format_time, parse_script
 from narrate.settings import MissingAPIKey, Settings, get_settings, resolve_provider
 from narrate.suggest import MODEL_RATES, SuggestionRun, estimate_tokens, suggest_for_chunks
 from narrate.timeline import build_timeline
@@ -731,6 +731,60 @@ def cast_remove(project: str, name: str) -> None:
 
 script_app = typer.Typer(no_args_is_help=True, help="Scripts (episodes).")
 app.add_typer(script_app, name="script")
+
+
+@script_app.command("template")
+def script_template(
+    kind: str = typer.Argument("single-voice", help="single-voice or multi-voice."),
+    out: Path = typer.Option(None, "--out", "-o", help="Where to write it."),
+    show: bool = typer.Option(False, "--show", help="Print it instead of writing a file."),
+) -> None:
+    """Write a starter script you can edit and generate from.
+
+    The template is annotated in HTML comments, which are stripped before
+    anything is sent — so it explains itself *and* generates correctly with
+    every comment left in place. Nothing has to be deleted first.
+    """
+    try:
+        template = templates.get(kind)
+    except KeyError as exc:
+        _die(str(exc).strip('"'))
+
+    body = template.read()
+
+    if show:
+        console.print(body)
+        return
+
+    target = out or Path(template.filename)
+    if target.is_dir():
+        target = target / template.filename
+    if target.exists():
+        _die(f"{target} already exists. Pass --out to write somewhere else.")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding="utf-8")
+
+    # What it produces, so the numbers are visible before anything is spent.
+    parsed = parse_script(body)
+    console.print(f"[green]Wrote[/green] {target}  [dim]({template.title})[/dim]")
+    console.print(
+        f"[dim]As-is it narrates {len(parsed.text):,} characters"
+        + (f", with {len(parsed.slots)} effect cue(s)" if parsed.slots else "")
+        + (f" and {len(parsed.speakers)} speaker(s)" if parsed.speakers else "")
+        + ". Every comment is stripped before sending.[/dim]"
+    )
+    console.print(f"[dim]Next:  narrate script add {target} --project <name>[/dim]")
+
+
+@script_app.command("templates")
+def script_templates() -> None:
+    """List the starter scripts. Costs nothing."""
+    table = Table("template", "what it covers", show_header=True, header_style="bold")
+    for template in templates.all_templates():
+        table.add_row(f"[bold]{template.slug}[/bold]", template.summary)
+    console.print(table)
+    console.print("[dim]narrate script template <name> --out my-episode.md[/dim]")
 
 
 @script_app.command("add")

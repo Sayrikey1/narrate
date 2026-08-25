@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 40 CLI commands, 33 HTTP endpoints, 7 pages, and 414 Python plus 67
+memory — 42 CLI commands, 35 HTTP endpoints, 7 pages, and 448 Python plus 67
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -37,6 +37,7 @@ narration around it.
 | `[CAST] Morag = <voice_id>` | Declare who speaks in this script |
 | `[VOICE: Morag]` | Switch speaker mid-paragraph |
 | `Morag: her line` | A speaker turn — **only** when Morag is cast |
+| `<!-- a note -->` | A comment. Never narrated, never billed |
 
 **Markdown is layout, not speech**, so it is stripped too. Emphasis, links,
 inline code, bullets and quote marks lose their syntax and keep their words;
@@ -44,6 +45,21 @@ images and rules go entirely; a heading is dropped outright, because
 `# The Keeper's Log` would otherwise be narrated in front of the episode that is
 already called that. Ordinary prose survives untouched: `5 * 3`,
 `output_format` and `$0.19` are all left alone, and that is a test.
+
+---
+
+### Starter templates
+
+`narrate script template single-voice|multi-voice`, and download buttons beside
+the upload box in the UI. Each is annotated in HTML comments — stripped before
+anything is sent — so a template is guidance **and** a working script, and
+generates correctly with every note left in place.
+
+That promise is enforced rather than asserted: `tests/test_templates.py` parses
+every shipped template and fails if a single word of guidance reaches the
+narration. It caught the obvious trap on the first run — the opening comment
+described the comment syntax, and the closing delimiter inside it ended the
+comment early, exactly as HTML says it should.
 
 ---
 
@@ -258,12 +274,12 @@ builds the WAL index and creates files.
 
 ## 10. Surfaces
 
-**CLI** — 40 commands across `project`, `script`, `chunk`, `cast`, `cut`,
+**CLI** — 42 commands across `project`, `script`, `chunk`, `cast`, `cut`,
 `effects`, `cost`, `db`, plus `doctor`, `models`, `voices`, `estimate`,
 `generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`, `serve`
 and `probe`.
 
-**HTTP** — 33 endpoints. Deliberately thin: every one calls the same functions
+**HTTP** — 35 endpoints. Deliberately thin: every one calls the same functions
 the CLI does. Two entry points that disagreed about what a re-roll costs would
 be worse than having one.
 
@@ -294,7 +310,7 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 414 Python + 67 frontend. None touches the network |
+| Tests | 448 Python + 67 frontend. None touches the network |
 | Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `formats`, `media`, `cost *`, `db *`, and every voice audition |
 
 `narrate probe --live` is the only command that spends without being asked

@@ -955,3 +955,12 @@ button.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--acc
 /* A number field wide enough for two digits and no wider. */
 .narrow-field { width: 84px; flex: none; }
 @media (max-width: 900px) { .narrow-field { width: auto; } }
+
+/* Starter scripts, offered next to the upload box. */
+.templates {
+  display: grid; gap: var(--s-2);
+  margin-top: var(--s-4); padding-top: var(--s-4);
+  border-top: 1px solid var(--line-soft);
+  font-size: var(--t-sm);
+}
+.templates .faint { font-size: var(--t-xs); line-height: 1.45; }

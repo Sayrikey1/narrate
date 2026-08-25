@@ -17,6 +17,7 @@ Grammar, deliberately narrow so ordinary prose cannot trip it:
     [CAST] Morag = <voice_id>     declare who is in this script
     [VOICE: Morag]                everything after this is Morag speaking
     Morag: the line she speaks    the same thing, in script form
+    <!-- a note to yourself -->   never narrated, never billed
 
 **A speaker prefix only counts if the name is cast.** `Morag:` becomes a
 speaker change when Morag is a declared cast member and stays ordinary prose
@@ -72,6 +73,13 @@ _DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?)[ \t]*s(?:ec(?:onds?)?)?$", re.IGNOR
 # Markdown that would otherwise be spoken. Every pattern here is deliberately
 # conservative: prose containing a lone asterisk or an underscore inside a word
 # must survive untouched, because a false positive silently edits narration.
+# HTML comments. Markdown-native, invisible when rendered, and therefore the
+# natural way to annotate a script — which is exactly why they must not be
+# narrated. `DOTALL` because a comment spanning lines is the useful kind.
+# One flanking space is absorbed, so a comment removed from mid-sentence leaves
+# one space rather than two. A stranded space is a billed character.
+_COMMENT_RE = re.compile(r"[ \t]?<!--.*?-->[ \t]?", re.DOTALL)
+
 _FENCE_RE = re.compile(r"^[ \t]{0,3}(?:```|~~~)")
 _HEADING_RE = re.compile(r"^[ \t]{0,3}(#{1,6})[ \t]+(.*?)[ \t]*#*[ \t]*$")
 _RULE_RE = re.compile(r"^[ \t]{0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$")
@@ -106,6 +114,13 @@ def strip_formatting(text: str) -> tuple[str, list[str]]:
     """
     notes: list[str] = []
     headings: list[str] = []
+
+    # Comments go first, before anything else looks at the text. A script
+    # written from the downloadable template is mostly guidance in comments,
+    # and left in place every word of it would be read aloud and billed for.
+    text, comment_notes = _strip_comments(text)
+    notes += comment_notes
+
     lines = text.split("\n")
     out: list[str] = []
     in_fence = False
@@ -150,6 +165,34 @@ def strip_formatting(text: str) -> tuple[str, list[str]]:
     # chunker does not see an extra paragraph break where a title used to be.
     clean = re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", clean).strip()
     return clean, notes
+
+
+def _strip_comments(text: str) -> tuple[str, list[str]]:
+    """Remove `<!-- ... -->`, and refuse to guess about an unterminated one.
+
+    An unterminated comment is the interesting case. HTML says it swallows
+    everything to the end of the document, and a Markdown renderer will do
+    exactly that — which here would silently delete the rest of the episode.
+    Losing words is the one mistake that cannot be undone downstream, so a
+    stray `<!--` is left in place and reported instead. Narrating four odd
+    characters is recoverable; narrating nothing at all is not.
+    """
+
+    def swap(match: re.Match[str]) -> str:
+        # Whitespace on both sides means the comment sat inside a sentence, so
+        # one space has to survive. Otherwise it was on its own, and nothing
+        # should be left behind.
+        raw = match.group(0)
+        return " " if raw[:1] in " \t" and raw[-1:] in " \t" else ""
+
+    cleaned = _COMMENT_RE.sub(swap, text)
+    if "<!--" not in cleaned:
+        return cleaned, []
+    return cleaned, [
+        "An unterminated `<!--` is left in the narration rather than guessed at — "
+        "closing it with `-->` would delete everything after it. Close the comment "
+        "or remove it."
+    ]
 
 
 def _inline(line: str) -> str:

@@ -12,6 +12,7 @@ import type {
   GenerateStarted,
   ScriptCreated,
   ScriptSummary,
+  ScriptTemplate,
   Slot,
   Timeline,
   Voice,
@@ -138,6 +139,11 @@ export const api = {
       `/api/scripts/${id}/effects/generate`,
       { dry_run },
     ),
+
+  templates: () => request<ScriptTemplate[]>("/api/templates"),
+  /** `download` makes the browser save it rather than show it. */
+  templateUrl: (slug: string, download = false) =>
+    `/api/templates/${encodeURIComponent(slug)}${download ? "?download=1" : ""}`,
 
   formats: () => request<AudioFormatInfo[]>("/api/formats"),
   export: (id: number, formats?: string[], pieceFormat?: string) =>

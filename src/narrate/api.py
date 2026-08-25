@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, select
 
-from narrate import audio, ledger, previews
+from narrate import audio, ledger, previews, templates
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
@@ -495,6 +495,38 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                     f'attachment; filename="{safe or f"script-{script_id}"}.{format}"'
                 )
             },
+        )
+
+    @app.get("/api/templates")
+    def list_templates() -> list[dict[str, str]]:
+        """Starter scripts. Costs nothing."""
+        return [
+            {"slug": t.slug, "title": t.title, "summary": t.summary, "filename": t.filename}
+            for t in templates.all_templates()
+        ]
+
+    @app.get("/api/templates/{slug}")
+    def get_template(slug: str, download: bool = False) -> Response:
+        """One starter script, as text or as a download.
+
+        Served as `text/markdown` so the browser shows it inline by default;
+        `?download=1` makes it save instead. Both come from the same file the
+        CLI writes, so the guidance cannot drift between the two.
+        """
+        try:
+            template = templates.get(slug)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc).strip('"')) from exc
+
+        headers = (
+            {"Content-Disposition": f'attachment; filename="{template.filename}"'}
+            if download
+            else {}
+        )
+        return Response(
+            content=template.read(),
+            media_type="text/markdown; charset=utf-8",
+            headers=headers,
         )
 
     @app.get("/api/formats")

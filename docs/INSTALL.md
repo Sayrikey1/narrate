@@ -298,8 +298,24 @@ path:
 ```bash
 just demo               # one voice, five chunks, five cues, exported
 just demo-dialogue      # two speakers, both modes
-just check              # 414 Python + 67 frontend tests
+just check              # 448 Python + 67 frontend tests
 ```
+
+---
+
+## ✍️ Writing your first script
+
+Do not start from a blank file. Write a template and edit it:
+
+```bash
+narrate script templates                              # single-voice, multi-voice
+narrate script template single-voice -o my-episode.md
+```
+
+Every explanation in it sits in an HTML comment, which is stripped before
+anything reaches the provider — so you can generate from the file as it stands,
+then replace the prose with your own. The same two templates are download
+buttons beside the upload box in the web UI.
 
 ---
 

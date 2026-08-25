@@ -1,7 +1,7 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
-import type { Project } from "../types";
-import { UploadIcon } from "./Icon";
+import type { Project, ScriptTemplate } from "../types";
+import { DownloadIcon, UploadIcon } from "./Icon";
 
 const ACCEPT = ".txt,.md,.markdown,.text";
 
@@ -169,11 +169,59 @@ export function ScriptUpload({
 
       {result && <p className="note ok">Added — {result}</p>}
       {error && <p className="note error">{error}</p>}
+
+      <TemplateLinks />
+
       <p className="note">
         <code>[SFX: description, 4s]</code> places an effect; <code>[@ 02:15]</code> marks a
         target time. Both are stripped before anything is sent, so they are never spoken or
         billed.
       </p>
     </>
+  );
+}
+
+/** Starter scripts, offered where somebody is about to write one.
+ *
+ *  Each is annotated in HTML comments, which the parser strips before anything
+ *  is sent — so a template explains itself *and* generates correctly with every
+ *  comment left in place. Nothing has to be deleted first, which is the whole
+ *  reason it is worth offering rather than documenting.
+ *
+ *  Silent if the list cannot be fetched: a starter script is a convenience, and
+ *  an error about one has no business sitting above the upload box that works. */
+function TemplateLinks() {
+  const [templates, setTemplates] = useState<ScriptTemplate[]>([]);
+
+  useEffect(() => {
+    api
+      .templates()
+      .then(setTemplates)
+      .catch(() => undefined);
+  }, []);
+
+  if (!templates.length) return null;
+
+  return (
+    <div className="templates">
+      <span className="dim">Not sure of the format? Start from a template:</span>
+      <div className="toolbar">
+        {templates.map((template) => (
+          <a
+            key={template.slug}
+            className="download"
+            href={api.templateUrl(template.slug, true)}
+            download={template.filename}
+            title={template.summary}
+          >
+            <DownloadIcon /> {template.title}
+          </a>
+        ))}
+      </div>
+      <span className="faint">
+        Annotated throughout, and every note is stripped before anything is sent —
+        so it generates as-is.
+      </span>
+    </div>
   );
 }

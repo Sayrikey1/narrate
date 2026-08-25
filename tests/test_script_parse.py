@@ -399,3 +399,65 @@ def test_markdown_bold_around_a_speaker_still_reads_as_a_speaker() -> None:
     parsed = parse_script("**Morag:** The light went out.", CAST)
     assert parsed.text == "The light went out."
     assert parsed.turns[0].speaker == "Morag"
+
+
+# ---------------------------------------------------------------------------
+# Comments. The downloadable script template is mostly guidance in comments, so
+# every word of it would be read aloud and billed if these survived.
+# ---------------------------------------------------------------------------
+
+
+def test_a_comment_is_never_narrated() -> None:
+    assert strip_markers("<!-- delete me -->\n\nThe light turned.") == "The light turned."
+
+
+def test_a_comment_may_span_lines() -> None:
+    """The useful kind — a paragraph of guidance above the line it explains."""
+    text = "<!--\nWrite the hook here.\nKeep it under two sentences.\n-->\n\nThe light turned."
+    assert strip_markers(text) == "The light turned."
+
+
+def test_a_mid_sentence_comment_leaves_one_space_not_two() -> None:
+    """A stranded space is a billed character."""
+    assert strip_markers("The light turned. <!-- note --> Then it stopped.") == (
+        "The light turned. Then it stopped."
+    )
+
+
+def test_a_comment_at_the_end_of_a_line_leaves_nothing() -> None:
+    assert strip_markers("The light turned. <!-- note -->\n\nNext.") == "The light turned.\n\nNext."
+
+
+def test_several_comments_on_one_line() -> None:
+    assert strip_markers("A. <!-- one --> B. <!-- two --> C.") == "A. B. C."
+
+
+def test_a_comment_wrapping_a_marker_removes_both() -> None:
+    parsed = parse_script("<!-- [SFX: not wanted, 4s] -->\n\nThe light turned.")
+    assert parsed.text == "The light turned."
+    # Commented out means commented out — no slot is created.
+    assert parsed.slots == []
+
+
+def test_an_unterminated_comment_keeps_the_script_and_warns() -> None:
+    """HTML would swallow everything to the end of the document, and a Markdown
+    renderer will too — which here deletes the rest of the episode. Losing words
+    is the one mistake that cannot be undone downstream, so this reports instead
+    of guessing."""
+    text = "The light turned.\n\n<!-- oops I never closed this\n\nAnd this must survive."
+    parsed = parse_script(text)
+
+    assert "And this must survive." in parsed.text
+    assert any("unterminated" in w for w in parsed.warnings)
+
+
+def test_comments_do_not_disturb_the_offsets_around_them() -> None:
+    """Comments are removed before anything is measured, so a marker after one
+    still lands on its own words."""
+    parsed = parse_script(
+        "<!-- guidance -->\n\n[SFX: foghorn, 4s] The light turned.\n\n"
+        "<!-- more guidance -->\n\n[SFX: waves, 6s] The sea answered."
+    )
+    assert parsed.text == "The light turned.\n\nThe sea answered."
+    assert parsed.text[parsed.slots[0].offset :].startswith("The light turned.")
+    assert parsed.text[parsed.slots[1].offset :].startswith("The sea answered.")

@@ -868,3 +868,51 @@ def test_a_script_ingested_before_casting_has_no_speakers(client: TestClient, pr
     ).json()
     assert created.get("speakers") == []
     assert created["turns_assigned"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Starter scripts, offered where somebody is about to write one
+# ---------------------------------------------------------------------------
+
+
+def test_the_templates_are_listed(client: TestClient) -> None:
+    body = client.get("/api/templates").json()
+    assert {t["slug"] for t in body} == {"single-voice", "multi-voice"}
+    assert all(t["summary"] for t in body)
+
+
+def test_a_template_is_served_as_markdown(client: TestClient) -> None:
+    response = client.get("/api/templates/multi-voice")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/markdown")
+    assert "[CAST]" in response.text
+
+
+def test_a_template_can_be_downloaded(client: TestClient) -> None:
+    response = client.get("/api/templates/single-voice?download=1")
+    assert 'filename="single-voice.md"' in response.headers["content-disposition"]
+
+
+def test_an_unknown_template_names_the_valid_ones(client: TestClient) -> None:
+    response = client.get("/api/templates/nope")
+    assert response.status_code == 404
+    assert "single-voice" in response.json()["detail"]
+
+
+def test_a_template_uploads_and_generates_as_it_stands(client: TestClient) -> None:
+    """The promise, end to end through the API: fetch a template, upload it
+    untouched, and get chunks — no editing, no stripped comments to remember."""
+    body = client.get("/api/templates/single-voice").text
+    project = client.post("/api/projects", json={"name": "T", "voice_id": "v1"}).json()
+    created = client.post(
+        "/api/scripts",
+        json={"project_id": project["id"], "title": "From template", "text": body},
+    ).json()
+
+    assert created["chunks"] > 0
+    assert created["slots"] > 0
+
+    chunks = client.get(f"/api/scripts/{created['id']}/chunks").json()
+    everything = " ".join(c["text"] for c in chunks)
+    for marker in ("<!--", "-->", "narrate script", "===="):
+        assert marker not in everything

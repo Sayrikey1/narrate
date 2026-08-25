@@ -120,12 +120,24 @@ Re-rolling one chunk leaves the others untouched:
 narrate generate 1 --only 7 --go --force
 ```
 
-**40 commands** in all. `narrate --help` lists them; every one that spends says
+**42 commands** in all. `narrate --help` lists them; every one that spends says
 so first.
 
 ---
 
 ## ✍️ Writing a script
+
+Start from a template rather than from these rules:
+
+```bash
+narrate script templates                              # what is available
+narrate script template multi-voice -o my-episode.md  # write one and edit it
+```
+
+Both are also download buttons beside the upload box in the UI. They are
+annotated throughout in HTML comments — **stripped before anything is sent**, so
+a template explains itself *and* generates correctly with every note left in
+place. Nothing has to be deleted first.
 
 Mark up the text and the tool does the rest. **Markers are stripped before
 anything is sent**, so they are never spoken and never billed:
@@ -151,6 +163,7 @@ Keeper: I hoped not. Hoping is a different thing from knowing.
 | `[CAST] Name = voice_id` | Declares who speaks in this script |
 | `[VOICE: Name]` | Switches speaker mid-paragraph |
 | `Name: her line` | A speaker turn — **only** when that name is cast |
+| `<!-- a note -->` | A comment. Never narrated, never billed — which is what makes an annotated template work as a script |
 
 > 🛡️ **A prefix only counts as a speaker when the name is cast.** That single
 > rule is what makes this safe over existing writing: `Note:`, `Warning:`,
@@ -290,7 +303,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 414 Python + 67 frontend tests
+just check                        # 448 Python + 67 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -340,7 +353,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                414 Python tests
+tests/                448 Python tests
 assets/               generated audio (gitignored)
 ```
 

@@ -205,6 +205,16 @@ export interface CastMember {
   note: string;
 }
 
+/** A starter script: annotated in HTML comments, which are stripped before
+ *  anything is sent — so it explains itself and still generates correctly with
+ *  every comment left in place. */
+export interface ScriptTemplate {
+  slug: string;
+  title: string;
+  summary: string;
+  filename: string;
+}
+
 export interface Slot {
   id: number;
   at_chunk_ordinal: number;
