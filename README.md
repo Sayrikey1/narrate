@@ -120,7 +120,7 @@ Re-rolling one chunk leaves the others untouched:
 narrate generate 1 --only 7 --go --force
 ```
 
-**46 commands** in all. `narrate --help` lists them; every one that spends says
+**49 commands** in all. `narrate --help` lists them; every one that spends says
 so first.
 
 ---
@@ -210,21 +210,50 @@ in a link.
 
 ## 🎭 Cloned voices, and two versions of one script
 
+Full walkthrough in **[docs/VOICES.md](docs/VOICES.md)** — the process, the slot
+limits, and what to do when your plan will not let you clone.
+
 A clone is an ordinary `voice_id` once it exists, so everything here already
 works with one — the picker lists it, you can audition it, and it can be cast on
-a project or a single chunk.
+a project, a script, one chunk or one character.
 
 ```bash
-narrate voice capability            # may this account clone? how many slots left?
-narrate voice list --mine           # voices you created, clones included
-narrate voice clone "My Voice" samples/*.mp3 --assign "My Channel"
-narrate voice remove <voice_id>     # frees the slot; existing takes keep working
+narrate voice capability                        # may this account clone? slots left?
+narrate voice clone "My Voice" samples/*.mp3    # if the plan permits it
+narrate voice register <voice_id> --name mine   # or name one cloned elsewhere
+narrate project set "My Channel" --voice mine   # then use the name, not the id
 ```
 
-Cloning costs **no characters** — it consumes one of the account's voice *slots*.
-The plan permission and the free slot count are checked before anything is
-uploaded, so a plan that does not allow cloning gets an explanation rather than
-an opaque error.
+**Check the plan first.** Cloning is a plan permission, and having free voice
+slots is not the same as being allowed to fill them:
+
+```text
+tier                        payg
+instant voice cloning       not permitted
+custom voice slots          0 of 3 used
+```
+
+Cloning costs **no characters** — it consumes a voice *slot*. Both the
+permission and a free slot are checked before anything is uploaded, so a plan
+that disallows it gets an explanation rather than an opaque error.
+
+### Names, so a clone is usable from a terminal
+
+A voice id is twenty random characters, and so is every other voice you cloned.
+Registering gives one a handle — and **registering is not creating**, so this is
+also the path for a voice you cloned in ElevenLabs' own interface:
+
+```bash
+narrate voice register 21m00Tcm4TlvDq8ikWAM --name mine
+narrate voice registered            # what you have named
+narrate voice forget mine           # drop the name; the voice stays
+```
+
+The name works anywhere a voice is asked for — `project set`, `cast set`,
+`chunk set`, `export --voice` — and reaches the exported filename, so a master
+is identifiable without looking anything up. A name is never silently repointed
+at a different voice: that would change what the next generation produces, and
+the charge would land before anybody noticed.
 
 ### Two performances, one generation history
 
@@ -348,7 +377,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 462 Python + 67 frontend tests
+just check                        # 496 Python + 67 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -380,6 +409,7 @@ second, rounded up** — not the 40 credits/second the subscription docs quote.
 | --- | --- |
 | 🛠️ **[docs/INSTALL.md](docs/INSTALL.md)** | Setup for macOS, Linux and Windows; database provisioning; troubleshooting |
 | 📋 **[docs/FEATURES.md](docs/FEATURES.md)** | Everything supported, read from the code — and a plain list of what is not |
+| 🎭 **[docs/VOICES.md](docs/VOICES.md)** | Clones, registering a voice, slot limits, and two versions of one episode |
 | 🔬 **[docs/probe-results.md](docs/probe-results.md)** | What live probing settled about billing |
 | 📐 **[docs/PRD.md](docs/PRD.md)** | The original brief, kept for the reasoning behind the design |
 
@@ -398,7 +428,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                462 Python tests
+tests/                496 Python tests
 assets/               generated audio (gitignored)
 ```
 

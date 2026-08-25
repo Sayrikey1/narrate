@@ -30,6 +30,7 @@ from narrate import media as media_mod
 from narrate import probe as probe_mod
 from narrate import produce as produce_mod
 from narrate import reconcile as reconcile_mod
+from narrate import voices as voices_mod
 from narrate.chunking import Chunk as ChunkObj
 from narrate.chunking import merge_chunks, split_chunk
 from narrate.db import locate
@@ -356,7 +357,9 @@ async def _fetch_voices(
 @project_app.command("new")
 def project_new(
     name: str,
-    voice: str = typer.Option(None, "--voice", help="Default voice id."),
+    voice: str = typer.Option(
+        None, "--voice", help="Voice id, or a name from `narrate voice register`."
+    ),
     model: str = typer.Option(None, "--model", help="Default model id."),
     tags: str = typer.Option("", "--tags", help="Prefix tags applied to every chunk."),
     cap: float = typer.Option(None, "--monthly-cap", help="Monthly spend cap in USD."),
@@ -380,7 +383,7 @@ def project_new(
             _die(f"A project named {name!r} already exists.")
         project = Project(
             name=name,
-            voice_id=voice,
+            voice_id=voices_mod.resolve(session, voice),
             model_id=model_id,
             prefix_tags=tags,
             monthly_cap_micros=int(cap * 1_000_000) if cap else None,
@@ -433,7 +436,7 @@ def project_set(
                 _die(f"Unknown model {model!r}.")
             row.model_id = model
         if voice:
-            row.voice_id = voice
+            row.voice_id = voices_mod.resolve(session, voice)
         if cap is not None:
             row.monthly_cap_micros = int(cap * 1_000_000)
 
@@ -562,18 +565,152 @@ def voice_list(
         console.print("[dim]No voices matched.[/dim]")
         return
 
-    table = Table("voice_id", "name", "category", "labels")
+    with session_scope(_engine()) as session:
+        registered = {r.voice_id: r.slug for r in voices_mod.all_voices(session)}
+
+    table = Table("voice_id", "name", "category", "registered as", "labels")
     for voice in found:
         labels = voice.get("labels") or {}
+        vid = voice.get("voice_id", "")
         table.add_row(
-            voice.get("voice_id", ""),
+            vid,
             voice.get("name", ""),
             # A clone reports `cloned`; this is how you tell yours apart.
             voice.get("category", ""),
+            f"[bold]{registered[vid]}[/bold]" if vid in registered else "",
             ", ".join(f"{k}={v}" for k, v in list(labels.items())[:3]),
         )
     console.print(table)
-    console.print(f"[dim]{len(found)} voice(s). Audition one in the web UI before choosing.[/dim]")
+    console.print(
+        f"[dim]{len(found)} voice(s). `narrate voice register <id> --name x` gives one a "
+        "name you can use instead of its id.[/dim]"
+    )
+
+
+@voice_app.command("register")
+def voice_register(
+    voice_id: str = typer.Argument(..., help="The provider's voice id."),
+    name: str = typer.Option(
+        None, "--name", "-n", help="What to call it. Defaults to the provider's own name."
+    ),
+    note: str = typer.Option(None, "--note", help="A reminder of what this voice is for."),
+    replace: bool = typer.Option(
+        False, "--replace", help="Repoint an existing name at this voice."
+    ),
+    offline: bool = typer.Option(
+        False, "--offline", help="Register without checking the voice exists."
+    ),
+) -> None:
+    """Give a voice a name you can use instead of its id.
+
+    Registering is **not** creating. A voice cloned in ElevenLabs' own
+    interface, a professional voice, a premade one you keep returning to — all
+    can be registered, and the tool never needs to have made a voice to name it.
+    That matters when an account may clone in the web app but not through the
+    API.
+
+    Costs nothing. The voice is confirmed against the account first, so a typo
+    in an id is caught here rather than at the point of a billed generation.
+    """
+    settings = get_settings()
+    label: str | None = None
+    category = ""
+
+    if not offline:
+
+        async def lookup() -> dict[str, Any] | None:
+            provider = ElevenLabsProvider(settings)
+            try:
+                return await provider.get_voice(voice_id)
+            finally:
+                await provider.aclose()
+
+        try:
+            found = asyncio.run(lookup())
+        except MissingAPIKey:
+            _die(
+                "No API key, so the voice cannot be confirmed. Pass --offline to register "
+                "it anyway."
+            )
+        except ProviderError as exc:
+            _die(f"{exc.message}\n\nPass --offline to register it without checking.")
+
+        if found is None:
+            _die(
+                f"No voice {voice_id!r} on this account. Check `narrate voice list`, or "
+                "pass --offline if you are registering one you have not added yet."
+            )
+        label = found.get("name")
+        category = str(found.get("category") or "")
+
+    with session_scope(_engine()) as session:
+        try:
+            row = voices_mod.register(
+                session,
+                voice_id,
+                name=name,
+                label=label,
+                category=category,
+                note=note or "",
+                verified=not offline,
+                replace=replace,
+            )
+        except (
+            voices_mod.BadVoiceName,
+            voices_mod.VoiceNameTaken,
+            voices_mod.VoiceAlreadyRegistered,
+        ) as exc:
+            _die(str(exc))
+        slug, shown, kind = row.slug, row.label, row.category
+
+    console.print(
+        f"[green]Registered[/green] [bold]{slug}[/bold] → {shown or voice_id}"
+        + (f" [dim]({kind})[/dim]" if kind else " [dim](unverified)[/dim]")
+    )
+    console.print(f"[dim]Use it anywhere a voice is asked for:  --voice {slug}[/dim]")
+
+
+@voice_app.command("forget")
+def voice_forget(
+    name: str = typer.Argument(..., help="The registered name to drop."),
+) -> None:
+    """Drop a local name. The voice itself is untouched on the provider."""
+    with session_scope(_engine()) as session:
+        try:
+            row = voices_mod.forget(session, name)
+        except voices_mod.UnknownVoice:
+            _die(f"No registered voice called {name!r}. See `narrate voice registered`.")
+        voice_id = row.voice_id
+    console.print(
+        f"[green]Forgot[/green] {name}. [dim]{voice_id} is still on the account, and every "
+        "take made with it is unaffected.[/dim]"
+    )
+
+
+@voice_app.command("registered")
+def voice_registered() -> None:
+    """Voices you have named locally. Costs nothing, works offline."""
+    with session_scope(_engine()) as session:
+        records = voices_mod.all_voices(session)
+
+    if not records:
+        console.print(
+            "[dim]No voices registered. Give one a name:  "
+            "narrate voice register <voice_id> --name my-voice[/dim]"
+        )
+        return
+
+    table = Table("name", "voice", "voice_id", "kind", "note")
+    for record in records:
+        table.add_row(
+            f"[bold]{record.slug}[/bold]",
+            record.label,
+            _short_id(record.voice_id, 20),
+            record.category or "[dim]unverified[/dim]",
+            record.note,
+        )
+    console.print(table)
+    console.print("[dim]Use a name anywhere a voice id is accepted.[/dim]")
 
 
 @voice_app.command("capability")
@@ -952,7 +1089,9 @@ def cast_list(project: str) -> None:
 def cast_set(
     project: str,
     name: str,
-    voice: str = typer.Option(..., "--voice", help="The voice id that plays this character."),
+    voice: str = typer.Option(
+        ..., "--voice", help="Voice id, or a name from `narrate voice register`."
+    ),
     note: str = typer.Option(None, "--note"),
 ) -> None:
     """Cast a speaker, or change who plays them.
@@ -967,11 +1106,13 @@ def cast_set(
             select(CastMember).where(CastMember.project_id == row.id, CastMember.name == name)
         ).first()
         if member is None:
-            member = CastMember(project_id=row.id, name=name, voice_id=voice)
+            member = CastMember(
+                project_id=row.id, name=name, voice_id=voices_mod.resolve_required(session, voice)
+            )
             session.add(member)
             verb = "Cast"
         else:
-            member.voice_id = voice
+            member.voice_id = voices_mod.resolve_required(session, voice)
             verb = "Recast"
         if note is not None:
             member.note = note
@@ -1223,7 +1364,9 @@ def chunk_split(
 def chunk_set(
     script_id: int,
     ordinal: int,
-    voice: str = typer.Option(None, "--voice", help="Use a different voice for this chunk."),
+    voice: str = typer.Option(
+        None, "--voice", help="A different voice for this chunk. Id or registered name."
+    ),
     model: str = typer.Option(None, "--model", help="Use a different model for this chunk."),
     tags: str = typer.Option(None, "--tags", help="Prefix tags for this chunk only."),
     stability: float = typer.Option(None, "--stability"),
@@ -1259,7 +1402,7 @@ def chunk_set(
                 _die(f"Unknown model {model!r}. Run `narrate models` to see the options.")
             row.model_id = model
         if voice:
-            row.voice_id = voice
+            row.voice_id = voices_mod.resolve(session, voice)
 
         effective_model = row.model_id or script.model_id or (project.model_id if project else "")
         spec = registry.get(effective_model)
@@ -1857,12 +2000,20 @@ def export(
 
     label = None
     if voice:
-        # A readable filename beats an opaque id, and the voice list is free.
-        try:
-            found = asyncio.run(_fetch_voices(settings, None))
-            label = next((v.get("name") for v in found if v.get("voice_id") == voice), None)
-        except (MissingAPIKey, ProviderError):
-            label = None
+        # A registered name wins: it is what was typed, it needs no network, and
+        # it makes the exported filename predictable rather than dependent on
+        # whatever the voice happens to be called on the account.
+        with session_scope(engine) as session:
+            resolved = voices_mod.resolve(session, voice)
+            label = voices_mod.label_for(session, resolved or voice)
+        voice = resolved or voice
+
+        if label is None:
+            try:
+                found = asyncio.run(_fetch_voices(settings, None))
+                label = next((v.get("name") for v in found if v.get("voice_id") == voice), None)
+            except (MissingAPIKey, ProviderError):
+                label = None
 
     try:
         result = export_script(

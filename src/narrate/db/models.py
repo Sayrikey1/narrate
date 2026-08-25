@@ -313,6 +313,47 @@ class Reconciliation(Base):
     fetched_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class RegisteredVoice(Base):
+    """A voice given a local name, so it can be reused without its id.
+
+    Voices live on the provider, not here — this table stores no audio and
+    grants no access. What it adds is a **handle**: `--voice my-voice` instead
+    of `--voice 21m00Tcm4TlvDq8ikWAM`, which matters most for cloned voices,
+    because those are the ones you create, name, and then use across several
+    projects from a terminal.
+
+    Account-wide on purpose, unlike [`CastMember`](models.py) which is
+    project-scoped. A cast is who speaks in *this* series; a registered voice is
+    one you own and reach for anywhere.
+
+    `category` and `verified_at` record what the provider said about it when it
+    was registered. They are a snapshot, not a lease: a voice deleted from the
+    account leaves this row behind, and that is deliberate — takes generated
+    with it are still on disk and still in the ledger, so the name should keep
+    resolving well enough to explain where an old master came from.
+    """
+
+    __tablename__ = "registered_voice"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_registered_voice_slug"),
+        UniqueConstraint("voice_id", name="uq_registered_voice_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # The handle typed at the CLI: lowercase, hyphenated, unique.
+    slug: Mapped[str] = mapped_column(String(64))
+    # What to show a person. Defaults to the provider's own name.
+    label: Mapped[str] = mapped_column(String(128))
+    voice_id: Mapped[str] = mapped_column(String(64))
+    # `cloned`, `premade`, `professional`, `generated` — or empty when it was
+    # registered without the provider being reachable.
+    category: Mapped[str] = mapped_column(String(32), default="")
+    note: Mapped[str] = mapped_column(Text, default="")
+    # When the provider last confirmed this voice exists on the account.
+    verified_at: Mapped[datetime | None] = mapped_column(default=None)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class CastMember(Base):
     """A named speaker in a project, and the voice that plays them.
 

@@ -945,3 +945,84 @@ def test_a_generated_script_reports_the_voice_it_was_made_in(
 
 def test_an_unknown_script_has_no_variants(client: TestClient) -> None:
     assert client.get("/api/scripts/9999/variants").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Naming a voice, so a cloned one can be reused without its id
+# ---------------------------------------------------------------------------
+
+
+def test_no_voices_are_registered_to_begin_with(client: TestClient) -> None:
+    assert client.get("/api/voices/registered").json() == []
+
+
+def test_a_voice_can_be_named_and_listed(client: TestClient) -> None:
+    created = client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-1", "name": "My Clone", "offline": True},
+    )
+    assert created.status_code == 200
+    assert created.json()["slug"] == "my-clone"
+
+    listed = client.get("/api/voices/registered").json()
+    assert [v["slug"] for v in listed] == ["my-clone"]
+    assert listed[0]["voice_id"] == "mock-voice-1"
+
+
+def test_a_name_is_not_silently_repointed(client: TestClient) -> None:
+    """The same guarantee the CLI gives: a name moving to a different voice
+    changes what the next generation produces."""
+    body = {"voice_id": "mock-voice-1", "name": "mine", "offline": True}
+    assert client.post("/api/voices/registered", json=body).status_code == 200
+
+    clash = client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-2", "name": "mine", "offline": True},
+    )
+    assert clash.status_code == 409
+    assert "already points at" in clash.json()["detail"]
+
+
+def test_replace_repoints_deliberately(client: TestClient) -> None:
+    client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-1", "name": "mine", "offline": True},
+    )
+    moved = client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-2", "name": "mine", "offline": True, "replace": True},
+    )
+    assert moved.status_code == 200
+    assert moved.json()["voice_id"] == "mock-voice-2"
+
+
+def test_a_name_shaped_like_an_id_is_refused(client: TestClient) -> None:
+    bad = client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-1", "name": "AbCdEfGhIjKlMnOpQrSt", "offline": True},
+    )
+    assert bad.status_code == 400
+    assert "looks like a voice id" in bad.json()["detail"]
+
+
+def test_a_name_can_be_forgotten(client: TestClient) -> None:
+    client.post(
+        "/api/voices/registered",
+        json={"voice_id": "mock-voice-1", "name": "mine", "offline": True},
+    )
+    assert client.delete("/api/voices/registered/mine").status_code == 200
+    assert client.get("/api/voices/registered").json() == []
+
+
+def test_forgetting_an_unknown_name_is_a_404(client: TestClient) -> None:
+    assert client.delete("/api/voices/registered/nope").status_code == 404
+
+
+def test_the_registered_route_is_not_swallowed_by_the_preview_route(
+    client: TestClient,
+) -> None:
+    """`/api/voices/registered` sits beside `/api/voices/{voice_id}/preview`, so
+    route order decides whether it is reachable at all."""
+    response = client.get("/api/voices/registered")
+    assert response.status_code == 200
+    assert isinstance(response.json(), list)

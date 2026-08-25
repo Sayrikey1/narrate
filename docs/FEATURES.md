@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 46 CLI commands, 36 HTTP endpoints, 7 pages, and 462 Python plus 67
+memory — 49 CLI commands, 39 HTTP endpoints, 7 pages, and 496 Python plus 67
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -137,6 +137,11 @@ overwriting a rate**.
 | Checked before upload | The plan permission and free slots are read from the subscription first, so a refusal explains itself instead of arriving as an opaque error |
 | Sample sanity | Total duration measured and flagged if far outside what instant cloning uses |
 | `voice remove` | Frees a slot. Takes already generated with that voice keep working — the audio is on disk and the ledger rows stay |
+| `voice register` | Give a voice a local name, so `--voice mine` works instead of a 20-character id. **Registering is not creating** — it names a voice cloned anywhere, stores no audio, and consumes no slot |
+| Names everywhere | `project new/set`, `cast set`, `chunk set` and `export --voice` all accept a registered name. Anything unrecognised passes through, so every existing `--voice <id>` keeps working |
+| Never silently repointed | Reusing a name for a different voice is refused; a name quietly moving would change what the next generation produces |
+
+Full walkthrough, including the slot limits: **[VOICES.md](VOICES.md)**.
 
 ### Two versions of one script
 
@@ -302,12 +307,12 @@ builds the WAL index and creates files.
 
 ## 10. Surfaces
 
-**CLI** — 46 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
+**CLI** — 49 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
 `effects`, `cost`, `db`, plus `doctor`, `models`, `voices`, `estimate`,
 `generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`, `serve`
 and `probe`.
 
-**HTTP** — 36 endpoints. Deliberately thin: every one calls the same functions
+**HTTP** — 39 endpoints. Deliberately thin: every one calls the same functions
 the CLI does. Two entry points that disagreed about what a re-roll costs would
 be worse than having one.
 
@@ -338,7 +343,7 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 462 Python + 67 frontend. None touches the network |
+| Tests | 496 Python + 67 frontend. None touches the network |
 | Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `formats`, `media`, `cost *`, `db *`, and every voice audition |
 
 `narrate probe --live` is the only command that spends without being asked

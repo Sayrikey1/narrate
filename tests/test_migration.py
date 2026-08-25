@@ -108,7 +108,8 @@ def _build_previous_release(path: Path) -> None:
     with engine.begin() as conn:
         for column in ("units", "unit_kind", "provider"):
             conn.execute(text(f"ALTER TABLE ledger_entry DROP COLUMN {column}"))
-        # Added by 9a1c4f7be2d0, two revisions later.
+        # Added by later revisions; this fixture recreates an older release.
+        conn.execute(text("DROP TABLE IF EXISTS registered_voice"))
         conn.execute(text("DROP TABLE IF EXISTS cast_member"))
         conn.execute(text("ALTER TABLE chunk DROP COLUMN turns_json"))
         conn.execute(text("ALTER TABLE take DROP COLUMN voices_json"))

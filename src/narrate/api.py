@@ -34,6 +34,7 @@ from narrate import audio, ledger, previews, templates
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
+from narrate import voices as voices_mod
 from narrate.db.models import (
     CastMember,
     Chunk,
@@ -126,6 +127,16 @@ class ScriptIn(BaseModel):
     # Group each run of speaker turns into one conversation. Ignored, with a
     # warning, on a model that has no dialogue endpoint.
     dialogue: bool = False
+
+
+class RegisterVoiceIn(BaseModel):
+    voice_id: str
+    name: str | None = None
+    note: str = ""
+    replace: bool = False
+    # Skip confirming the voice exists. For a voice added to the account since
+    # the last list, or when there is no key.
+    offline: bool = False
 
 
 class CastIn(BaseModel):
@@ -1038,6 +1049,82 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             effect = session.get(Effect, effect_id)
             path = Path(effect.asset_path) if effect and effect.asset_path else None
         return _audio_response(path)
+
+    @app.get("/api/voices/registered")
+    def list_registered_voices() -> list[dict[str, Any]]:
+        """Voices given a local name. Costs nothing and needs no key."""
+        with session_scope(db) as session:
+            return [
+                {
+                    "slug": v.slug,
+                    "label": v.label,
+                    "voice_id": v.voice_id,
+                    "category": v.category,
+                    "note": v.note,
+                    "verified": v.verified,
+                }
+                for v in voices_mod.all_voices(session)
+            ]
+
+    @app.post("/api/voices/registered")
+    async def register_voice(body: RegisterVoiceIn) -> dict[str, Any]:
+        """Name a voice so it can be used without its id.
+
+        Registering is not creating: a voice cloned in ElevenLabs' own interface
+        can be named here, and the tool never has to have made a voice to give
+        it a handle. The voice is confirmed against the account first, so a
+        mistyped id is caught now rather than at a billed generation.
+        """
+        label: str | None = None
+        category = ""
+
+        if not body.offline and resolve_provider() != "mock" and config.has_api_key:
+            provider = ElevenLabsProvider(config)
+            try:
+                found = await provider.get_voice(body.voice_id)
+            finally:
+                await provider.aclose()
+            if found is None:
+                raise HTTPException(
+                    404,
+                    f"No voice {body.voice_id!r} on this account. Pass offline=true to "
+                    "register it anyway.",
+                )
+            label = found.get("name")
+            category = str(found.get("category") or "")
+
+        with session_scope(db) as session:
+            try:
+                row = voices_mod.register(
+                    session,
+                    body.voice_id,
+                    name=body.name,
+                    label=label,
+                    category=category,
+                    note=body.note,
+                    verified=not body.offline,
+                    replace=body.replace,
+                )
+            except voices_mod.BadVoiceName as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except (voices_mod.VoiceNameTaken, voices_mod.VoiceAlreadyRegistered) as exc:
+                raise HTTPException(409, str(exc)) from exc
+            return {
+                "slug": row.slug,
+                "label": row.label,
+                "voice_id": row.voice_id,
+                "category": row.category,
+            }
+
+    @app.delete("/api/voices/registered/{name}")
+    def forget_voice(name: str) -> dict[str, str]:
+        """Drop a local name. The voice stays on the account."""
+        with session_scope(db) as session:
+            try:
+                row = voices_mod.forget(session, name)
+            except voices_mod.UnknownVoice as exc:
+                raise HTTPException(404, f"No registered voice called {name!r}.") from exc
+            return {"slug": name, "voice_id": row.voice_id}
 
     @app.get("/api/voices/{voice_id}/preview")
     async def voice_preview(voice_id: str) -> FileResponse:
