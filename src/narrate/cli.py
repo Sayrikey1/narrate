@@ -322,10 +322,28 @@ def voices(
     console.print(table)
 
 
-async def _fetch_voices(settings: Settings, search: str | None) -> list[dict[str, Any]]:
+def _short_id(value: str, width: int = 13) -> str:
+    """Shorten an id from the middle, keeping both ends.
+
+    Truncating the front is the obvious choice and the wrong one: ids that share
+    a prefix collapse to the same string, which defeats the column entirely —
+    `mock-voice-1` and `mock-voice-2` both became `mock-voice-1…`. Provider ids
+    are random enough that either end identifies them, so keeping both is safe
+    and handles the shared-prefix case too.
+    """
+    if len(value) <= width:
+        return value
+    head = (width - 1) // 2
+    tail = width - 1 - head
+    return f"{value[:head]}…{value[-tail:]}"
+
+
+async def _fetch_voices(
+    settings: Settings, search: str | None, voice_type: str | None = None
+) -> list[dict[str, Any]]:
     provider = ElevenLabsProvider(settings)
     try:
-        return await provider.list_voices(search=search)
+        return await provider.list_voices(search=search, voice_type=voice_type)
     finally:
         await provider.aclose()
 
@@ -458,6 +476,259 @@ def _lookup_project(session: Session, key: str) -> Project:
     if row is None:
         _die(f"No project matching {key!r}.")
     return row
+
+
+# ---------------------------------------------------------------------------
+# voice
+# ---------------------------------------------------------------------------
+
+voice_app = typer.Typer(
+    no_args_is_help=True, help="Voices on the account, including clones you create."
+)
+app.add_typer(voice_app, name="voice")
+
+# Instant cloning wants under two minutes of audio in total. More than this is
+# not better — it is a longer upload for the same result, and the docs are
+# explicit that IVC uses short samples.
+CLONE_SECONDS_MAX = 150.0
+CLONE_SECONDS_MIN = 10.0
+
+
+async def _clone_capability(settings: Settings) -> dict[str, Any]:
+    provider = ElevenLabsProvider(settings)
+    try:
+        return await provider.clone_capability()
+    finally:
+        await provider.aclose()
+
+
+def _require_cloning(settings: Settings) -> dict[str, Any]:
+    """Check the plan before sending anything, and explain a refusal.
+
+    `POST /v1/voices/add` on a plan without the permission fails with little to
+    go on, and a clone also occupies one of a limited number of voice slots. The
+    subscription endpoint costs nothing and answers both questions exactly, so
+    it is consulted first rather than after a confusing error.
+    """
+    try:
+        capability = asyncio.run(_clone_capability(settings))
+    except (MissingAPIKey, ProviderError) as exc:
+        _die(str(exc))
+
+    if not capability["instant"]:
+        yes_no = {True: "yes", False: "not permitted"}
+        console.print(
+            Panel(
+                "This account cannot create voice clones.\n\n"
+                f"  tier                        {capability['tier']}\n"
+                f"  instant voice cloning       {yes_no[capability['instant']]}\n"
+                f"  professional voice cloning  {yes_no[capability['professional']]}\n"
+                f"  custom voice slots          "
+                f"{capability['slots_used']} of {capability['slot_limit']} used\n\n"
+                "Instant cloning needs a plan that permits it. Until then, clone at "
+                "elevenlabs.io and use the voice_id here — a clone is an ordinary "
+                "voice_id once it exists, so everything else in this tool already "
+                "works with one.\n\n"
+                "[dim]Nothing was sent.[/dim]",
+                title="Cloning not available",
+                expand=False,
+            )
+        )
+        raise typer.Exit(code=1)
+
+    if capability["slots_free"] <= 0:
+        _die(
+            f"All {capability['slot_limit']} custom voice slots are in use. "
+            "Remove one with `narrate voice remove <voice_id>` first."
+        )
+    return capability
+
+
+@voice_app.command("list")
+def voice_list(
+    search: str = typer.Option(None, "--search", "-s"),
+    mine: bool = typer.Option(False, "--mine", help="Only voices this account created."),
+) -> None:
+    """Voices available to this account. Costs zero characters."""
+    settings = get_settings()
+    try:
+        found = asyncio.run(
+            _fetch_voices(settings, search, voice_type="personal" if mine else None)
+        )
+    except (MissingAPIKey, ProviderError) as exc:
+        _die(str(exc))
+
+    if not found:
+        console.print("[dim]No voices matched.[/dim]")
+        return
+
+    table = Table("voice_id", "name", "category", "labels")
+    for voice in found:
+        labels = voice.get("labels") or {}
+        table.add_row(
+            voice.get("voice_id", ""),
+            voice.get("name", ""),
+            # A clone reports `cloned`; this is how you tell yours apart.
+            voice.get("category", ""),
+            ", ".join(f"{k}={v}" for k, v in list(labels.items())[:3]),
+        )
+    console.print(table)
+    console.print(f"[dim]{len(found)} voice(s). Audition one in the web UI before choosing.[/dim]")
+
+
+@voice_app.command("capability")
+def voice_capability() -> None:
+    """Whether this account may clone, and how many slots are left."""
+    settings = get_settings()
+    try:
+        capability = asyncio.run(_clone_capability(settings))
+    except (MissingAPIKey, ProviderError) as exc:
+        _die(str(exc))
+
+    table = Table("check", "value")
+    table.add_row("tier", str(capability["tier"]))
+    table.add_row(
+        "instant voice cloning",
+        "[green]yes[/green]" if capability["instant"] else "[yellow]not permitted[/yellow]",
+    )
+    table.add_row(
+        "professional voice cloning",
+        "[green]yes[/green]" if capability["professional"] else "[yellow]not permitted[/yellow]",
+    )
+    table.add_row(
+        "custom voice slots",
+        f"{capability['slots_used']} of {capability['slot_limit']} used",
+    )
+    console.print(table)
+
+
+@voice_app.command("clone")
+def voice_clone(
+    name: str = typer.Argument(..., help="What to call the voice."),
+    samples: list[Path] = typer.Argument(..., help="Audio files to clone from."),
+    description: str = typer.Option(None, "--description"),
+    accent: str = typer.Option(None, "--accent", help="Recorded as a label."),
+    denoise: bool = typer.Option(
+        False, "--denoise", help="Have the provider strip background noise from the samples."
+    ),
+    assign: str = typer.Option(
+        None, "--assign", help="Set the new voice on this project once created."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+) -> None:
+    """Clone a voice from audio samples, and optionally cast it on a project.
+
+    Costs no characters — a clone consumes one of the account's voice *slots*
+    rather than character quota. The plan permission and the free slot count are
+    both checked before anything is uploaded.
+    """
+    settings = get_settings()
+    capability = _require_cloning(settings)
+
+    missing = [p for p in samples if not p.is_file()]
+    if missing:
+        _die("No such file: " + ", ".join(str(p) for p in missing))
+
+    total = 0.0
+    unmeasured: list[Path] = []
+    for path in samples:
+        try:
+            total += audio.duration_seconds(path)
+        except (audio.FFmpegMissing, audio.FFmpegFailed):
+            unmeasured.append(path)
+
+    console.print(f"[bold]{name}[/bold] from {len(samples)} sample(s):")
+    for path in samples:
+        console.print(f"  {path}")
+    if unmeasured:
+        console.print(
+            f"[yellow]Could not measure {len(unmeasured)} file(s)[/yellow] — "
+            "ffmpeg is needed for that, and the upload will proceed regardless."
+        )
+    elif total:
+        console.print(f"[dim]{total:.0f}s of audio in total.[/dim]")
+        if total > CLONE_SECONDS_MAX:
+            console.print(
+                f"[yellow]That is more than the ~{CLONE_SECONDS_MAX:.0f}s instant cloning "
+                "uses. Extra audio is a longer upload for the same result.[/yellow]"
+            )
+        elif total < CLONE_SECONDS_MIN:
+            console.print(
+                f"[yellow]Under {CLONE_SECONDS_MIN:.0f}s is very little to clone from; "
+                "expect a rough result.[/yellow]"
+            )
+    console.print(
+        f"[dim]Uses 1 of {capability['slots_free']} free voice slot(s). "
+        "No characters are spent.[/dim]"
+    )
+
+    if not yes and not typer.confirm("Create it?"):
+        console.print("[dim]Nothing was sent.[/dim]")
+        raise typer.Exit(code=1)
+
+    async def run() -> dict[str, Any]:
+        provider = ElevenLabsProvider(settings)
+        try:
+            return await provider.create_voice(
+                name,
+                list(samples),
+                description=description,
+                labels={"accent": accent} if accent else None,
+                remove_background_noise=denoise,
+            )
+        finally:
+            await provider.aclose()
+
+    try:
+        created = asyncio.run(run())
+    except ProviderError as exc:
+        _die(exc.message)
+
+    voice_id = created.get("voice_id", "")
+    console.print(f"[green]Created[/green] {name} — [bold]{voice_id}[/bold]")
+    if created.get("requires_verification"):
+        console.print(
+            "[yellow]The provider wants verification before this voice can be used.[/yellow] "
+            "Complete it at elevenlabs.io."
+        )
+
+    if assign:
+        with session_scope(_engine()) as session:
+            project = _lookup_project(session, assign)
+            project.voice_id = voice_id
+        console.print(f"[green]Cast on {assign}.[/green]")
+    else:
+        console.print(f"[dim]Cast it:  narrate project set <project> --voice {voice_id}[/dim]")
+
+
+@voice_app.command("remove")
+def voice_remove(
+    voice_id: str = typer.Argument(..., help="The voice to delete."),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Delete a voice from the account, freeing its slot.
+
+    Irreversible on the provider's side, and takes already generated with it
+    keep working — the audio is on disk here and the ledger rows stay. What
+    breaks is generating anything *new* in that voice.
+    """
+    settings = get_settings()
+    if not yes and not typer.confirm(f"Delete voice {voice_id} from the account?"):
+        console.print("[dim]Nothing was sent.[/dim]")
+        raise typer.Exit(code=1)
+
+    async def run() -> None:
+        provider = ElevenLabsProvider(settings)
+        try:
+            await provider.delete_voice(voice_id)
+        finally:
+            await provider.aclose()
+
+    try:
+        asyncio.run(run())
+    except (MissingAPIKey, ProviderError) as exc:
+        _die(str(exc))
+    console.print(f"[green]Deleted[/green] {voice_id}. Existing takes are unaffected.")
 
 
 # ---------------------------------------------------------------------------
@@ -1490,7 +1761,10 @@ def takes(
 ) -> None:
     """List every take, with its cost and whether it is in the cut (F6)."""
     engine = _engine()
-    table = Table("chunk", "take", "status", "chars", "cost", "in cut", "model", "file")
+    # `voice` matters as soon as a script has been generated in more than one:
+    # two takes of the same chunk are otherwise indistinguishable in this table,
+    # which is exactly the situation a variant export creates.
+    table = Table("chunk", "take", "status", "chars", "cost", "in cut", "voice", "model", "file")
     with session_scope(engine) as session:
         _require_script(session, script_id)
         rows = session.scalars(
@@ -1520,6 +1794,7 @@ def takes(
                     f"{take.billed_chars:,}",
                     fmt_usd(take.cost_micros),
                     "[green]✓[/green]" if is_cut else "",
+                    _short_id(take.voice_id),
                     take.model_id,
                     Path(take.asset_path).name if take.asset_path else "",
                 )
@@ -1564,10 +1839,31 @@ def export(
     ),
     no_mp3: bool = typer.Option(False, "--no-mp3"),
     out: Path = typer.Option(None, "--out", help="Output directory."),
+    voice: str = typer.Option(
+        None,
+        "--voice",
+        help="Export this voice's performance instead of the cut. `narrate takes` lists them.",
+    ),
 ) -> None:
-    """Stitch the cut, name every piece by timeline position, and write the plan."""
+    """Stitch the cut, name every piece by timeline position, and write the plan.
+
+    `--voice` exports a **variant**: the episode as one voice performed it,
+    assembled from the takes already on record. Generate a script in two voices
+    and you can export both from one generation history, into separate folders
+    so neither overwrites the other.
+    """
     settings = get_settings()
     engine = _engine()
+
+    label = None
+    if voice:
+        # A readable filename beats an opaque id, and the voice list is free.
+        try:
+            found = asyncio.run(_fetch_voices(settings, None))
+            label = next((v.get("name") for v in found if v.get("voice_id") == voice), None)
+        except (MissingAPIKey, ProviderError):
+            label = None
+
     try:
         result = export_script(
             engine,
@@ -1578,6 +1874,8 @@ def export(
             out_dir=out,
             formats=fmt,
             piece_format=piece_fmt,
+            voice_id=voice or None,
+            variant_label=label,
         )
     except audio.UnknownFormat as exc:
         _die(str(exc))

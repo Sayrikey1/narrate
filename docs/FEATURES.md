@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 42 CLI commands, 35 HTTP endpoints, 7 pages, and 448 Python plus 67
+memory — 46 CLI commands, 36 HTTP endpoints, 7 pages, and 462 Python plus 67
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -123,6 +123,34 @@ Two deprecated Turbo models are listed so the CLI can name the replacement
 rather than fail with an opaque error. `narrate models --sync` reconciles the
 declared capabilities against `GET /v1/models` and **reports drift without
 overwriting a rate**.
+
+---
+
+### Cloned voices
+
+| Feature | Detail |
+|---|---|
+| Use a clone | Works already — a clone is an ordinary `voice_id`. Listed in the picker with its `cloned` category, auditionable before selection |
+| `voice list --mine` | Voices this account created, filtered server-side |
+| `voice capability` | Whether the plan permits instant or professional cloning, and how many voice slots are free |
+| `voice clone` | Instant cloning from audio samples. Costs **no characters** — it consumes a voice *slot* |
+| Checked before upload | The plan permission and free slots are read from the subscription first, so a refusal explains itself instead of arriving as an opaque error |
+| Sample sanity | Total duration measured and flagged if far outside what instant cloning uses |
+| `voice remove` | Frees a slot. Takes already generated with that voice keep working — the audio is on disk and the ledger rows stay |
+
+### Two versions of one script
+
+Generate, change voice, generate again with `--force`. Both sets of takes remain
+and either can be exported.
+
+| Feature | Detail |
+|---|---|
+| No new storage | A take has always recorded its voice, so a variant is a different way of *choosing* between takes, not a new entity |
+| `takes` shows the voice | Without it, two takes of one chunk are indistinguishable — exactly the situation a second version creates |
+| `export --voice <id>` | Stitches that voice's performance. Separate folder and filename, so variants never overwrite |
+| `GET /scripts/{id}/variants` | Every voice with takes, its coverage, and whether it is complete |
+| Partial variants refused | A voice missing chunks would ship a silent gap; the error names the missing lines and the command to fill them |
+| Works without a cut | A variant is selected by voice, so it exports straight after a second run |
 
 ---
 
@@ -274,12 +302,12 @@ builds the WAL index and creates files.
 
 ## 10. Surfaces
 
-**CLI** — 42 commands across `project`, `script`, `chunk`, `cast`, `cut`,
+**CLI** — 46 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
 `effects`, `cost`, `db`, plus `doctor`, `models`, `voices`, `estimate`,
 `generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`, `serve`
 and `probe`.
 
-**HTTP** — 35 endpoints. Deliberately thin: every one calls the same functions
+**HTTP** — 36 endpoints. Deliberately thin: every one calls the same functions
 the CLI does. Two entry points that disagreed about what a re-roll costs would
 be worse than having one.
 
@@ -310,7 +338,7 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 448 Python + 67 frontend. None touches the network |
+| Tests | 462 Python + 67 frontend. None touches the network |
 | Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `formats`, `media`, `cost *`, `db *`, and every voice audition |
 
 `narrate probe --live` is the only command that spends without being asked
@@ -325,7 +353,10 @@ failed every chunk after the first.
 
 Stated plainly, because a gap you know about is cheaper than one you discover:
 
-- **Voice cloning or voice design.** Use ElevenLabs' own UI and consume the resulting `voice_id`
+- **Voice *design*** (generating a voice from a text description). Cloning is
+  supported; design is not — use ElevenLabs' own UI and consume the `voice_id`
+- **Professional voice cloning.** Only instant cloning is wired up; PVC needs a
+  Creator plan and a different endpoint
 - **Postgres.** The seam exists — `NARRATE_DATABASE_URL` — but no dialect other than SQLite is supported or tested
 - **Multi-user.** Single-operator by design; run state is in-memory and process-local
 - **Loudness normalisation.** WAV masters are the correct input for it, done elsewhere

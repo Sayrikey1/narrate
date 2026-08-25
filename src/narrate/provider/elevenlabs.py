@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -227,7 +228,10 @@ class ElevenLabsProvider:
         return payload if isinstance(payload, list) else []
 
     async def list_voices(
-        self, search: str | None = None, page_size: int = 100
+        self,
+        search: str | None = None,
+        page_size: int = 100,
+        voice_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Page through `GET /v2/voices`.
 
@@ -238,6 +242,11 @@ class ElevenLabsProvider:
         params: dict[str, Any] = {"page_size": min(page_size, 100), "include_total_count": False}
         if search:
             params["search"] = search
+        # `personal` is what the API calls a voice this account created, which
+        # includes clones. Filtering server-side beats fetching everything and
+        # discarding most of it on an account with hundreds of voices.
+        if voice_type:
+            params["voice_type"] = voice_type
 
         while True:
             response = await self._client.get("/v2/voices", params=params)
@@ -264,6 +273,81 @@ class ElevenLabsProvider:
             if voice.get("voice_id") == voice_id:
                 return dict(voice)
         return None
+
+    # -- voices ------------------------------------------------------------
+
+    async def clone_capability(self) -> dict[str, Any]:
+        """What this account is permitted to do about cloning.
+
+        Read from `GET /v1/user/subscription`, which costs nothing, and checked
+        *before* a clone is attempted. `POST /v1/voices/add` on a plan that does
+        not allow it returns an error that says little; the subscription says
+        exactly which permission is missing and how many slots are left.
+        """
+        sub = await self.subscription()
+        used = int(sub.get("voice_slots_used") or 0)
+        limit = int(sub.get("voice_limit") or 0)
+        return {
+            "tier": sub.get("tier", "unknown"),
+            "instant": bool(sub.get("can_use_instant_voice_cloning")),
+            "professional": bool(sub.get("can_use_professional_voice_cloning")),
+            "slots_used": used,
+            "slot_limit": limit,
+            "slots_free": max(0, limit - used),
+            "can_extend": bool(sub.get("can_extend_voice_limit")),
+        }
+
+    async def create_voice(
+        self,
+        name: str,
+        files: list[Path],
+        *,
+        description: str | None = None,
+        labels: dict[str, str] | None = None,
+        remove_background_noise: bool = False,
+    ) -> dict[str, Any]:
+        """`POST /v1/voices/add` — instant voice cloning from audio samples.
+
+        Multipart, and the field is repeated once per sample rather than being a
+        list — `files` for each, which is easy to get wrong because every other
+        endpoint here takes JSON.
+
+        The files are read into memory. Instant cloning wants under two minutes
+        of audio in total, so that is a few megabytes; streaming them would add
+        a failure mode for no benefit at this size.
+        """
+        data: dict[str, str] = {"name": name}
+        if description:
+            data["description"] = description
+        if labels:
+            data["labels"] = json.dumps(labels)
+        if remove_background_noise:
+            data["remove_background_noise"] = "true"
+
+        payload = [("files", (path.name, path.read_bytes(), _audio_mime(path))) for path in files]
+
+        try:
+            response = await self._client.post("/v1/voices/add", data=data, files=payload)
+        except httpx.ConnectError as exc:
+            raise RetryableError(f"Could not reach the provider: {exc}") from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.RemoteProtocolError) as exc:
+            # A clone occupies a voice slot, so a half-known outcome matters
+            # here for the same reason it does for a billed generation: retrying
+            # could leave two copies of the same voice.
+            raise UnknownOutcomeError(
+                f"The clone request was sent but no response was read ({type(exc).__name__}). "
+                "Check `narrate voice list` before retrying — it may have been created."
+            ) from exc
+
+        if response.status_code >= 400:
+            raise _classify(response)
+        return dict(response.json())
+
+    async def delete_voice(self, voice_id: str) -> None:
+        """`DELETE /v1/voices/{id}` — frees a voice slot."""
+        response = await self._client.delete(f"/v1/voices/{voice_id}")
+        if response.status_code >= 400:
+            raise _classify(response)
 
     async def subscription(self) -> dict[str, Any]:
         response = await self._client.get("/v1/user/subscription")
@@ -300,6 +384,25 @@ class ElevenLabsProvider:
             raise _classify(response)
         result: dict[str, Any] = response.json()
         return result
+
+
+# Audio types the cloning endpoint accepts. A multipart part with no
+# Content-Type falls back to application/octet-stream, which some gateways
+# reject outright, so it is stated rather than left to chance.
+_AUDIO_MIMES = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".webm": "audio/webm",
+}
+
+
+def _audio_mime(path: Path) -> str:
+    return _AUDIO_MIMES.get(path.suffix.lower(), "application/octet-stream")
 
 
 def _classify(response: httpx.Response) -> ProviderError:

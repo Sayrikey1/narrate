@@ -916,3 +916,32 @@ def test_a_template_uploads_and_generates_as_it_stands(client: TestClient) -> No
     everything = " ".join(c["text"] for c in chunks)
     for marker in ("<!--", "-->", "narrate script", "===="):
         assert marker not in everything
+
+
+# ---------------------------------------------------------------------------
+# Variants — two performances of one script, from the takes on record
+# ---------------------------------------------------------------------------
+
+
+def test_variants_are_empty_before_anything_is_generated(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    assert client.get(f"/api/scripts/{script['script_id']}/variants").json() == []
+
+
+def test_a_generated_script_reports_the_voice_it_was_made_in(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    started = client.post(f"/api/scripts/{script_id}/generate", json={"dry_run": False}).json()
+    _drain(client, started["run_key"])
+
+    variants = client.get(f"/api/scripts/{script_id}/variants").json()
+    assert len(variants) == 1
+    assert variants[0]["voice_id"] == "v1"
+    assert variants[0]["complete"] is True
+    assert variants[0]["chunks"] == variants[0]["chunks_total"]
+
+
+def test_an_unknown_script_has_no_variants(client: TestClient) -> None:
+    assert client.get("/api/scripts/9999/variants").status_code == 404

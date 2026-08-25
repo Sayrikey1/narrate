@@ -34,7 +34,14 @@ from narrate.db.models import Chunk, Cut, Export, Take
 from narrate.db.session import session_scope
 from narrate.plan import PlanContext, gather_context, render_plan, render_timeline_json
 from narrate.settings import Settings
-from narrate.timeline import EFFECT, NARRATION, Timeline, build_timeline, export_basename
+from narrate.timeline import (
+    EFFECT,
+    NARRATION,
+    Timeline,
+    build_timeline,
+    export_basename,
+    takes_by_voice,
+)
 
 
 class NothingToExport(RuntimeError):
@@ -75,7 +82,15 @@ def selected_takes(session: Session, script_id: int) -> list[tuple[int, Take]]:
     return [(ordinal, take) for ordinal, take in rows]
 
 
-def _check_ready(session: Session, timeline: Timeline, script_id: int) -> None:
+def _variant_slug(label: str) -> str:
+    """A filename-safe tag for a variant. Short, because it is a suffix."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in label).strip("-")
+    return safe[:24].lower() or "variant"
+
+
+def _check_ready(
+    session: Session, timeline: Timeline, script_id: int, voice_id: str | None = None
+) -> None:
     """Refuse an export that would ship a hole in the middle of an episode."""
     if not timeline.narration:
         raise NothingToExport(
@@ -87,15 +102,28 @@ def _check_ready(session: Session, timeline: Timeline, script_id: int) -> None:
             select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
         ).all()
     )
-    selected = {
-        c.chunk_id for c in session.scalars(select(Cut).where(Cut.script_id == script_id)).all()
-    }
-    unselected = [c.ordinal for c in chunks if c.id not in selected]
-    if unselected:
-        raise NothingToExport(
-            f"Chunks {unselected} have no selected take. Generate them, or pick a take, "
-            "before exporting — a gap in the middle of an episode is worse than no export."
-        )
+    if voice_id is None:
+        selected = {
+            c.chunk_id for c in session.scalars(select(Cut).where(Cut.script_id == script_id)).all()
+        }
+        unselected = [c.ordinal for c in chunks if c.id not in selected]
+        if unselected:
+            raise NothingToExport(
+                f"Chunks {unselected} have no selected take. Generate them, or pick a take, "
+                "before exporting — a gap in the middle of an episode is worse than no export."
+            )
+    else:
+        # A variant is only exportable where that voice covers every chunk.
+        # A partial variant would ship an episode with a silent hole in it, and
+        # the useful thing to say is which lines are missing in *that voice*.
+        covered = set(takes_by_voice(session, script_id, voice_id))
+        missing = [c.ordinal for c in chunks if c.id not in covered]
+        if missing:
+            raise NothingToExport(
+                f"Voice {voice_id} has no take for chunks {missing}. Generate them in "
+                f"that voice first:  narrate generate {script_id} --only "
+                f"{','.join(str(o) for o in missing)} --go"
+            )
 
     for entry in timeline.narration:
         path = entry.source_path
@@ -138,11 +166,21 @@ def export_script(
     out_dir: Path | None = None,
     formats: list[str] | str | None = None,
     piece_format: str | None = None,
+    voice_id: str | None = None,
+    variant_label: str | None = None,
 ) -> ExportResult:
     """Stitch the cut and write it out in each requested delivery format.
 
     `formats` are the masters. `piece_format` is what the timeline-named files
     are encoded as, since those are the ones dropped onto an editing track.
+
+    `voice_id` exports a **variant**: the episode as that one voice performed
+    it, taken from the takes already on record rather than from the cut. Two
+    voices of the same script therefore produce two masters from one generation
+    history — which is the point of keeping every take.
+
+    A variant writes to its own directory and carries the voice in its filename,
+    because the alternative is one export quietly overwriting the other.
     """
     gap = settings.gap_seconds if gap_seconds is None else gap_seconds
 
@@ -157,15 +195,20 @@ def export_script(
         requested = [*parse_formats(["wav"]), *requested]
     piece = (piece_format or settings.piece_format).lower().lstrip(".")
 
+    slug = _variant_slug(variant_label or voice_id) if voice_id else ""
+
     with session_scope(engine) as session:
-        timeline = build_timeline(session, script_id, gap_seconds=gap)
-        _check_ready(session, timeline, script_id)
+        timeline = build_timeline(session, script_id, gap_seconds=gap, voice_id=voice_id)
+        _check_ready(session, timeline, script_id, voice_id=voice_id)
         context = gather_context(session, script_id)
         take_ids = [e.take_id for e in timeline.narration if e.take_id]
         project_name = timeline.project_name
         safe_title = _safe_title(timeline.script_title, script_id)
+        if slug:
+            safe_title = f"{safe_title}__{slug}"
 
-    target = out_dir or (settings.assets_dir / "exports" / f"script-{script_id}")
+    default_dir = f"script-{script_id}" + (f"-{slug}" if slug else "")
+    target = out_dir or (settings.assets_dir / "exports" / default_dir)
     target.mkdir(parents=True, exist_ok=True)
 
     # Timeline-named deliverables. Applied here rather than at generation, so a

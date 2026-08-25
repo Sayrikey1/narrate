@@ -298,7 +298,7 @@ path:
 ```bash
 just demo               # one voice, five chunks, five cues, exported
 just demo-dialogue      # two speakers, both modes
-just check              # 448 Python + 67 frontend tests
+just check              # 462 Python + 67 frontend tests
 ```
 
 ---

@@ -159,7 +159,9 @@ function Shell() {
             />
           )}
 
-          {route.pattern === "/script/:id/media" && <MediaPage project={project} />}
+          {route.pattern === "/script/:id/media" && (
+            <MediaPage project={project} scriptId={scriptId} />
+          )}
 
           {route.pattern === "/script/:id/plan" && scriptId !== null && (
             <PlanPage scriptId={scriptId} script={script} plan={plan} />

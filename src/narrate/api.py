@@ -28,7 +28,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 
 from narrate import audio, ledger, previews, templates
 from narrate import effects as effects_mod
@@ -53,7 +53,7 @@ from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
 from narrate.registry import Registry
 from narrate.settings import Settings, get_settings, resolve_provider
-from narrate.timeline import build_timeline
+from narrate.timeline import build_timeline, voices_used
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
@@ -160,6 +160,10 @@ class SlotIn(BaseModel):
 class ExportIn(BaseModel):
     formats: list[str] | None = None
     piece_format: str | None = None
+    # Export one voice's performance instead of the cut. The masters go to their
+    # own folder, so two variants of an episode never overwrite each other.
+    voice_id: str | None = None
+    variant_label: str | None = None
 
 
 class EffectsGenerateIn(BaseModel):
@@ -626,6 +630,32 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 "data": json.loads(render_timeline_json(tl, None, context)),
             }
 
+    @app.get("/api/scripts/{script_id}/variants")
+    def script_variants(script_id: int) -> list[dict[str, Any]]:
+        """Every voice this script has takes in, and whether each is complete.
+
+        A variant needs nothing stored: a take already records the voice that
+        produced it, so generating a script twice in two voices leaves both sets
+        side by side and this is just a different way of counting them.
+        """
+        with session_scope(db) as session:
+            _script(session, script_id)
+            total = (
+                session.scalar(select(func.count(Chunk.id)).where(Chunk.script_id == script_id))
+                or 0
+            )
+            return [
+                {
+                    "voice_id": voice_id,
+                    "chunks": covered,
+                    "chunks_total": total,
+                    # Only a voice covering every chunk can be exported; a
+                    # partial one would ship an episode with a hole in it.
+                    "complete": covered >= total > 0,
+                }
+                for voice_id, covered in voices_used(session, script_id)
+            ]
+
     @app.get("/api/scripts/{script_id}/cost")
     def script_cost(script_id: int) -> dict[str, Any]:
         with session_scope(db) as session:
@@ -869,6 +899,8 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 config,
                 formats=options.formats,
                 piece_format=options.piece_format,
+                voice_id=options.voice_id,
+                variant_label=options.variant_label,
             )
         except NothingToExport as exc:
             raise HTTPException(409, str(exc)) from exc

@@ -15,6 +15,7 @@ import type {
   ScriptTemplate,
   Slot,
   Timeline,
+  Variant,
   Voice,
   VoiceSettings,
 } from "./types";
@@ -119,6 +120,7 @@ export const api = {
   timeline: (id: number) => request<Timeline>(`/api/scripts/${id}/timeline`),
   plan: (id: number) => request<Plan>(`/api/scripts/${id}/plan`),
   cost: (id: number) => request<Cost>(`/api/scripts/${id}/cost`),
+  variants: (id: number) => request<Variant[]>(`/api/scripts/${id}/variants`),
 
   generate: (
     id: number,
@@ -146,10 +148,18 @@ export const api = {
     `/api/templates/${encodeURIComponent(slug)}${download ? "?download=1" : ""}`,
 
   formats: () => request<AudioFormatInfo[]>("/api/formats"),
-  export: (id: number, formats?: string[], pieceFormat?: string) =>
+  export: (
+    id: number,
+    formats?: string[],
+    pieceFormat?: string,
+    /** Export one voice's performance instead of the cut. */
+    variant?: { voice_id: string; label?: string },
+  ) =>
     post<ExportResult>(`/api/scripts/${id}/export`, {
       formats: formats ?? null,
       piece_format: pieceFormat ?? null,
+      voice_id: variant?.voice_id ?? null,
+      variant_label: variant?.label ?? null,
     }),
 
   audioTake: (takeId: number) => `/api/audio/take/${takeId}`,

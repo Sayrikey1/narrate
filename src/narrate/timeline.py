@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from narrate.db.models import Chunk, Cut, Effect, EffectSlot, Project, Script, Take
@@ -108,8 +108,61 @@ class Timeline:
         return bool(self.narration) and all(e.generated for e in self.narration)
 
 
-def build_timeline(session: Session, script_id: int, gap_seconds: float = 0.0) -> Timeline:
-    """Assemble the running order from what has actually been generated."""
+def takes_by_voice(session: Session, script_id: int, voice_id: str) -> dict[int, Take]:
+    """The newest succeeded take per chunk **in one voice**.
+
+    This is what makes two performances of one episode possible without storing
+    anything new: a take already records the voice that produced it, so
+    generating a script twice in two voices leaves both sets side by side and a
+    variant is just a different way of choosing between them.
+
+    Newest wins, so re-rolling a line in that voice supersedes the earlier
+    attempt — the same rule the cut follows when it auto-selects.
+    """
+    rows = session.execute(
+        select(Chunk.id, Take)
+        .join(Take, Take.chunk_id == Chunk.id)
+        .where(
+            Chunk.script_id == script_id,
+            Take.voice_id == voice_id,
+            Take.status == "succeeded",
+        )
+        .order_by(Chunk.ordinal, Take.ordinal)
+    ).all()
+    # Later rows overwrite earlier ones, leaving the highest ordinal per chunk.
+    return {chunk_id: take for chunk_id, take in rows}
+
+
+def voices_used(session: Session, script_id: int) -> list[tuple[str, int]]:
+    """`(voice_id, chunks covered)` for every voice this script has takes in.
+
+    Ordered by coverage, so the voice that could actually produce a complete
+    export comes first. A voice covering fewer chunks than the script has is
+    a partial performance, and saying so is the difference between "here are
+    your variants" and "here is a list of voice ids".
+    """
+    rows = session.execute(
+        select(Take.voice_id, func.count(func.distinct(Chunk.id)))
+        .join(Chunk, Chunk.id == Take.chunk_id)
+        .where(Chunk.script_id == script_id, Take.status == "succeeded")
+        .group_by(Take.voice_id)
+    ).all()
+    return sorted(((v, n) for v, n in rows), key=lambda pair: (-pair[1], pair[0]))
+
+
+def build_timeline(
+    session: Session,
+    script_id: int,
+    gap_seconds: float = 0.0,
+    voice_id: str | None = None,
+) -> Timeline:
+    """Assemble the running order from what has actually been generated.
+
+    `voice_id` builds a **variant**: the running order as that one voice
+    performed it, rather than as the cut selects it. Everything downstream —
+    durations, positions, the editing plan, the export — follows from this one
+    choice, so a variant needs no separate machinery.
+    """
     script = session.get(Script, script_id)
     if script is None:
         raise ValueError(f"No script with id {script_id}.")
@@ -120,14 +173,17 @@ def build_timeline(session: Session, script_id: int, gap_seconds: float = 0.0) -
             select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
         ).all()
     )
-    selected = {
-        chunk_id: take
-        for chunk_id, take in session.execute(
-            select(Cut.chunk_id, Take)
-            .join(Take, Take.id == Cut.take_id)
-            .where(Cut.script_id == script_id)
-        ).all()
-    }
+    if voice_id is not None:
+        selected = takes_by_voice(session, script_id, voice_id)
+    else:
+        selected = {
+            chunk_id: take
+            for chunk_id, take in session.execute(
+                select(Cut.chunk_id, Take)
+                .join(Take, Take.id == Cut.take_id)
+                .where(Cut.script_id == script_id)
+            ).all()
+        }
 
     slots_by_chunk: dict[int, list[EffectSlot]] = {}
     for slot in session.scalars(

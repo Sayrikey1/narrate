@@ -120,7 +120,7 @@ Re-rolling one chunk leaves the others untouched:
 narrate generate 1 --only 7 --go --force
 ```
 
-**42 commands** in all. `narrate --help` lists them; every one that spends says
+**46 commands** in all. `narrate --help` lists them; every one that spends says
 so first.
 
 ---
@@ -205,6 +205,51 @@ toggles play/pause; clicking either lane seeks.
 
 🌗 Dark and light, following your OS unless you choose; `?theme=light` pins it
 in a link.
+
+---
+
+## 🎭 Cloned voices, and two versions of one script
+
+A clone is an ordinary `voice_id` once it exists, so everything here already
+works with one — the picker lists it, you can audition it, and it can be cast on
+a project or a single chunk.
+
+```bash
+narrate voice capability            # may this account clone? how many slots left?
+narrate voice list --mine           # voices you created, clones included
+narrate voice clone "My Voice" samples/*.mp3 --assign "My Channel"
+narrate voice remove <voice_id>     # frees the slot; existing takes keep working
+```
+
+Cloning costs **no characters** — it consumes one of the account's voice *slots*.
+The plan permission and the free slot count are checked before anything is
+uploaded, so a plan that does not allow cloning gets an explanation rather than
+an opaque error.
+
+### Two performances, one generation history
+
+Generate a script, change the voice, generate again with `--force`. Every take is
+kept and each records the voice that produced it, so both versions stay
+available and either can be exported:
+
+```bash
+narrate generate 1 --go                        # the original voice
+narrate project set "My Channel" --voice <cloned>
+narrate generate 1 --go --force                # the clone
+
+narrate takes 1                                # both takes per chunk, with voices
+narrate export 1 --voice <original>            # -> Ep__brian.wav
+narrate export 1 --voice <cloned>              # -> Ep__my-voice.wav
+```
+
+Each variant writes to its own folder, so neither overwrites the other. The
+Media page lists them with their coverage and an export button each.
+
+**Nothing is stored to make this work.** A take has always recorded its voice; a
+variant is only a different way of choosing between takes. A voice covering
+fewer chunks than the script has cannot be exported — the master would carry a
+silent gap — and the refusal names the missing lines and the command that fills
+them.
 
 ---
 
@@ -303,7 +348,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 448 Python + 67 frontend tests
+just check                        # 462 Python + 67 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -353,7 +398,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                448 Python tests
+tests/                462 Python tests
 assets/               generated audio (gitignored)
 ```
 
@@ -392,7 +437,8 @@ React itself.
 ## 🚧 Not supported
 
 Stated plainly, because a gap you know about is cheaper than one you discover:
-voice cloning or design (use ElevenLabs' own UI and consume the `voice_id`),
+voice *design* (generating a voice from a text description — cloning **is**
+supported), professional voice cloning (instant only),
 Postgres (the seam exists, no dialect but SQLite is tested), multi-user,
 loudness normalisation, effects mixed into the master (they are overlays by
 design), and `.docx`/`.pdf` scripts. Dialogue pricing is undocumented by the

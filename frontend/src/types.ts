@@ -215,6 +215,18 @@ export interface ScriptTemplate {
   filename: string;
 }
 
+/** One voice's performance of a script, assembled from the takes on record.
+ *
+ *  Nothing is stored for a variant — a take already records the voice that made
+ *  it, so this is a count rather than a new entity. Only a voice covering every
+ *  chunk can be exported; a partial one would ship an episode with a hole. */
+export interface Variant {
+  voice_id: string;
+  chunks: number;
+  chunks_total: number;
+  complete: boolean;
+}
+
 export interface Slot {
   id: number;
   at_chunk_ordinal: number;
