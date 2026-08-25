@@ -1,0 +1,35 @@
+# Secrets — the API key lives here and must never be committed.
+.env
+.env.*
+!.env.example
+
+# Per-account API metadata cached by `narrate models --sync`. Lives with the
+# database now; this covers an older checkout that still writes it here.
+narrate.observed.json
+
+# Generated audio. The ledger database now lives outside the project — see
+# src/narrate/db/locate.py — but these stay so an older checkout, an explicit
+# NARRATE_DB_PATH, or a stray copy can never be committed.
+assets/
+*.db
+*.db-wal
+*.db-shm
+# macOS names a duplicate "narrate 2.db". Three of those accumulated in this
+# directory during development; `*.db` already covers them, and this line is
+# here so the pattern is recognised rather than puzzled over next time.
+* [0-9].db
+
+# Frontend
+node_modules/
+frontend/dist/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/

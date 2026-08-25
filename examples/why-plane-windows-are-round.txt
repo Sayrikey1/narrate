@@ -1,0 +1,42 @@
+Look out of an aeroplane window and you are looking through a shape that was
+paid for in lives. The rounded corner is not a style choice. It is a correction.
+
+In 1952 the de Havilland Comet became the first jet airliner in commercial
+service, and by every measure that mattered then it was a triumph. It flew at
+500 miles per hour, roughly twice the speed of the propeller aircraft it
+replaced, and it cruised at 35,000 feet, above most of the weather. Passengers
+described the ride as uncannily smooth.
+
+Then, in the space of twelve months, three of them came apart in the air.
+
+The first was in May 1953, near Calcutta. The second, in January 1954, off
+Elba. The third, in April, near Naples. Fifty-six people died in the last two
+alone. The fleet was grounded, and the investigation that followed is still
+taught, because of how it was done.
+
+Investigators recovered roughly two thirds of the Elba aircraft from the
+seabed, extraordinary for the era. In parallel, engineers submerged an intact
+Comet fuselage in a water tank and pressurised it over and over, simulating
+flight after flight. After the equivalent of approximately 3,000 flights, the
+tank fuselage failed.
+
+It failed at a corner. Specifically, at the corner of a window.
+
+The Comet's windows were square, or near enough. A square corner concentrates
+stress: the load has nowhere to spread, so it piles up in a very small area. On
+the ground that is fine. But a pressurised cabin inflates slightly at altitude
+and relaxes on descent, every single flight, and metal that is flexed enough
+times will crack no matter how strong it is. Engineers call it metal fatigue,
+and in 1952 it was understood in theory far better than it was in practice.
+
+A curve has no such corner. Spread the same load around an arc and the stress
+distributes instead of accumulating. That is the whole idea.
+
+De Havilland never recovered its lead; Boeing took it with the 707. But every
+pressurised aircraft built since, by anyone, has rounded windows, and the
+reason is a water tank in Farnborough and three aircraft that should have come
+home.
+
+Next time you are at 35,000 feet, put a finger on that curve. It is one of the
+few pieces of engineering you can actually touch that exists because somebody
+worked out, at real cost, exactly why the obvious shape was wrong.

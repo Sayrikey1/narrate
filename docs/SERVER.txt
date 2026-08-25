@@ -1,0 +1,109 @@
+narrate - starting and stopping the server
+=========================================
+
+A quick cheat sheet for Unix shells (macOS, Linux, WSL). Everything here is
+also in INSTALL.md, with the Windows equivalents and more detail — this file is
+kept because a plain-text card is faster to grep than a rendered document.
+
+
+START - development (API + UI, hot reload)
+------------------------------------------
+
+    just up
+
+    backend   http://127.0.0.1:8420
+    frontend  http://127.0.0.1:5173   <- open this one
+
+Open port 5173. Vite serves the UI and proxies /api through to the backend,
+so you only need the one URL.
+
+First time only:
+
+    just ui-install
+
+
+START - normal use (one port, UI served by the backend)
+-------------------------------------------------------
+
+    just ui-build       # once, and again after any frontend change
+    just serve
+
+    http://127.0.0.1:8420
+
+Use this when you are producing rather than editing the frontend. One process,
+one port, no node running.
+
+
+STOP
+----
+
+    Ctrl+C
+
+in the terminal that is running it. That stops both services and frees both
+ports.
+
+If that terminal is gone, or a port is still held:
+
+    pkill -f "narrate serve"
+    pkill -f "bin/vite"
+
+Confirm nothing is left listening:
+
+    lsof -nP -iTCP:8420 -iTCP:5173 -sTCP:LISTEN
+
+No output means both ports are free.
+
+
+PAGES WORTH BOOKMARKING
+-----------------------
+
+Every page is a real URL and survives a reload, so any of these can be opened
+directly (5173 in development, 8420 when the backend serves the UI):
+
+    /                       projects
+    /script/1               track view, chunks and takes, generate, export
+    /script/1/effects       cue slots and the reusable library
+    /script/1/media         every artifact, with playback and download
+    /script/1/plan          the editing plan
+    /costs                  spend across every project
+
+Add ?theme=light or ?theme=dark to pin the appearance in a link.
+
+
+SPENDING NOTHING
+----------------
+
+To click around without touching the API or your character balance:
+
+    NARRATE_PROVIDER=mock just up
+
+Generation then produces silence of a plausible length. The whole pipeline
+works - chunking, effects, export, the ledger - at zero cost.
+
+
+IF A PORT IS ALREADY IN USE
+---------------------------
+
+    Address already in use
+
+means a previous run is still alive. Use the two pkill lines above, then start
+again. This is the usual cause; it is not a code problem.
+
+To run on different ports instead:
+
+    uv run narrate serve --port 9000
+
+
+NOTES
+-----
+
+- `just` recipes set UV_PROJECT_ENVIRONMENT themselves, so you do not need it
+  in your shell. A bare `uv run narrate serve` does - the venv lives outside
+  this folder because iCloud breaks virtualenvs inside it. See the README.
+
+- Ctrl+C works because the terminal signals the whole foreground process
+  group. If you kill the `just` process on its own from somewhere else, the
+  cleanup will not run and you will need the pkill lines.
+
+- `just serve` without `just ui-build` still answers on /api, and says so, but
+  there will be no UI to look at.
