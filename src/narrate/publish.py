@@ -324,6 +324,10 @@ def _summary(timeline: Timeline, ctx: PublishContext, target: Target) -> str:
         parts.append(f"{len(ctx.titles)} title candidate(s)")
     if not timeline.is_complete:
         parts.append("**incomplete**")
+    # An upload pack should not read as finished with a known hole in it.
+    suspect = sum(1 for e in timeline.narration if e.check == "suspect")
+    if suspect:
+        parts.append(f"**{suspect} take(s) flagged — see plan.md**")
     return " · ".join(parts)
 
 

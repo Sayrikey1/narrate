@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 
 from narrate.db.models import Chunk, Cut, Effect, EffectSlot, Project, Script, Take
 from narrate.script_parse import format_time
+from narrate.verify.service import heard_by_transcript
 
 # What a planned (ungenerated) effect is drawn as when its slot names no
 # duration. Only ever used for display — nothing is billed from it.
@@ -56,6 +57,18 @@ class TimelineEntry:
     # list is a read of the timeline rather than a second query — the timestamp
     # a chapter needs is `start_s`, which only exists here.
     chapter_title: str | None = None
+
+    # What `narrate verify` found in this entry's take: its status, and each
+    # problem as (seconds into the take, severity, one-line summary). Carried
+    # here because every document that reports the episode — plan.md,
+    # publish.md, the export check, the API — already reads the timeline, and a
+    # flagged take must not reach an upload unmentioned.
+    check: str | None = None
+    issues: tuple[tuple[float, str, str], ...] = ()
+    # Whether speech-to-text listened to this take's words. The waveform check
+    # alone cannot clear a take, so a gate that must know a take was *heard*
+    # reads this, not `check`.
+    heard: bool = False
 
     @property
     def duration_s(self) -> float:
@@ -102,6 +115,11 @@ class Timeline:
     @property
     def planned(self) -> list[TimelineEntry]:
         return [e for e in self.entries if e.kind == PLANNED]
+
+    @property
+    def flagged(self) -> list[TimelineEntry]:
+        """Narration whose take `narrate verify` flagged, in running order."""
+        return [e for e in self.narration if e.check in ("suspect", "review")]
 
     @property
     def chapter_starts(self) -> list[TimelineEntry]:
@@ -261,6 +279,9 @@ def build_timeline(
                 target_s=chunk.target_start_s,
                 generated=bool(take and take.asset_path and take.duration_s),
                 chapter_title=chunk.chapter_title,
+                check=take.verify_status if take else None,
+                issues=_issues(take) if take else (),
+                heard=take is not None and heard_by_transcript(take.verifier),
             )
         )
         index += 1
@@ -295,3 +316,14 @@ def export_basename(project_name: str, start_s: float, end_s: float) -> str:
 def _stamp(seconds: float) -> str:
     """`HH-MM-SS-mmm` — filename-safe, and sorts chronologically."""
     return format_time(seconds).replace(":", "-").replace(".", "-")
+
+
+def _issues(take: Take) -> tuple[tuple[float, str, str], ...]:
+    """A take's stored problems, in the plain shape the timeline carries."""
+    from narrate.verify.service import findings_of
+
+    return tuple(
+        (round(f.start_s, 2), f.severity, f.summary)
+        for f in findings_of(take)
+        if f.severity != "info"
+    )

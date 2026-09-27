@@ -1075,3 +1075,70 @@ def test_the_registered_route_is_not_swallowed_by_the_preview_route(
     response = client.get("/api/voices/registered")
     assert response.status_code == 200
     assert isinstance(response.json(), list)
+
+
+# --------------------------------------------------------------------------
+# The default model
+# --------------------------------------------------------------------------
+
+
+def test_a_project_created_without_a_model_gets_eleven_v3(client: TestClient) -> None:
+    created = client.post("/api/projects", json={"name": "Default", "voice_id": "v1"}).json()
+    listed = {p["id"]: p for p in client.get("/api/projects").json()}
+    assert listed[created["id"]]["model_id"] == "eleven_v3"
+
+
+def test_the_model_list_names_exactly_one_default(client: TestClient) -> None:
+    """The web form preselects this flag rather than re-deriving the rule."""
+    models = client.get("/api/models").json()
+    assert [m["model_id"] for m in models if m["default"]] == ["eleven_v3"]
+
+
+def test_a_new_project_cannot_carry_tags_its_model_would_read_aloud(
+    client: TestClient,
+) -> None:
+    response = client.post(
+        "/api/projects",
+        json={
+            "name": "Tagged",
+            "voice_id": "v1",
+            "model_id": "eleven_multilingual_v2",
+            "prefix_tags": "[calm]",
+        },
+    )
+    assert response.status_code == 422
+    assert "audio tags" in response.json()["detail"]
+
+
+def test_a_new_project_on_the_default_may_carry_tags(client: TestClient) -> None:
+    response = client.post(
+        "/api/projects", json={"name": "Tagged", "voice_id": "v1", "prefix_tags": "[calm]"}
+    )
+    assert response.status_code == 200
+
+
+def test_a_model_change_that_would_strand_the_projects_tags_is_refused(
+    client: TestClient,
+) -> None:
+    """Following the "Multilingual v2 stitches" hint on a tagged project must not
+    save a model that would read the tags aloud — it must say so, and change
+    nothing."""
+    created = client.post(
+        "/api/projects", json={"name": "T", "voice_id": "v1", "prefix_tags": "[calm]"}
+    ).json()
+
+    refused = client.patch(
+        f"/api/projects/{created['id']}",
+        json={"model_id": "eleven_multilingual_v2", "voice_id": "v1", "settings": {}},
+    )
+    assert refused.status_code == 422
+    assert "[calm]" in refused.json()["detail"]
+    listed = {p["id"]: p for p in client.get("/api/projects").json()}
+    assert listed[created["id"]]["model_id"] == "eleven_v3"
+
+    cleared = client.patch(
+        f"/api/projects/{created['id']}",
+        json={"model_id": "eleven_multilingual_v2", "prefix_tags": ""},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["model_id"] == "eleven_multilingual_v2"

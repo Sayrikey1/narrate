@@ -20,6 +20,7 @@ clone to a generated episode — without spending a cent until you choose to.
 | **Node.js** | The web UI. Skip it if you only want the CLI | 20+ |
 | **[just](https://github.com/casey/just)** | Task shortcuts. Optional — every recipe is a plain command underneath | 1.27+ |
 | **An ElevenLabs API key** | Only for real audio. The offline provider needs nothing | — |
+| **The `verify` extra** | Optional. Checks that every word was actually spoken — see below | — |
 
 > ⚠️ **Python 3.12 exactly.** `pyproject.toml` pins `>=3.12,<3.13`, which is
 > what the project is developed and tested against. `uv` will fetch 3.12 for you
@@ -270,6 +271,45 @@ migrate a database you moved in by hand.
 
 ---
 
+## 🔎 Optional: checking that every word was spoken
+
+A speech model occasionally drops, adds or swaps a word in a take. `narrate
+verify` finds those takes by transcribing them **locally** — free, nothing
+uploaded. It is an optional extra so the core install stays light: about 55 MB
+of wheels on Apple Silicon, up to about 130 MB on Linux (no torch), and a speech
+model of about 480 MB downloaded once, only when you ask for it.
+
+```bash
+uv sync --extra verify              # or: just sync-verify   ·   pip: pip install --prefer-binary -e '.[verify]'
+narrate verify --download-model     # once, about 480 MB
+narrate doctor                      # the speech-to-text row should read "ready"
+```
+
+Where it installs — checked against the lockfile's wheels, not assumed:
+
+| Platform | `uv sync --extra verify` |
+|---|---|
+| macOS, Apple Silicon | macOS 14 or later. On 13, use `pip install --prefer-binary -e '.[verify]'` — `--prefer-binary` makes pip take older wheels rather than try to compile the newest from source |
+| macOS, Intel | macOS 13 or later. `uv` picks an older onnxruntime automatically — the current one ships no Intel wheel |
+| Linux, x86-64 and ARM64 | glibc 2.28 or later — Ubuntu 20.04, Debian 10, RHEL 8 and newer. **Not Alpine or other musl distributions** |
+| Windows, x86-64 | Yes |
+| Windows, ARM64 | **Not supported**: the speech engine publishes no wheels for it |
+
+Where it does not install, everything else in narrate still works; use
+`narrate verify --energy-only` for the waveform check alone.
+
+> ⚠️ Plain `uv sync` and `just sync` remove extras they were not asked for.
+> Once verification is installed, sync with `just sync-verify`.
+
+> 📴 Offline machine? Copy the model directory from another machine and set
+> `NARRATE_STT_MODEL_DIR` to it. Nothing is ever downloaded without
+> `--download-model`.
+
+Everything else about it — what it catches, what it cannot, and regenerating
+the takes it flags — is in **[VERIFY.md](VERIFY.md)**.
+
+---
+
 ## ✅ Verify the install
 
 ```bash
@@ -286,6 +326,7 @@ just doctor
 │ api key         │ set       │ ELEVEN_API in .env                            │
 │ media           │ empty     │ ./assets                                      │
 │ rate card       │ ok        │ 5 models, version 2026-08-21                  │
+│ speech-to-text  │ ready     │ ~/.local/share/narrate/models/faster-whisp…   │
 │ provider        │ reachable │ tier=payg used=7,243/48,461                    │
 └─────────────────┴───────────┴───────────────────────────────────────────────┘
 ```
@@ -298,7 +339,7 @@ path:
 ```bash
 just demo               # one voice, five chunks, five cues, exported
 just demo-dialogue      # two speakers, both modes
-just check              # 496 Python + 67 frontend tests
+just check              # 769 Python + 93 frontend tests
 ```
 
 ---

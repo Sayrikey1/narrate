@@ -126,6 +126,25 @@ def render_plan(
                 f"landed {entry.start_stamp} ({drift:+.1f}s {direction})"
             )
 
+    flagged = timeline.flagged
+    if flagged:
+        lines += [
+            "",
+            "## Takes to check",
+            "",
+            "`narrate verify` compared these takes with the script and found words",
+            "missing, added or changed. Listen at the times below; regenerate with",
+            "`narrate regenerate` if it is what it looks like.",
+            "",
+        ]
+        for entry in flagged:
+            for offset, severity, summary in entry.issues:
+                mark = "⚠️" if severity == "fail" else "👂"
+                lines.append(
+                    f"- {mark} **{format_time(entry.start_s + offset)}** — chunk "
+                    f"{entry.chunk_ordinal}: {summary}"
+                )
+
     missing = [e for e in timeline.narration if not e.generated]
     if missing:
         lines += [
@@ -153,6 +172,9 @@ def _summary_line(timeline: Timeline, ctx: PlanContext) -> str:
         parts.append(f"{len(timeline.effects)} effects")
     if timeline.planned:
         parts.append(f"{len(timeline.planned)} planned")
+    suspect = sum(1 for e in timeline.narration if e.check == "suspect")
+    if suspect:
+        parts.append(f"**{suspect} take(s) flagged**")
     if ctx.cost_micros:
         parts.append(f"spent {fmt_usd(ctx.cost_micros, 2)}")
         # Divided by the runtime this document reports, not by the ledger's

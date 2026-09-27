@@ -85,6 +85,9 @@ def project(
     registry: Registry,
     *,
     with_effects: bool = True,
+    only: list[int] | None = None,
+    force: bool = False,
+    settings: Settings | None = None,
 ) -> Projection:
     """Price the work still to do, across both phases.
 
@@ -95,7 +98,10 @@ def project(
     """
     rates = EffectRates.load()
     with session_scope(engine) as session:
-        todo = ledger.outstanding(session, script_id, registry)
+        # Strict: this figure is what a run is confirmed and held to.
+        todo = ledger.outstanding(
+            session, script_id, registry, only=only, force=force, settings=settings, strict=True
+        )
 
     effect_micros = rates.cost_micros(todo.effect_seconds) if with_effects else 0
     return Projection(
@@ -133,7 +139,15 @@ async def produce(
         if on_event:
             on_event(message)
 
-    projection = project(engine, script_id, registry, with_effects=with_effects)
+    projection = project(
+        engine,
+        script_id,
+        registry,
+        with_effects=with_effects,
+        only=only,
+        force=force,
+        settings=settings,
+    )
     report = ProductionReport(dry_run=dry_run, projection=projection)
 
     # The cap is checked here, once, against both phases. Passing the effect

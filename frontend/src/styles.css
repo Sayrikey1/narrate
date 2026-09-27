@@ -286,6 +286,7 @@ tr.selected-row td { background: color-mix(in srgb, var(--accent) 11%, transpare
   margin-top: var(--s-2); line-height: 1.5;
 }
 .note.warn { color: var(--planned); }
+.note.error { color: var(--danger); }
 
 .tag {
   display: inline-flex; align-items: center; gap: var(--s-1);
@@ -297,6 +298,11 @@ tr.selected-row td { background: color-mix(in srgb, var(--accent) 11%, transpare
 .tag.effect   { color: var(--effect);   border-color: color-mix(in srgb, var(--effect) 45%, transparent); }
 .tag.planned  { color: var(--planned);  border-color: color-mix(in srgb, var(--planned) 45%, transparent); }
 .tag.cut      { color: var(--ok);       border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+/* Verification. There is deliberately no "ok" colour for a clean check: it
+   means nothing was found, not that the take is perfect, so it stays quiet. */
+.tag.bad      { color: var(--danger);   border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.tag.warn     { color: var(--planned);  border-color: color-mix(in srgb, var(--planned) 45%, transparent); }
+.tag.quiet    { color: var(--text-faint); border-style: dashed; }
 
 .stat {
   display: flex; justify-content: space-between; align-items: baseline;
@@ -1003,4 +1009,66 @@ button.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--acc
   padding-top: 0.45rem;
   border-top: 1px solid light-dark(#e4e4e7, #27272a);
   font-size: 0.9rem;
+}
+
+/* -- verify and regenerate ---------------------------------------------- */
+
+.take + .take { margin-top: var(--s-2); }
+
+.findings {
+  list-style: none; margin: var(--s-1) 0 0; padding: 0 0 0 var(--s-2);
+  border-left: 2px solid var(--line-soft);
+  display: grid; gap: 2px; font-size: var(--t-sm);
+}
+/* The time and the words side by side: a long finding wraps beside its
+   button rather than under it, so the button always marks the line it plays. */
+.findings li {
+  display: grid; grid-template-columns: auto 1fr;
+  align-items: baseline; gap: var(--s-2);
+}
+.findings li.faint { display: block; }
+.findings li.fail { color: var(--danger); }
+.findings li.review { color: var(--planned); }
+.findings li > span { color: var(--text); }
+.finding-time {
+  padding: 0 var(--s-1); font-family: var(--mono); font-size: var(--t-xs);
+  background: transparent; border-color: currentColor; color: inherit;
+}
+
+.regen-toggle { margin-top: var(--s-2); }
+.regen-toggle[aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }
+.regen-toggle[aria-disabled="true"]:hover { background: none; }
+tr.regen-open > td { border-bottom-color: transparent; }
+tr.regen-row > td { padding-top: 0; }
+
+.regen {
+  display: grid; gap: var(--s-3);
+  padding: var(--s-3) var(--s-4); border-radius: var(--r-md);
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+}
+.regen-options { display: grid; gap: var(--s-2); }
+.regen-options label:not(.checkbox) {
+  display: grid; gap: var(--s-1); font-size: var(--t-sm); color: var(--text-dim);
+  max-width: 420px;
+}
+.regen-text { width: 100%; font: inherit; line-height: 1.5; resize: vertical; }
+.regen-quote { margin: 0; font-size: var(--t-md); }
+.regen-actions { display: flex; gap: var(--s-2); flex-wrap: wrap; }
+
+@media (max-width: 640px) {
+  .regen { padding: var(--s-3); }
+  .regen-actions button { flex: 1 1 auto; }
+
+  /* Four columns do not fit a phone once a take carries a player, a verdict
+     and its findings. Each chunk becomes a block: number and size on one
+     line, then the opening, then the takes at full width. */
+  table.chunks thead { display: none; }
+  table.chunks, table.chunks tbody, table.chunks tr, table.chunks td {
+    display: block; width: 100%;
+  }
+  table.chunks tr { padding: var(--s-3) 0; border-bottom: 1px solid var(--line-soft); }
+  table.chunks td { border: 0; padding: var(--s-1) 0; }
+  table.chunks td.num { display: inline-block; width: auto; margin-right: var(--s-3); }
+  table.chunks .take-row { flex-wrap: wrap; }
 }

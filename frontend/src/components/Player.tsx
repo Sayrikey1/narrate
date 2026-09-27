@@ -32,12 +32,16 @@ export function Player({
   duration,
   download,
   wide,
+  cue,
 }: {
   src: string;
   /** Known ahead of metadata load, so the bar is right before first play. */
   duration?: number | null;
   download?: string;
   wide?: boolean;
+  /** Jump to `at` seconds and play. A new `nonce` repeats the jump, so the same
+   *  spot can be played twice in a row. */
+  cue?: { at: number; nonce: number } | null;
 }) {
   const ref = useRef<HTMLAudioElement | null>(null);
   const scrub = useRef<HTMLDivElement | null>(null);
@@ -90,6 +94,19 @@ export function Player({
       ref.current = null;
     };
   }, [src, pause]);
+
+  // Playing from a cue goes through the same solo rule as the play button, so
+  // hearing a flagged word never overlaps whatever else was playing.
+  useEffect(() => {
+    const audio = ref.current;
+    if (!cue || !audio) return;
+    if (current && current !== audio) current.pause();
+    current = audio;
+    claimSolo(pause);
+    audio.currentTime = Math.max(0, cue.at);
+    setAt(audio.currentTime);
+    void audio.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+  }, [cue, pause]);
 
   function toggle() {
     const audio = ref.current;

@@ -19,17 +19,17 @@ export function ModelField({
   models: Model[];
   value: string;
   onChange: (id: string) => void;
-  /** Choose the best long-form model once the list arrives. */
+  /** Preselect the server's default model once the list arrives. */
   autoSelect?: boolean;
 }) {
   const model = models.find((m) => m.model_id === value);
 
   useEffect(() => {
     if (!autoSelect || value || !models.length) return;
-    // Default to the model rated best for long-form work, which is the one
-    // where request stitching keeps prosody continuous across chunks.
-    const best = models.find((m) => m.long_form === "best") ?? models[0];
-    if (best) onChange(best.model_id);
+    // The server says which model is the default, so the form, the CLI and
+    // the API cannot disagree about it.
+    const chosen = models.find((m) => m.default) ?? models[0];
+    if (chosen) onChange(chosen.model_id);
   }, [autoSelect, models, value, onChange]);
 
   return (
@@ -38,21 +38,31 @@ export function ModelField({
         label="Model"
         value={value}
         onChange={onChange}
-        options={models.map((m) => ({
-          value: m.model_id,
-          label: `${m.label} — $${m.usd_per_1k.toFixed(2)}/1k, ${m.max_chars.toLocaleString()} chars`,
-        }))}
+        options={[
+          // A project on a model no longer offered (a deprecated one) must show
+          // that model, not whichever option happens to come first — or the
+          // form would display one model and save another.
+          ...(value && !model ? [{ value, label: `${value} (no longer offered — choose another)` }] : []),
+          ...models.map((m) => ({
+            value: m.model_id,
+            label:
+              `${m.label} — $${m.usd_per_1k.toFixed(2)}/1k, ${m.max_chars.toLocaleString()} chars` +
+              (m.default ? " (default)" : ""),
+          })),
+        ]}
       />
       {model?.continuity_mode === "none" && (
         <Notice tone="warn">
           {model.label} has no cross-chunk continuity — neither request stitching
-          nor text conditioning — so seams between chunks are unavoidable.
+          nor text conditioning — so seams between chunks are unavoidable. For
+          one long narrator where that matters most, Multilingual v2 stitches.
         </Notice>
       )}
       {model?.dialogue && (
         <Notice tone="ok">
           {model.label} can render several speakers in one request. Cast the
-          project and add <code>--dialogue</code> when ingesting.
+          project, then add the script from the command line with{" "}
+          <code>narrate script add … --dialogue</code>.
         </Notice>
       )}
       {model?.note && <Notice>{model.note}</Notice>}

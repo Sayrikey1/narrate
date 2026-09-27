@@ -25,6 +25,22 @@ dependencies = [
     "python-multipart>=0.0.32",
 ]
 
+# `narrate verify` — checking that every word in the script was actually spoken.
+# Optional, so the core install stays light: faster-whisper brings CTranslate2
+# and onnxruntime (55-130 MB of wheels by platform, no torch) and a speech model of about
+# 480 MB that is downloaded only when asked for. Without the extra, verification
+# reports itself unavailable and nothing else changes.
+#
+# onnxruntime stopped shipping Intel-Mac wheels for Python 3.12 after 1.23.2, so
+# that one platform is held back. Nowhere else is pinned: faster-whisper already
+# requires onnxruntime, and a floor here only locked out platforms — older
+# Apple-Silicon macOS — whose newest wheel predates it.
+[project.optional-dependencies]
+verify = [
+    "faster-whisper>=1.2,<2",
+    "onnxruntime<1.24; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+
 [project.scripts]
 narrate = "narrate.cli:app"
 
@@ -50,6 +66,8 @@ packages = ["src/narrate"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Upstream code, kept byte-comparable with its source — see its docstring.
+extend-exclude = ["src/narrate/verify/_whisper_normalizer.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
@@ -74,6 +92,16 @@ mypy_path = "src"
 explicit_package_bases = true
 namespace_packages = true
 
+# Vendored upstream code, deliberately left as it was written.
+[[tool.mypy.overrides]]
+module = ["narrate.verify._whisper_normalizer"]
+ignore_errors = true
+
+# An optional extra, imported lazily; it ships no type information.
+[[tool.mypy.overrides]]
+module = ["faster_whisper", "faster_whisper.*", "ctranslate2", "ctranslate2.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
@@ -84,4 +112,5 @@ addopts = "-ra --strict-markers"
 markers = [
     "live: spends real API characters — never runs by default",
     "ffmpeg: requires ffmpeg on PATH",
+    "stt: loads a real speech-to-text model — needs the verify extra and a downloaded model",
 ]

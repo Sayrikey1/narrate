@@ -807,3 +807,26 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
 def strip_markers(text: str) -> str:
     """The cleaned narration alone — what is safe to send and to bill for."""
     return parse_script(text).text
+
+
+# An audio tag: `[fast-paced]`, `[whispers]`, `[building energy]`. Short, on one
+# line, and — after `parse_script` — never one of the structural markers, which
+# are gone by then.
+_AUDIO_TAG_RE = re.compile(r"\[[^\]\n]{1,60}\]")
+
+
+def spoken_text(text: str, *, audio_tags: bool) -> str:
+    """What a chunk should actually *sound* like.
+
+    Different from what was sent. On a model that honours audio tags,
+    `[fast-paced]` is a performance direction and is never spoken, so anything
+    comparing the audio against the text has to remove it first — or every tag
+    would be reported as a missing word.
+
+    On a model that does not honour them, the brackets are left in, because
+    that model will read them out: the honest expectation is the embarrassing
+    one, and the lint at ingest is where that gets caught before any spend.
+    """
+    if not audio_tags:
+        return text
+    return " ".join(_AUDIO_TAG_RE.sub(" ", text).split())

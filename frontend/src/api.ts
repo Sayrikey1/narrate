@@ -11,12 +11,15 @@ import type {
   ProjectDetail,
   ProjectMedia,
   Publish,
+  RegenerateBody,
+  RegenerateQuote,
   ScriptCreated,
   ScriptSummary,
   ScriptTemplate,
   Slot,
   Timeline,
   Variant,
+  VerifyCapability,
   Voice,
   VoiceSettings,
 } from "./types";
@@ -120,6 +123,13 @@ export const api = {
   chunks: (id: number) => request<ChunkRow[]>(`/api/scripts/${id}/chunks`),
   timeline: (id: number) => request<Timeline>(`/api/scripts/${id}/timeline`),
   plan: (id: number) => request<Plan>(`/api/scripts/${id}/plan`),
+  verifyCapability: () => request<VerifyCapability>("/api/verify"),
+  /** Check takes against the script. Costs nothing; stream `run_key`. */
+  verify: (id: number, body: { chunks?: number[]; recheck?: boolean } = {}) =>
+    post<{ run_key: string; mode: string }>(`/api/scripts/${id}/verify`, body),
+  /** Without `confirm` this only prices the work and sends nothing. */
+  regenerate: (id: number, body: RegenerateBody) =>
+    post<RegenerateQuote>(`/api/scripts/${id}/regenerate`, body),
   publish: (id: number) => request<Publish>(`/api/scripts/${id}/publish`),
   acceptTitle: (scriptId: number, candidateId: number) =>
     request<{ id: number; text: string }>(

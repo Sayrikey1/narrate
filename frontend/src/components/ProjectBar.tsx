@@ -146,6 +146,10 @@ export function ProjectBar({
 
       {open === "profile" && current && (
         <ProjectForm
+          // Keyed by project: the form seeds its fields once, so without a
+          // remount, selecting another project would save the first one's
+          // model and voice onto it.
+          key={current.id}
           models={models}
           project={current}
           onDone={() => {

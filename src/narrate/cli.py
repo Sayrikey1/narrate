@@ -20,6 +20,7 @@ from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from sqlalchemy import Engine, func, select
@@ -30,6 +31,7 @@ from narrate import media as media_mod
 from narrate import probe as probe_mod
 from narrate import produce as produce_mod
 from narrate import reconcile as reconcile_mod
+from narrate import regenerate as regen
 from narrate import voices as voices_mod
 from narrate.chunking import Chunk as ChunkObj
 from narrate.chunking import merge_chunks, split_chunk
@@ -63,16 +65,20 @@ from narrate.export import (
     write_publish_pack_only,
 )
 from narrate.ingest import ScriptHasTakes, ingest_script
+from narrate.lint import lint_chunks
 from narrate.money import fmt_usd
 from narrate.provider.base import ProviderError, SFXProvider, TTSProvider
 from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
-from narrate.registry import ModelSpec, Registry, detect_drift, save_observed
+from narrate.registry import ModelSpec, Registry, UnknownModel, detect_drift, save_observed
 from narrate.runner import generate as run_generate
 from narrate.script_parse import format_time, parse_script
 from narrate.settings import MissingAPIKey, Settings, get_settings, resolve_provider
 from narrate.suggest import MODEL_RATES, SuggestionRun, estimate_tokens, suggest_for_chunks
 from narrate.timeline import build_timeline
+from narrate.verify import service as verify_service
+from narrate.verify import transcribe as stt
+from narrate.verify.compare import FAIL, INFO, REVIEW
 
 console = Console()
 
@@ -114,7 +120,9 @@ def _provider(settings: Settings, override: str | None = None) -> TTSProvider:
 
 def _die(message: str) -> NoReturn:
     """Print and exit. Typed `NoReturn` so callers narrow correctly after it."""
-    console.print(f"[red]{message}[/red]")
+    # Escaped: messages carry user text and bracketed syntax — `[@ 03:00]`,
+    # `[verify]` — that Rich would otherwise swallow as markup and drop.
+    console.print(f"[red]{escape(message)}[/red]")
     raise typer.Exit(1)
 
 
@@ -199,6 +207,20 @@ def doctor() -> None:
         "[green]ok[/green]",
         f"{len(registry.all())} models, version {registry.rate_card_version}",
     )
+
+    # Optional, so absent is dim rather than red: nothing else depends on it.
+    if not stt.stt_available():
+        table.add_row(
+            "speech-to-text", "[dim]not installed[/dim]", "optional — uv sync --extra verify"
+        )
+    elif not stt.model_ready():
+        table.add_row(
+            "speech-to-text",
+            "[yellow]no model[/yellow]",
+            "narrate verify --download-model",
+        )
+    else:
+        table.add_row("speech-to-text", "[green]ready[/green]", str(stt.model_dir()))
 
     if settings.has_api_key and resolve_provider() == "elevenlabs":
         try:
@@ -290,12 +312,13 @@ def models(
         )
     console.print(table)
 
-    best = registry.recommended()
+    default = registry.recommended()
     console.print(
-        f"\n[bold]For long-form narration:[/bold] {best.model_id} — {best.note}\n"
+        f"\n[bold]Default for new projects:[/bold] {default.model_id} — {default.note}\n"
         "[dim]Request stitching conditions each chunk on the audio of the ones before it, "
-        "which is what keeps a long track from sounding like separate recordings. "
-        "Models without it fall back to text context.[/dim]"
+        "which keeps a long track from sounding like separate recordings. The v3 family "
+        "has neither that nor text context. For one long narrator where that matters "
+        "more than audio tags, choose eleven_multilingual_v2 with --model.[/dim]"
     )
 
 
@@ -374,7 +397,9 @@ def project_new(
     voice: str = typer.Option(
         None, "--voice", help="Voice id, or a name from `narrate voice register`."
     ),
-    model: str = typer.Option(None, "--model", help="Default model id."),
+    model: str = typer.Option(
+        None, "--model", help="Model for this project's scripts. Omit for the default."
+    ),
     tags: str = typer.Option("", "--tags", help="Prefix tags applied to every chunk."),
     cap: float = typer.Option(None, "--monthly-cap", help="Monthly spend cap in USD."),
 ) -> None:
@@ -465,6 +490,12 @@ def project_set(
             if tags and not spec.audio_tags:
                 _die(f"{spec.label} does not support audio tags.")
             row.prefix_tags = tags
+        elif row.prefix_tags and not spec.audio_tags:
+            # Nothing is saved: the tags would be read aloud on every chunk.
+            _die(
+                f"{spec.label} does not support audio tags, and {row.name} has prefix tags "
+                f'{row.prefix_tags!r}. Pass --tags "" to clear them in the same command.'
+            )
 
         if boilerplate is not None:
             row.description_boilerplate = boilerplate
@@ -1246,6 +1277,12 @@ def script_add(
         model_id = model or row.model_id
         if model_id not in registry:
             _die(f"Unknown model {model_id!r}.")
+        if row.prefix_tags and not registry.get(model_id).audio_tags:
+            _die(
+                f"{registry.get(model_id).label} does not support audio tags, and "
+                f"{row.name} has prefix tags {row.prefix_tags!r} for every chunk. Use a "
+                "project without them for this script."
+            )
 
         script = Script(
             project_id=row.id,
@@ -1585,6 +1622,16 @@ def _render_chunks(script_id: int) -> None:
             "[yellow]Some chunks were split mid-sentence. Adjust them with "
             "`--merge` or `--split` before generating.[/yellow]"
         )
+    # Here as well as at ingest, so a script added before these checks existed
+    # gets them too.
+    # Grouped by each chunk's own model: tags are fine on a chunk overridden to
+    # v3 even when the script's default model would read them aloud.
+    by_model: dict[str, tuple[ModelSpec, list[tuple[int, str]]]] = {}
+    for row, _, row_spec in per_row:
+        by_model.setdefault(row_spec.model_id, (row_spec, []))[1].append((row.ordinal, row.text))
+    for group_spec, group in by_model.values():
+        for warning in lint_chunks(group, group_spec):
+            console.print(f"[yellow]{escape(warning)}[/yellow]")
 
 
 def _override_summary(row: Chunk) -> str:
@@ -1672,8 +1719,11 @@ def estimate(script_id: int) -> None:
             f"[yellow]{spec.label} has no cross-chunk continuity.[/yellow] It supports "
             "neither request stitching nor text conditioning, so every chunk is generated "
             "cold and seams between them are unavoidable.\n"
-            "[dim]For a long single-narrator piece, a model with stitching will sound more "
-            "continuous — see `narrate models`.[/dim]"
+            "[dim]For a long single-narrator piece where that matters more than audio tags, "
+            "eleven_multilingual_v2 stitches. Choose it for a new script — `narrate script "
+            "add <file> -p <project> --model eleven_multilingual_v2` — rather than switching "
+            "the project: that re-keys every script's takes, and the next run pays for them "
+            "again.[/dim]"
         )
     elif mode == "text":
         console.print(
@@ -1698,6 +1748,11 @@ def generate(
     concurrency: int = typer.Option(None, "--concurrency"),
     provider_name: str = typer.Option(None, "--provider", help="elevenlabs | mock"),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Check the new takes against the script afterwards. Free; needs the verify extra.",
+    ),
 ) -> None:
     """Produce an episode: narration and its accepted effect cues (F5).
 
@@ -1711,7 +1766,18 @@ def generate(
     with_effects = not no_effects
     dry = not go
 
-    projection = produce_mod.project(engine, script_id, registry, with_effects=with_effects)
+    try:
+        projection = produce_mod.project(
+            engine,
+            script_id,
+            registry,
+            with_effects=with_effects,
+            only=chunks,
+            force=force,
+            settings=settings,
+        )
+    except UnknownModel as exc:
+        _die(f"{exc.args[0]} Point the chunk or script at a known model first.")
 
     if go and not yes:
         if projection.is_empty:
@@ -1740,7 +1806,7 @@ def generate(
             chunks,
             dry,
             force,
-            int(max_spend * 1_000_000) if max_spend else None,
+            round(max_spend * 1_000_000) if max_spend is not None else None,
             concurrency,
             provider_name,
             override_cap,
@@ -1817,6 +1883,67 @@ def generate(
             "[yellow]Run stopped at the project's monthly cap.[/yellow] "
             "[dim]Raise it with `narrate project set --monthly-cap`, or re-run with "
             "--override-cap.[/dim]"
+        )
+
+    made = [o.take_id for o in (speech.succeeded if speech else []) if o.take_id]
+    if made and verify:
+        _verify_new_takes(engine, script_id, registry, made)
+    elif made:
+        console.print(
+            f"[dim]Check the new takes against the script (free):  narrate verify {script_id}[/dim]"
+        )
+
+
+def _verify_new_takes(
+    engine: Engine, script_id: int, registry: Registry, take_ids: list[int]
+) -> None:
+    """Check freshly generated takes, and say where anything went wrong."""
+    transcriber = _transcriber_or_none(False)
+    if transcriber is None:
+        console.print(
+            "[yellow]--verify needs the speech model: "
+            "`uv sync --extra verify`, then `narrate verify --download-model`.[/yellow]"
+        )
+        return
+    console.print(f"[dim]Checking {len(take_ids)} new take(s) against the script…[/dim]")
+    try:
+        results = verify_service.verify_script(
+            engine, script_id, transcriber, registry, take_ids=take_ids, recheck=True
+        )
+    except (stt.ModelBroken, stt.ModelMissing, stt.SttUnavailable) as exc:
+        # The generation succeeded and is paid for; only the check failed.
+        console.print(f"[yellow]The new takes were not checked:[/yellow] {escape(str(exc))}")
+        raise typer.Exit(1) from exc
+    for result in results:
+        colour = {"suspect": "red", "review": "yellow"}.get(result.status)
+        if colour:
+            for finding in result.problems:
+                console.print(
+                    f"[{colour}]chunk {result.chunk_ordinal}[/{colour}] at "
+                    f"{finding.start_s:.1f}s into the take: {escape(finding.summary)}"
+                )
+        elif result.status == "error":
+            console.print(
+                f"[red]chunk {result.chunk_ordinal}: could not be checked[/red] — "
+                f"{escape(result.error or 'unknown error')}"
+            )
+    counts = {k: sum(1 for r in results if r.status == k) for k in ("suspect", "review", "clear")}
+    suspects = [r for r in results if r.status == "suspect"]
+    if suspects:
+        chunks = ",".join(str(r.chunk_ordinal) for r in suspects)
+        console.print(
+            f"Regenerate them (shows the price first):  "
+            f"[bold]narrate regenerate {script_id} --chunk {chunks}[/bold]"
+        )
+    elif counts["clear"] == len(results):
+        console.print(
+            f"[green]{len(results)} take(s) checked — no issues found.[/green] "
+            "[dim]Not a guarantee: listen to anything that matters.[/dim]"
+        )
+    else:
+        console.print(
+            f"{len(results)} take(s): {counts['review']} to review, "
+            f"{counts['clear']} with no issues found."
         )
 
 
@@ -1932,7 +2059,9 @@ def takes(
     # `voice` matters as soon as a script has been generated in more than one:
     # two takes of the same chunk are otherwise indistinguishable in this table,
     # which is exactly the situation a variant export creates.
-    table = Table("chunk", "take", "status", "chars", "cost", "in cut", "voice", "model", "file")
+    table = Table(
+        "chunk", "take", "status", "check", "chars", "cost", "in cut", "voice", "model", "file"
+    )
     with session_scope(engine) as session:
         _require_script(session, script_id)
         rows = session.scalars(
@@ -1959,6 +2088,7 @@ def takes(
                     str(row.ordinal),
                     str(take.ordinal),
                     status,
+                    _check_label(take),
                     f"{take.billed_chars:,}",
                     fmt_usd(take.cost_micros),
                     "[green]✓[/green]" if is_cut else "",
@@ -1967,6 +2097,500 @@ def takes(
                     Path(take.asset_path).name if take.asset_path else "",
                 )
     console.print(table)
+    console.print(
+        '[dim]check: what `narrate verify` found. "no issues found" is not a guarantee — '
+        "a word clipped short but still recognisable can pass.[/dim]"
+    )
+
+
+def _check_label(take: Take) -> str:
+    """How a take's verification reads in a table. Never a tick."""
+    status = take.verify_status
+    if status == "suspect":
+        count = sum(1 for f in verify_service.findings_of(take) if f.severity == FAIL)
+        return f"[red]suspect ({count})[/red]"
+    if status == "review":
+        return "[yellow]review[/yellow]"
+    if status == "clear":
+        return "[dim]no issues found[/dim]"
+    if status == "error":
+        return "[red]error[/red]"
+    return "[dim]-[/dim]"
+
+
+# ---------------------------------------------------------------------------
+# verify and regenerate — catching a take that is not what was written
+# ---------------------------------------------------------------------------
+
+# Exit codes for `verify`, distinct from the 1 every error uses and the 2 a
+# usage error gets, so a script can tell "found problems" from "could not look".
+EXIT_SUSPECT = 3
+EXIT_NO_STT = 4
+
+
+def _transcriber_or_none(energy_only: bool) -> stt.Transcriber | None:
+    """The local transcriber if it can run, or `None` with the reason said once."""
+    if energy_only:
+        return None
+    if not stt.stt_available():
+        return None
+    if not stt.model_ready():
+        return None
+    return stt.LocalWhisper()
+
+
+def _episode_offsets(engine: Engine, script_id: int, settings: Settings) -> dict[int, float]:
+    """Where each take in the cut starts in the finished episode."""
+    with session_scope(engine) as session:
+        tl = build_timeline(session, script_id, gap_seconds=settings.gap_seconds)
+    return {e.take_id: e.start_s for e in tl.narration if e.take_id is not None}
+
+
+@app.command("verify")
+def verify(
+    script_id: int = typer.Argument(None, help="The script to check."),
+    chunk: str = typer.Option(None, "--chunk", "-c", help="Chunks to check, e.g. 5 or 5,8."),
+    all_takes: bool = typer.Option(
+        False, "--all-takes", help="Check every take, not only the ones in the cut."
+    ),
+    recheck: bool = typer.Option(False, "--recheck", help="Check takes already checked."),
+    energy_only: bool = typer.Option(
+        False, "--energy-only", help="Waveform check only. Needs no extra, catches less."
+    ),
+    show_info: bool = typer.Option(
+        False, "--show-info", help="Also list differences that are almost always the transcriber's."
+    ),
+    download_model: bool = typer.Option(
+        False, "--download-model", help="Download the speech model, then exit."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the download confirmation."),
+) -> None:
+    """Check that every word in the script was actually spoken. Costs nothing.
+
+    Transcribes each take locally and compares it with what was sent: a missing
+    word, a word that was never in the script, a word swapped for another, a
+    word reduced to a noise. Nothing is sent anywhere and nothing is billed.
+
+    "No issues found" is not a guarantee. A word clipped short but still
+    recognisable passes every check here, so listen to anything that matters.
+    """
+    if download_model:
+        _download_speech_model(yes)
+        return
+    if script_id is None:
+        _die("Name a script to check:  narrate verify <script_id>")
+
+    settings = get_settings()
+    engine = _engine()
+    registry = _registry()
+    chunks = [int(x) for x in chunk.split(",")] if chunk else None
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        ordinals = set(
+            session.scalars(select(Chunk.ordinal).where(Chunk.script_id == script_id)).all()
+        )
+    unknown = sorted(set(chunks or []) - ordinals)
+    if unknown:
+        _die(f"Script {script_id} has no chunk {', '.join(map(str, unknown))}.")
+
+    transcriber = _transcriber_or_none(energy_only)
+    if transcriber is None and not energy_only:
+        if not stt.stt_available():
+            console.print(
+                f"[yellow]Speech-to-text is not installed.[/yellow] {escape(stt.INSTALL_HINT)}"
+            )
+        else:
+            size = stt.MODEL_SIZE_MB.get(stt.DEFAULT_MODEL, 0)
+            console.print(
+                f"[yellow]The speech model is not downloaded yet (about {size} MB).[/yellow] "
+                "Fetch it once with:  narrate verify --download-model"
+            )
+        console.print("[dim]Or run the waveform check alone with --energy-only.[/dim]")
+        raise typer.Exit(EXIT_NO_STT)
+    if not audio.ffmpeg_path():
+        _die(audio.INSTALL_HINT)
+
+    mode = "waveform only" if transcriber is None else transcriber.identity
+    console.print(f"[dim]Checking with {mode}. Nothing is sent anywhere.[/dim]")
+
+    def progress(result: verify_service.TakeCheck) -> None:
+        console.print(
+            f"[dim]  chunk {result.chunk_ordinal} take {result.take_ordinal}: "
+            f"{result.status} ({result.seconds:.0f}s)[/dim]"
+        )
+
+    try:
+        results = verify_service.verify_script(
+            engine,
+            script_id,
+            transcriber,
+            registry,
+            chunks=chunks,
+            scope="all" if all_takes else "cut",
+            recheck=recheck,
+            on_result=progress,
+        )
+    except (stt.ModelBroken, stt.ModelMissing, stt.SttUnavailable) as exc:
+        _die(str(exc))
+
+    fresh = {r.take_id: r for r in results}
+    scope = "all" if all_takes else "cut"
+    known = verify_service.stored(engine, script_id, chunks=chunks, scope=scope)
+    results = [fresh.get(r.take_id, r) for r in known]
+    if not results:
+        console.print("[yellow]No generated takes to check.[/yellow]")
+        return
+    if not fresh:
+        if transcriber is None and any(
+            verify_service.heard_by_transcript(r.verifier) for r in results
+        ):
+            why = (
+                "These takes were checked with speech-to-text, and the waveform check "
+                "never replaces that; showing what it found."
+            )
+        elif recheck:
+            why = "Nothing in scope could be checked again; showing what was found."
+        else:
+            why = (
+                "Every take in scope was already checked with these settings; showing "
+                "what was found. Pass --recheck to listen again."
+            )
+        console.print(f"[dim]{why}[/dim]")
+    unchecked = [r for r in results if r.status == "unverified"]
+
+    offsets = _episode_offsets(engine, script_id, settings)
+    table = Table("chunk", "take", "at", "check", "what was found")
+    for result in results:
+        shown = [f for f in result.findings if show_info or f.severity != INFO]
+        if result.error:
+            table.add_row(
+                str(result.chunk_ordinal),
+                str(result.take_ordinal),
+                "",
+                "[red]error[/red]",
+                result.error,
+            )
+            continue
+        for finding in shown:
+            base = offsets.get(result.take_id)
+            when = (
+                _stamp(base + finding.start_s)
+                if base is not None
+                else f"{finding.start_s:.1f}s into the take"
+            )
+            severity = {
+                FAIL: "[red]suspect[/red]",
+                REVIEW: "[yellow]review[/yellow]",
+                INFO: "[dim]info[/dim]",
+            }[finding.severity]
+            detail = finding.summary + (f"\n[dim]{finding.note}[/dim]" if finding.note else "")
+            table.add_row(
+                str(result.chunk_ordinal), str(result.take_ordinal), when, severity, detail
+            )
+
+    flagged = [r for r in results if r.status in ("suspect", "review")]
+    if table.row_count:
+        console.print(table)
+
+    clear = sum(1 for r in results if r.status == "clear")
+    errors = [r for r in results if r.status == "error"]
+    checked = len(results) - len(unchecked) - len(errors)
+    console.print(
+        f"{checked} take(s) checked: "
+        f"[red]{sum(1 for r in results if r.status == 'suspect')} suspect[/red], "
+        f"[yellow]{sum(1 for r in results if r.status == 'review')} to review[/yellow], "
+        f"{clear} with no issues found."
+        + (f" {len(unchecked)} not checked." if unchecked else "")
+        + (f" [red]{len(errors)} could not be checked.[/red]" if errors else "")
+    )
+    if clear:
+        console.print(
+            "[dim]No issues found is not a guarantee: a word clipped short but still "
+            "recognisable passes. Listen to anything that matters.[/dim]"
+        )
+    suspects = sorted({r.chunk_ordinal for r in results if r.status == "suspect"})
+    if suspects:
+        listed = ",".join(map(str, suspects))
+        console.print(
+            f"Regenerate them (shows the price, sends nothing):  "
+            f"[bold]narrate regenerate {script_id} --chunk {listed}[/bold]"
+        )
+        raise typer.Exit(EXIT_SUSPECT)
+    if flagged:
+        console.print("[dim]Review items are worth a listen; nothing is clearly wrong.[/dim]")
+    if errors:
+        # 1, as for any error: the episode was not fully checked, so a script
+        # gating on this must not read the silence as a pass.
+        raise typer.Exit(1)
+
+
+def _stamp(seconds: float) -> str:
+    """Episode time as m:ss.s — precise enough to find the spot by ear."""
+    minutes, rest = divmod(max(0.0, seconds), 60)
+    return f"{int(minutes)}:{rest:04.1f}"
+
+
+def _download_speech_model(yes: bool) -> None:
+    if not stt.stt_available():
+        console.print(f"[red]Speech-to-text is not installed.[/red] {escape(stt.INSTALL_HINT)}")
+        raise typer.Exit(EXIT_NO_STT)
+    target = stt.model_dir()
+    if stt.model_ready():
+        console.print(f"[green]Already downloaded:[/green] {target}")
+        return
+    size = stt.MODEL_SIZE_MB.get(stt.DEFAULT_MODEL, 0)
+    console.print(
+        f"This downloads the {stt.DEFAULT_MODEL} speech model — about {size} MB — from "
+        f"Hugging Face into {target}. It is free and happens once."
+    )
+    if not yes and not typer.confirm("Download it now?"):
+        console.print("Nothing was downloaded.")
+        return
+    try:
+        path = stt.download()
+    except (stt.ModelBroken, stt.SttUnavailable) as exc:
+        _die(str(exc))
+    console.print(f"[green]Ready:[/green] {path}")
+
+
+@app.command("regenerate")
+def regenerate_cmd(
+    script_id: int,
+    chunk: str = typer.Option(None, "--chunk", "-c", help="Chunks to regenerate, e.g. 5 or 5,8."),
+    suspect: bool = typer.Option(
+        False, "--suspect", help="Every chunk whose take in the cut `verify` flagged."
+    ),
+    text: str = typer.Option(
+        None, "--text", help="New words for the chunk first. One chunk; v3-family models only."
+    ),
+    attempts: int = typer.Option(
+        1,
+        "--attempts",
+        help=f"If the new take is still flagged, try again up to this many times "
+        f"(max {regen.MAX_ATTEMPTS}). Each try is billed.",
+    ),
+    use_new: bool = typer.Option(
+        False, "--use-new", help="Use the new take unless it checks worse."
+    ),
+    keep_cut: bool = typer.Option(
+        False,
+        "--keep-cut",
+        help="Leave the cut where it is. (If its audio is missing, the new take is used.)",
+    ),
+    max_spend: float = typer.Option(None, "--max-spend", help="Hard stop, in USD."),
+    accept_unknown: bool = typer.Option(
+        False,
+        "--accept-unknown",
+        help="Regenerate even where a request's outcome is unknown and may be billed.",
+    ),
+    go: bool = typer.Option(False, "--go", help="Actually spend. Without this it is a dry run."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    provider_name: str = typer.Option(None, "--provider", help="elevenlabs | mock"),
+) -> None:
+    """Generate chosen chunks again, keeping every earlier take.
+
+    The new take is checked like any other. By default the cut moves to it only
+    if it checks strictly better — so a flagged take is replaced by a clean one,
+    but a take you simply did not like stays in the cut until you have listened
+    to both and chosen with `narrate cut set`.
+    """
+    if use_new and keep_cut:
+        _die("Pass --use-new or --keep-cut, not both.")
+    if not chunk and not suspect:
+        _die("Name the chunks with --chunk 5,8, or pass --suspect for every flagged one.")
+    settings = get_settings()
+    engine = _engine()
+    registry = _registry()
+    chunks = [int(x) for x in chunk.split(",")] if chunk else None
+    if text is not None and (not chunks or len(chunks) != 1):
+        _die("--text replaces one chunk's words, so name exactly one chunk.")
+
+    try:
+        plans = regen.plan(
+            engine,
+            script_id,
+            registry,
+            chunks=chunks,
+            suspect_only=suspect,
+            texts={chunks[0]: text} if text is not None and chunks else None,
+        )
+    except regen.RegenerateRefused as exc:
+        _die(str(exc))
+    if not plans:
+        console.print(
+            "[green]No take in the cut is flagged.[/green] "
+            "[dim]Run `narrate verify` first, or name chunks with --chunk.[/dim]"
+        )
+        return
+
+    tries = max(1, min(attempts, regen.MAX_ATTEMPTS))
+    table = Table("chunk", "in the cut", "check", "chars", "price per try")
+    for item in plans:
+        check = {
+            "suspect": "[red]suspect[/red]",
+            "review": "[yellow]review[/yellow]",
+            "clear": "[dim]no issues found[/dim]",
+        }.get(item.cut_status, "[dim]-[/dim]")
+        table.add_row(
+            str(item.ordinal),
+            f"take {item.cut_take}" if item.cut_take else "—",
+            check,
+            f"{item.chars:,}",
+            fmt_usd(item.price_micros, 4),
+        )
+    console.print(table)
+    for item in plans:
+        if item.blocker and not accept_unknown:
+            console.print(f"[yellow]{escape(item.blocker)}[/yellow]")
+
+    runnable = [p for p in plans if accept_unknown or not p.blocker]
+    worst = sum(p.price_micros for p in runnable) * tries
+    move = regen.MOVE_NEVER if keep_cut else regen.MOVE_NEW if use_new else regen.MOVE_BETTER
+    if text is not None and move == regen.MOVE_BETTER:
+        # Once the words change, the old take says something the script no
+        # longer does, so the new take wins unless it checks worse.
+        move = regen.MOVE_NEW
+    transcriber = _transcriber_or_none(False)
+    checking = (
+        "each new take is checked with speech-to-text"
+        if transcriber
+        else "new takes get the waveform check only (install the verify extra for more)"
+    )
+    if text is not None:
+        console.print(f"[dim]Chunk {chunks[0] if chunks else ''} will be re-worded first.[/dim]")
+    if not runnable:
+        _die(
+            "Nothing can be regenerated: every chunk named has a request whose outcome is "
+            "unknown. See above."
+        )
+    limit = round(max_spend * 1_000_000) if max_spend is not None else None
+    if limit is not None and limit < min(p.price_micros for p in runnable):
+        _die(
+            f"--max-spend {fmt_usd(limit, 4)} is below the price of one try "
+            f"({fmt_usd(min(p.price_micros for p in runnable), 4)}), so nothing would be sent."
+        )
+
+    if not go:
+        console.print(
+            Panel(
+                f"Would regenerate {len(runnable)} chunk(s): up to "
+                f"[bold]{fmt_usd(min(worst, limit) if limit is not None else worst, 4)}[/bold] "
+                "at list price"
+                + (f" ({tries} tries each at most)" if tries > 1 else "")
+                + f".\nEvery existing take is kept; {checking}.\n\n"
+                "[bold]Re-run with --go.[/bold]",
+                title="Regenerate (nothing sent)",
+                expand=False,
+            )
+        )
+        return
+    ceiling = min(worst, limit) if limit is not None else worst
+    if not yes and not typer.confirm(f"Spend up to {fmt_usd(ceiling, 4)}?"):
+        console.print("Nothing was sent.")
+        raise typer.Exit(0)
+
+    results = asyncio.run(
+        _regenerate(
+            engine,
+            script_id,
+            [p.ordinal for p in runnable],
+            settings,
+            registry,
+            transcriber,
+            tries,
+            limit,
+            move,
+            accept_unknown,
+            provider_name,
+            {chunks[0]: text} if text is not None and chunks else None,
+        )
+    )
+
+    spent = sum(r.spent_micros for r in results)
+    for result in results:
+        if result.stopped and not result.new_takes:
+            console.print(f"[red]Chunk {result.ordinal}: {escape(result.stopped)}[/red]")
+            if result.unknown_takes:
+                console.print(
+                    "[yellow]  The request got no answer, so it may have been billed. "
+                    f"Reconcile with `narrate cost reconcile` before regenerating chunk "
+                    f"{result.ordinal} again, or pass --accept-unknown.[/yellow]"
+                )
+            if result.words_restored:
+                console.print(
+                    "[yellow]  No take was made with the new words, so the old ones were "
+                    "put back"
+                    + ("." if result.unknown_takes else ". Nothing about the chunk has changed.")
+                    + "[/yellow]"
+                )
+            continue
+        verdicts = ", ".join(result.statuses) or "not checked"
+        line = f"Chunk {result.ordinal}: {len(result.new_takes)} new take(s) — {verdicts}."
+        if result.moved:
+            reason = f" ({result.cut_note})" if result.cut_note else ""
+            console.print(f"[green]{line} The cut now uses the new take{reason}.[/green]")
+        else:
+            console.print(
+                f"{line} [dim]The cut is unchanged. Listen with `narrate takes {script_id} "
+                f"--chunk {result.ordinal}`, then `narrate cut set` to switch.[/dim]"
+            )
+            if result.reworded:
+                console.print(
+                    "[yellow]  The chunk now holds the new words; the take in the cut still "
+                    "has the old ones.[/yellow]"
+                )
+        if result.stopped:
+            console.print(f"[yellow]  {escape(result.stopped)}[/yellow]")
+    if resolve_provider(provider_name) == "mock":
+        console.print(
+            f"Recorded {fmt_usd(spent, 4)} against the mock provider — nothing was billed. "
+            "Every earlier take is still on disk."
+        )
+    else:
+        console.print(f"Spent {fmt_usd(spent, 4)}. Every earlier take is still on disk.")
+    if any(not r.new_takes for r in results):
+        # A chunk that was asked for and got no new take: a script chaining this
+        # into an export must not read it as done.
+        raise typer.Exit(1)
+
+
+async def _regenerate(
+    engine: Engine,
+    script_id: int,
+    chunks: list[int],
+    settings: Settings,
+    registry: Registry,
+    transcriber: stt.Transcriber | None,
+    attempts: int,
+    max_spend_micros: int | None,
+    move: str,
+    accept_unknown: bool,
+    provider_name: str | None,
+    texts: dict[int, str] | None = None,
+) -> list[regen.ChunkResult]:
+    tts = _provider(settings, provider_name)
+    # Regeneration never touches effect cues, so no real effects client is made.
+    sfx: SFXProvider = MockSFXProvider()
+    try:
+        return await regen.regenerate(
+            engine,
+            script_id,
+            chunks,
+            tts,
+            sfx,
+            registry,
+            settings,
+            transcriber=transcriber,
+            attempts=attempts,
+            max_spend_micros=max_spend_micros,
+            move_cut=move,
+            accept_unknown=accept_unknown,
+            texts=texts,
+            on_event=lambda m: console.print(f"[dim]{escape(m)}[/dim]"),
+        )
+    finally:
+        await tts.aclose()
+        await sfx.aclose()
 
 
 @cut_app.command("set")
@@ -1992,7 +2616,14 @@ def cut_set(
             existing.take_id = chosen.id
         else:
             session.add(Cut(chunk_id=row.id, script_id=script_id, take_id=chosen.id))
+        flagged = chosen.verify_status in ("suspect", "review")
+        problems = [f.summary for f in verify_service.findings_of(chosen) if f.severity != INFO]
     console.print(f"[green]Chunk {chunk_ordinal} now uses take {take}.[/green]")
+    if flagged:
+        console.print(
+            f"[yellow]Take {take} was flagged by `narrate verify`: "
+            f"{'; '.join(problems[:3]) or 'see narrate verify'}.[/yellow]"
+        )
 
 
 @app.command()
@@ -2012,6 +2643,12 @@ def export(
         "--voice",
         help="Export this voice's performance instead of the cut. `narrate takes` lists them.",
     ),
+    require_verified: bool = typer.Option(
+        False,
+        "--require-verified",
+        help="Refuse unless every take exported was checked with speech-to-text and none "
+        "is suspect.",
+    ),
 ) -> None:
     """Stitch the cut, name every piece by timeline position, and write the plan.
 
@@ -2022,6 +2659,9 @@ def export(
     """
     settings = get_settings()
     engine = _engine()
+    # An empty --voice (an unset "$VOICE" in a script) means the cut, and must
+    # mean it everywhere — the verification gate below included.
+    voice = (voice or "").strip()
 
     label = None
     if voice:
@@ -2039,6 +2679,38 @@ def export(
                 label = next((v.get("name") for v in found if v.get("voice_id") == voice), None)
             except (MissingAPIKey, ProviderError):
                 label = None
+
+    # The takes this export will actually use — the variant's, with --voice.
+    with session_scope(engine) as session:
+        narration = build_timeline(
+            session, script_id, gap_seconds=settings.gap_seconds, voice_id=voice or None
+        ).narration
+    suspects = [e.chunk_ordinal for e in narration if e.check == "suspect"]
+    # Keyed on the take, not its duration: a take recorded without one (ffmpeg
+    # missing at the time, or from before durations were kept) still ships.
+    # "Checked" means heard by speech-to-text — the waveform alone cannot clear
+    # a take, so a take it merely flagged for review was never checked either.
+    unchecked = [
+        e.chunk_ordinal
+        for e in narration
+        if e.take_id is not None and e.check != "suspect" and not e.heard
+    ]
+    if require_verified and (suspects or unchecked):
+        problems = []
+        if suspects:
+            problems.append(f"flagged: chunk {', '.join(map(str, suspects))}")
+        if unchecked:
+            problems.append(
+                f"not checked with speech-to-text: chunk {', '.join(map(str, unchecked))}"
+            )
+        # A variant's takes are not the cut, so only --all-takes reaches them.
+        how = (
+            f"`narrate verify {script_id} --all-takes`, then regenerate what it flags"
+            if voice
+            else f"`narrate verify {script_id}`, and regenerate flagged chunks with "
+            f"`narrate regenerate {script_id} --suspect`"
+        )
+        _die(f"--require-verified: {'; '.join(problems)}. Check with {how}.")
 
     try:
         result = export_script(
@@ -2084,6 +2756,12 @@ def export(
         per_minute = ledger.cost_per_minute_micros(session, script_id)
     if per_minute:
         console.print(f"Cost per finished minute: [bold]{fmt_usd(per_minute, 4)}[/bold]")
+    if suspects:
+        console.print(
+            f"[yellow]{len(suspects)} take(s) in this export are flagged by `narrate verify` "
+            f'(chunk {", ".join(map(str, suspects))}). They are listed under "Takes to '
+            f'check" in {result.plan.name}.[/yellow]'
+        )
 
 
 @app.command()
@@ -2191,6 +2869,13 @@ def timeline(script_id: int) -> None:
             f"{format_time(entry.target_s or 0)}, landed {entry.start_stamp} "
             f"({entry.drift_s:+.1f}s)"
         )
+    for entry in tl.flagged:
+        for offset, severity, summary in entry.issues:
+            colour = "red" if severity == FAIL else "yellow"
+            console.print(
+                f"[{colour}]Chunk {entry.chunk_ordinal}[/{colour}] at "
+                f"{format_time(entry.start_s + offset)}: {summary}"
+            )
     if not tl.is_complete:
         console.print("[dim]Timings after the first ungenerated chunk are provisional.[/dim]")
 

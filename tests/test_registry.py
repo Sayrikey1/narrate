@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from narrate.registry import Registry, UnknownModel, detect_drift
+from narrate.registry import CONFIG_PATH, Registry, UnknownModel, detect_drift
 
 
 def test_v3_has_no_cross_chunk_continuity_at_all(registry: Registry) -> None:
@@ -105,9 +107,42 @@ def test_flash_is_half_the_price(registry: Registry) -> None:
     assert registry.get("eleven_v3").usd_per_1k == 0.10
 
 
-def test_recommended_model_supports_stitching(registry: Registry) -> None:
-    """Long-form default must be one where prosody carries across chunks."""
-    assert registry.recommended().request_stitching is True
+def test_the_default_for_a_new_project_is_eleven_v3(registry: Registry) -> None:
+    """Chosen for narration and audio tags, not continuity — v3 has none, which
+    is why the stitched model stays available and is named wherever it matters."""
+    default = registry.recommended()
+    assert default.model_id == "eleven_v3"
+    assert not default.deprecated
+    assert default.audio_tags
+    assert registry.get("eleven_multilingual_v2").request_stitching
+
+
+def _card(tmp_path: Path, default: str | None) -> Path:
+    """The real rate card, declaring a different default — or none."""
+    text = CONFIG_PATH.read_text(encoding="utf-8")
+    line = 'default_model = "eleven_v3"'
+    assert line in text
+    card = tmp_path / "models.toml"
+    card.write_text(
+        text.replace(line, f'default_model = "{default}"' if default else ""), encoding="utf-8"
+    )
+    return card
+
+
+def test_a_default_naming_no_model_is_refused_at_load(tmp_path: Path) -> None:
+    """A typo would otherwise hand every new project some other model, quietly."""
+    with pytest.raises(ValueError, match="eleven_v4"):
+        Registry.load(_card(tmp_path, "eleven_v4"), observed=tmp_path / "none.json")
+
+
+def test_a_deprecated_default_is_refused_at_load(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="deprecated"):
+        Registry.load(_card(tmp_path, "eleven_turbo_v2_5"), observed=tmp_path / "none.json")
+
+
+def test_without_a_declared_default_the_long_form_rating_decides(tmp_path: Path) -> None:
+    registry = Registry.load(_card(tmp_path, None), observed=tmp_path / "none.json")
+    assert registry.recommended().model_id == "eleven_multilingual_v2"
 
 
 def test_deprecated_models_are_hidden_by_default(registry: Registry) -> None:
@@ -142,3 +177,15 @@ def test_drift_detects_alpha_gating(registry: Registry) -> None:
 def test_drift_reports_models_missing_from_the_api(registry: Registry) -> None:
     drift = detect_drift(registry, [])
     assert any(d.field == "presence" for d in drift)
+
+
+def test_a_misspelled_meta_key_is_refused_at_load(tmp_path: Path) -> None:
+    """ "default_modle" would otherwise read as "no default declared" and quietly
+    fall back to another model."""
+    card = tmp_path / "models.toml"
+    card.write_text(
+        CONFIG_PATH.read_text(encoding="utf-8").replace("default_model =", "default_modle ="),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="default_modle"):
+        Registry.load(card, observed=tmp_path / "none.json")

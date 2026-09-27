@@ -105,6 +105,7 @@ def _adopt_pre_alembic(engine: Engine) -> None:
         "chunk": {
             "start_offset": "INTEGER",
             "target_start_s": "FLOAT",
+            "turns_json": "TEXT",
             "chapter_title": "VARCHAR(120)",
         },
         "project": {
@@ -115,6 +116,13 @@ def _adopt_pre_alembic(engine: Engine) -> None:
             "description": "TEXT NOT NULL DEFAULT ''",
             "tags": "TEXT NOT NULL DEFAULT ''",
             "target_seconds": "FLOAT",
+        },
+        "take": {
+            "voices_json": "TEXT",
+            "verify_status": "VARCHAR(16) NOT NULL DEFAULT 'unverified'",
+            "verify_findings_json": "TEXT",
+            "verifier": "VARCHAR(96)",
+            "verified_at": "DATETIME",
         },
     }
     inspector = inspect(engine)

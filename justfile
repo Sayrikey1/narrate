@@ -38,6 +38,14 @@ sync:
     @uv run python scripts/repair_editable.py
 
 [group('setup')]
+[doc('Sync including the optional speech-to-text extra, for `narrate verify`.')]
+sync-verify:
+    # Plain `uv sync` is exact, so it removes extras it was not asked for —
+    # this is the recipe to use once verification is installed.
+    uv sync --extra verify
+    @uv run python scripts/repair_editable.py
+
+[group('setup')]
 [doc('Re-resolve dependencies, then sync.')]
 lock:
     uv lock

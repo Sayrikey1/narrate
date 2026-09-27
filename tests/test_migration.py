@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from sqlalchemy import inspect, select, text
+from sqlalchemy import Column, Table, inspect, select, text
 
-from narrate.db.models import Base, LedgerEntry, Project
+from narrate.db.models import Base, Chunk, LedgerEntry, Project, Script, Take
 from narrate.db.session import init_db, make_engine, session_scope
 
 NEW_TABLES = ("effect", "effect_slot")
@@ -121,6 +122,8 @@ def _build_previous_release(path: Path) -> None:
             conn.execute(text(f"ALTER TABLE script DROP COLUMN {column}"))
         for column in ("description_boilerplate", "default_tags"):
             conn.execute(text(f"ALTER TABLE project DROP COLUMN {column}"))
+        for column in ("verify_status", "verify_findings_json", "verifier", "verified_at"):
+            conn.execute(text(f"ALTER TABLE take DROP COLUMN {column}"))
         conn.execute(
             text(
                 "INSERT INTO ledger_entry "
@@ -195,3 +198,91 @@ def test_account_level_entries_may_have_no_project(tmp_path: Path) -> None:
     with session_scope(engine) as session:
         entry = session.scalars(select(LedgerEntry)).one()
         assert entry.project_id is None
+
+
+# Every column added to an existing table after the first release. Adoption
+# must restore all of them — `create_all` adds missing tables, never a missing
+# column — or it stamps head on a database that does not match it. Two of these
+# (`turns_json`, `voices_json`) were missing from the adoption map for a
+# release, which the narrower test above could not notice.
+LATER_COLUMNS: dict[str, tuple[str, ...]] = {
+    "chunk": ("start_offset", "target_start_s", "turns_json", "chapter_title"),
+    "take": ("voices_json", "verify_status", "verify_findings_json", "verifier", "verified_at"),
+    "script": ("description", "tags", "target_seconds"),
+    "project": ("description_boilerplate", "default_tags"),
+}
+
+
+def _build_first_release(path: Path) -> None:
+    engine = make_engine(path)
+    meta = Base.metadata
+    removed: list[tuple[Table, Column[Any]]] = []
+    for table_name, names in LATER_COLUMNS.items():
+        table = meta.tables[table_name]
+        for name in names:
+            column = table.c[name]
+            table._columns.remove(column)
+            removed.append((table, column))
+    try:
+        meta.create_all(engine, tables=[t for n, t in meta.tables.items() if n not in NEW_TABLES])
+    finally:
+        for table, column in removed:
+            table.append_column(column)
+    engine.dispose()
+
+
+def test_adoption_restores_every_column_the_model_declares(tmp_path: Path) -> None:
+    db = tmp_path / "first.db"
+    _build_first_release(db)
+    engine = make_engine(db)
+    before = {c["name"] for c in inspect(engine).get_columns("take")}
+    assert "verify_status" not in before
+
+    init_db(engine)
+
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        present = {c["name"] for c in inspector.get_columns(table.name)}
+        missing = {c.name for c in table.columns} - present
+        assert not missing, f"{table.name} is missing {sorted(missing)} after adoption"
+
+
+def test_existing_takes_start_unverified_after_the_upgrade(tmp_path: Path) -> None:
+    """Nothing has checked them, so that is the truth — not "clear"."""
+    db = tmp_path / "prev.db"
+    engine = make_engine(db)
+    init_db(engine)
+    with session_scope(engine) as session:
+        project = Project(name="p", model_id="eleven_v3")
+        session.add(project)
+        session.flush()
+        script = Script(project_id=project.id, title="s", source_text="x", source_sha256="h")
+        session.add(script)
+        session.flush()
+        chunk = Chunk(script_id=script.id, ordinal=1, text="x")
+        session.add(chunk)
+        session.flush()
+        session.add(
+            Take(
+                chunk_id=chunk.id,
+                idempotency_key="k",
+                model_id="eleven_v3",
+                voice_id="v",
+                submitted_text="x",
+                submitted_chars=1,
+                billed_chars=1,
+                cost_micros=100,
+            )
+        )
+    with engine.begin() as conn:
+        for column in ("verify_status", "verify_findings_json", "verifier", "verified_at"):
+            conn.execute(text(f"ALTER TABLE take DROP COLUMN {column}"))
+        conn.execute(text("UPDATE alembic_version SET version_num = '7e2b9d4c15af'"))
+    engine.dispose()
+
+    engine = make_engine(db)
+    init_db(engine)
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT verify_status, cost_micros FROM take")).one()
+    # Unverified, and the money untouched.
+    assert tuple(row) == ("unverified", 100)

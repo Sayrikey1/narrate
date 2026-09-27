@@ -20,6 +20,7 @@ from narrate.chunking import Chunk as ChunkObj
 from narrate.chunking import chunk_script
 from narrate.db.models import Chunk, Script, Take
 from narrate.effects import sync_slots_from_script
+from narrate.lint import lint_chunks
 from narrate.registry import ModelSpec
 from narrate.script_parse import ParsedScript, SpeakerTurn, parse_script
 
@@ -207,6 +208,8 @@ def ingest_script(
     _attach_anchors(session, script.id, parsed, offsets)
     result.chapters_named = _attach_chapters(session, script.id, parsed, offsets, result.warnings)
     result.slots_created = len(sync_slots_from_script(session, script.id, parsed, offsets))
+    # Last, so it sees the chunks as they will actually be sent.
+    result.warnings += lint_chunks([(c.ordinal, c.text) for c in result.chunks], spec)
     return result
 
 

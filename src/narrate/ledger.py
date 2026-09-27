@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from narrate.db.models import Chunk, Cut, Export, LedgerEntry, Project, Script, Take
 from narrate.money import pct
-from narrate.registry import ModelSpec
+from narrate.registry import ModelSpec, UnknownModel
 
 # Unit vocabulary. Speech is billed per character, effects per second of
 # audio, and an LLM per token — one ledger has to hold all three.
@@ -655,38 +655,79 @@ class Outstanding:
         return self.chunks == 0 and self.effects == 0
 
 
-def outstanding(session: Session, script_id: int, registry: object | None = None) -> Outstanding:
-    """Price the work still to do, so a project total can be projected.
+def outstanding(
+    session: Session,
+    script_id: int,
+    registry: object | None = None,
+    *,
+    only: list[int] | None = None,
+    force: bool = False,
+    settings: object | None = None,
+    strict: bool = False,
+) -> Outstanding:
+    """Price the work still to do — the same work the runner would send.
 
-    Counts chunks with no selected take and accepted effect slots with no
-    audio. Both are priced from the rate card, the same way a pre-flight
-    estimate is — this is the estimate, just scoped to what is left.
+    Speech is decided exactly the way the runner decides it: each chunk is built
+    into its real request (its own model, voice, tags and settings, context
+    included) and counts as outstanding unless a succeeded take with that exact
+    request is still on disk. `only` and `force` are the runner's own arguments.
+
+    Deciding it any other way lets the price shown before a run disagree with the
+    run. The previous rule — "a chunk with a take in the cut is done", priced on
+    the script's model — quoted nothing for a chunk whose words, voice or
+    settings had changed since, and then the run sent and billed it anyway; it
+    also under-quoted a chunk overridden to a dearer model or longer tags.
+
+    Accepted effect slots with no audio are priced from the effect rate card. A
+    chunk the runner could not build at all (no voice set, tags on a model
+    without them) falls back to a character estimate, so a report still shows
+    a figure rather than failing — the run itself will say what is wrong. That
+    includes a chunk naming a model the rate card no longer has, unless `strict`:
+    a price about to be spent against must be exact, or refused with the reason.
     """
     from narrate.db.models import EffectSlot
     from narrate.effects import EffectRates
     from narrate.registry import Registry
+    from narrate.runner import build_jobs, existing_take
+    from narrate.settings import Settings, get_settings
 
     script = session.get(Script, script_id)
     if script is None:
         return Outstanding(0, 0, 0, 0.0, 0)
     project = session.get(Project, script.project_id)
-
     cards = registry if isinstance(registry, Registry) else Registry.load()
-    spec = cards.get(script.model_id or (project.model_id if project else ""))
-    prefix = project.prefix_tags if project else ""
-    prefix_len = len(prefix) + 1 if prefix else 0
+    config = settings if isinstance(settings, Settings) else get_settings()
 
-    selected = {
-        c.chunk_id for c in session.scalars(select(Cut).where(Cut.script_id == script_id)).all()
-    }
-    pending = [
-        c
-        for c in session.scalars(
-            select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
-        ).all()
-        if c.id not in selected
-    ]
-    chars = sum(len(c.text) + prefix_len for c in pending)
+    chunk_count = chars = speech_micros = 0
+    try:
+        if project is None:
+            raise ValueError("no project")
+        jobs = build_jobs(session, script, project, cards, config, only)
+        pending = [j for j in jobs if force or existing_take(session, j.chunk_id, j.key) is None]
+        chunk_count = len(pending)
+        chars = sum(j.request.char_count for j in pending)
+        # The same figure the runner checks against --max-spend and the cap.
+        speech_micros = sum(j.spec.cost_micros(j.request.char_count) for j in pending)
+    except (ValueError, UnknownModel) as exc:
+        if strict and isinstance(exc, UnknownModel):
+            raise
+        spec = cards.get(script.model_id or (project.model_id if project else ""))
+        prefix = project.prefix_tags if project else ""
+        prefix_len = len(prefix) + 1 if prefix else 0
+        selected = {
+            c.chunk_id for c in session.scalars(select(Cut).where(Cut.script_id == script_id)).all()
+        }
+        wanted = set(only) if only else None
+        rough = [
+            c
+            for c in session.scalars(
+                select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
+            ).all()
+            if (wanted is None or c.ordinal in wanted) and (force or c.id not in selected)
+        ]
+        chunk_count = len(rough)
+        chars = sum(len(c.text) + prefix_len for c in rough)
+        speech_micros = spec.cost_micros(chars)
 
     rates = EffectRates.load()
     slots = [
@@ -698,11 +739,11 @@ def outstanding(session: Session, script_id: int, registry: object | None = None
     seconds = sum(s.duration_s or 3.0 for s in slots)
 
     return Outstanding(
-        chunks=len(pending),
+        chunks=chunk_count,
         chars=chars,
         effects=len(slots),
         effect_seconds=round(seconds, 2),
-        cost_micros=spec.cost_micros(chars) + rates.cost_micros(seconds),
+        cost_micros=speech_micros + rates.cost_micros(seconds),
     )
 
 

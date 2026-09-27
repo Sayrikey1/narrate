@@ -15,6 +15,7 @@ import type {
   ExportResult,
   Model,
   Project,
+  RegenerateBody,
   ScriptSummary,
   Timeline,
 } from "../types";
@@ -47,6 +48,10 @@ export function ScriptPage({
   const [error, setError] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportResult | null>(null);
   const [detail, setDetail] = useState(false);
+
+  const flagged = chunks
+    .filter((c) => c.takes.some((t) => t.in_cut && t.verify_status === "suspect"))
+    .map((c) => c.ordinal);
 
   useEffect(() => {
     api
@@ -97,6 +102,96 @@ export function ScriptPage({
     } catch (e) {
       setBusy(false);
       setError(String(e));
+    }
+  }
+
+  /** Stream a background run into the log, then refresh the page's data. */
+  function follow(runKey: string, summarise: (result: Record<string, unknown>) => string) {
+    api.streamRun(
+      runKey,
+      (message) => setLog((prior) => [...prior, message]),
+      (result) => {
+        setBusy(false);
+        if (result.error) setError(String(result.error));
+        else setLog((prior) => [...prior, summarise(result)]);
+        onRefresh();
+      },
+    );
+  }
+
+  async function verify() {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api.verify(scriptId);
+      setLog([`Checking takes against the script (${started.mode}) — nothing is sent anywhere.`]);
+      follow(started.run_key, (result) => {
+        const rows = (result.results ?? []) as { status: string }[];
+        const count = (status: string) => rows.filter((r) => r.status === status).length;
+        const checked = count("suspect") + count("review") + count("clear");
+        if (!rows.length) return "Nothing new to check.";
+        return (
+          `${checked} take(s) checked: ${count("suspect")} flagged, ` +
+          `${count("review")} to review, ${count("clear")} with no issues found.` +
+          (count("error") ? ` ${count("error")} could not be checked.` : "") +
+          (count("unverified") ? ` ${count("unverified")} not checked.` : "")
+        );
+      });
+    } catch (e) {
+      setBusy(false);
+      setError(String(e));
+    }
+  }
+
+  async function regenerate(body: RegenerateBody) {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api.regenerate(scriptId, body);
+      if (!started.run_key) {
+        setBusy(false);
+        return;
+      }
+      setLog([`Regenerating chunk ${body.chunks.join(", ")} — up to ${started.worst_usd}.`]);
+      follow(started.run_key, (result) => {
+        const done = (result.regenerated ?? []) as {
+          ordinal: number;
+          statuses: string[];
+          new_takes: number[];
+          moved: boolean;
+          stopped: string | null;
+          reworded: boolean;
+          words_restored: boolean;
+          unknown_takes: number[];
+          cut_note: string | null;
+        }[];
+        const lines = done.map((r) => {
+          if (!r.new_takes.length) {
+            return (
+              `chunk ${r.ordinal}: ${r.stopped || "no new take"}` +
+              (r.unknown_takes?.length
+                ? " — the request got no answer and may have been billed; reconcile before trying again"
+                : "") +
+              (r.words_restored ? " — no take was made with the new words, so the old ones were put back" : "")
+            );
+          }
+          return (
+            `chunk ${r.ordinal}: ${r.statuses.join(", ")}` +
+            (r.moved
+              ? ` — now in the cut${r.cut_note ? ` (${r.cut_note})` : ""}`
+              : " — the cut is unchanged; listen and choose") +
+            (r.reworded && !r.moved ? " (the take in the cut still has the old words)" : "")
+          );
+        });
+        const spent = usd(Number(result.spent_micros ?? 0));
+        return [...lines, result.mock ? `${spent} recorded (mock — nothing billed)` : `spent ${spent}`].join(
+          "\n",
+        );
+      });
+    } catch (e) {
+      setBusy(false);
+      setError(String(e));
+      throw e;
     }
   }
 
@@ -169,16 +264,38 @@ export function ScriptPage({
             <Card
               title="Chunks and takes"
               actions={
-                <button
-                  className="ghost small"
-                  onClick={() => setDetail((v) => !v)}
-                  aria-expanded={detail}
-                >
-                  {detail ? "hide the table" : "show the table"}
-                </button>
+                <>
+                  <button
+                    className="ghost small"
+                    disabled={busy || !chunks.some((c) => c.takes.length)}
+                    onClick={verify}
+                    title="Transcribe the takes and compare them with the script. Free."
+                  >
+                    Check takes
+                  </button>
+                  <button
+                    className="ghost small"
+                    onClick={() => setDetail((v) => !v)}
+                    aria-expanded={detail}
+                  >
+                    {detail ? "hide the table" : "show the table"}
+                  </button>
+                </>
               }
             >
-              <ChunkList chunks={chunks} scriptId={scriptId} busy={busy} onChange={onRefresh} />
+              {flagged.length > 0 && (
+                <Notice tone="warn" title={`${flagged.length} take(s) in the cut are flagged`}>
+                  Words missing, added or changed in chunk {flagged.join(", ")}. Press ▶ beside
+                  each finding to hear the spot, then Regenerate if it is what it looks like.
+                </Notice>
+              )}
+              <ChunkList
+                chunks={chunks}
+                scriptId={scriptId}
+                busy={busy}
+                onChange={onRefresh}
+                onRegenerate={regenerate}
+              />
               {detail && (
                 <div className="card-section">
                   <TimelineView timeline={timeline} />

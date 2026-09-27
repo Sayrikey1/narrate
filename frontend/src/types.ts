@@ -15,6 +15,8 @@ export interface Model {
   /** The dialogue endpoint's own ceiling, tighter than `max_chars`. */
   dialogue_max_chars: number;
   long_form: string;
+  /** What a new project gets when none is chosen — the server's choice. */
+  default: boolean;
   note: string;
 }
 
@@ -119,6 +121,72 @@ export interface Take {
   duration_s: number | null;
   model_id: string;
   in_cut: boolean;
+  /** What `narrate verify` found. "clear" means no issues were found — which
+   *  is not the same as perfect, and is never drawn as a tick. */
+  verify_status: VerifyStatus;
+  findings: Finding[];
+}
+
+export type VerifyStatus = "unverified" | "clear" | "review" | "suspect" | "error";
+
+/** One difference between the script and what was heard. Times are seconds
+ *  into the take. */
+export interface Finding {
+  severity: "fail" | "review" | "info";
+  kind: string;
+  summary: string;
+  expected?: string;
+  heard?: string;
+  start_s: number;
+  end_s?: number;
+  probability?: number;
+  gap_s?: number;
+  context?: string;
+  note?: string;
+}
+
+export interface VerifyCapability {
+  available: boolean;
+  model_ready: boolean;
+  model: string;
+  model_mb: number;
+  install_hint: string;
+  download_hint: string;
+}
+
+export interface RegeneratePlan {
+  ordinal: number;
+  chunk_id: number;
+  chars: number;
+  price_micros: number;
+  model_id: string;
+  cut_take: number | null;
+  cut_status: string;
+  blocker: string | null;
+}
+
+export type CutMove = "better" | "new" | "never";
+
+export interface RegenerateBody {
+  chunks: number[];
+  text?: string;
+  attempts?: number;
+  move?: CutMove;
+  max_spend_usd?: number;
+  accept_unknown?: boolean;
+  confirm?: boolean;
+}
+
+/** The price of a regeneration, and — once confirmed — the run to follow. */
+export interface RegenerateQuote {
+  dry_run: boolean;
+  run_key?: string;
+  plans: RegeneratePlan[];
+  attempts: number;
+  worst_micros: number;
+  worst_usd: string;
+  checked_with: string;
+  mock: boolean;
 }
 
 export interface ChunkRow {

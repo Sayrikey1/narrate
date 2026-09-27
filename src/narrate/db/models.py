@@ -232,6 +232,27 @@ class Take(Base):
     error_json: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(Integer, default=1)
 
+    # Whether every word in the script was actually spoken — `narrate verify`.
+    #
+    # unverified | clear | review | suspect | error
+    #
+    # Separate from `status` on purpose. Seven code paths select takes with
+    # `status == "succeeded"` — resume, cut selection, variant export, billing
+    # calibration — and a take that dropped a word *did* succeed as a request.
+    # Folding "suspect" into `status` would have silently re-billed it on the
+    # next resume and hidden it from export. `clear` means the checks found
+    # nothing, which is not the same as perfect, and is never shown as a tick.
+    verify_status: Mapped[str] = mapped_column(
+        String(16), default="unverified", server_default="unverified"
+    )
+    # The findings, times relative to the take: a JSON list of
+    # {severity, kind, expected, heard, start_s, end_s, ...}.
+    verify_findings_json: Mapped[str | None] = mapped_column(Text, default=None)
+    # Transcriber, settings and rules version — so a take checked under older
+    # rules can be found and checked again.
+    verifier: Mapped[str | None] = mapped_column(String(96), default=None)
+    verified_at: Mapped[datetime | None] = mapped_column(default=None)
+
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
     chunk: Mapped[Chunk] = relationship(back_populates="takes")

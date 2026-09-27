@@ -197,11 +197,16 @@ class ModelSpec:
         return Decimal(str(self.usd_per_1k))
 
 
+# Everything `[meta]` in models.toml may hold.
+_META_KEYS = frozenset({"rate_card_version", "default_model"})
+
+
 class Registry:
     """Loaded rate card, optionally overlaid with observed API metadata."""
 
-    def __init__(self, specs: dict[str, ModelSpec]) -> None:
+    def __init__(self, specs: dict[str, ModelSpec], default_model: str | None = None) -> None:
         self._specs = specs
+        self._default = default_model
 
     @classmethod
     def load(cls, config_path: Path | None = None, observed: Path | None = None) -> Registry:
@@ -235,7 +240,31 @@ class Registry:
                 concurrency_group=entry.get("concurrency_group", ""),
                 observed=observed_models.get(model_id, {}),
             )
-        return cls(specs)
+
+        meta = raw.get("meta", {})
+        # A misspelled key would read as "no default declared" and quietly fall
+        # back to another model — so an unknown key is as loud as a bad value.
+        unknown = sorted(set(meta) - _META_KEYS)
+        if unknown:
+            raise ValueError(
+                f"Unknown [meta] key(s) {', '.join(unknown)} in "
+                f"{(config_path or CONFIG_PATH).name}. Known: {', '.join(sorted(_META_KEYS))}."
+            )
+        default = meta.get("default_model")
+        if default is not None:
+            # A typo here would otherwise quietly hand every new project some
+            # other model. Loud, at load, names the fix.
+            if default not in specs:
+                raise ValueError(
+                    f"default_model {default!r} in {(config_path or CONFIG_PATH).name} is not "
+                    f"a model in the rate card. Known models: {', '.join(sorted(specs))}."
+                )
+            if specs[default].deprecated:
+                raise ValueError(
+                    f"default_model {default!r} is deprecated; name its replacement "
+                    f"({specs[default].replacement or 'see models.toml'}) instead."
+                )
+        return cls(specs, default)
 
     @property
     def rate_card_version(self) -> str:
@@ -262,12 +291,16 @@ class Registry:
         return sorted(specs, key=lambda s: (s.usd_per_1k, -s.max_chars))
 
     def recommended(self) -> ModelSpec:
-        """The default for long-form narration.
+        """The model a new project gets when none is chosen.
 
-        Prefers a model rated "best" for long form, which in practice means one
-        where request stitching works — the thing that keeps a 30-minute track
-        from sounding like thirteen separate recordings.
+        The rate card's `default_model` — eleven_v3 — chosen for narration
+        quality and audio tags, not for continuity: v3 has none, and
+        eleven_multilingual_v2 remains the choice where seamless prosody across
+        chunks matters more. Without a declared default, falls back to a model
+        rated "best" for long form, then to the first listed.
         """
+        if self._default is not None:
+            return self._specs[self._default]
         for spec in self.all():
             if spec.long_form == "best":
                 return spec

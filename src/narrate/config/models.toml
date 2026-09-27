@@ -46,16 +46,26 @@ concurrency_group = "standard"
 [meta]
 # Bump when the rate card changes so ledger entries can be traced to a version.
 rate_card_version = "2026-08-21"
+
+# The model a new project gets when none is chosen — in the CLI, the API and
+# the web form alike. Declared rather than derived from `long_form`, because the
+# default is a judgement about narration, not a continuity rating: eleven_v3 has
+# no cross-chunk continuity at all, and is still the better narrator. ElevenLabs'
+# model guide lists it for "audiobooks & video narration", it honours audio tags,
+# and it costs the same as multilingual_v2. Existing projects keep their model.
+default_model = "eleven_v3"
 # Capabilities below were reconciled against GET /v1/models on 2026-08-21;
 # `narrate models --sync` reports no drift as of that check.
 
 # ---------------------------------------------------------------------------
-# Multilingual v2 — the long-form default.
+# Multilingual v2 — the seamless option for one long narrator.
 #
 # The docs call this one "Most stable on long-form generations", it takes a
 # 10,000-character request (roughly a third the chunk count of v3 on the same
 # script), and crucially it is the only flagship model where request stitching
 # works — which is what keeps prosody continuous across chunk boundaries.
+# It does not honour audio tags. Not the default (see `default_model`); choose
+# it where continuity across chunks matters more than expressive delivery.
 # ---------------------------------------------------------------------------
 [models.eleven_multilingual_v2]
 label = "Multilingual v2"
@@ -73,14 +83,15 @@ concurrency_group = "standard"
 note = "Most stable on long-form generations. Request stitching works."
 
 # ---------------------------------------------------------------------------
-# Eleven v3 — the expressive option.
+# Eleven v3 — the default for new projects (see `default_model`).
 #
 # Two constraints the PRD did not account for, both verbatim from the docs:
 #   "Request stitching is not available for the eleven_v3 model."
 #   "Speed is not available for the Eleven v3 model."  (likewise similarity
 #   and speaker boost)
-# So v3 honours `stability` alone and does pacing through audio tags. Chunk
-# boundaries fall back to text conditioning, which is weaker.
+# So v3 honours `stability` alone and does pacing through audio tags. It has no
+# cross-chunk continuity either — see `text_conditioning` below — so each chunk
+# is generated on its own.
 # ---------------------------------------------------------------------------
 [models.eleven_v3]
 label = "Eleven v3"
@@ -97,6 +108,8 @@ request_stitching = false
 text_conditioning = false
 audio_tags = true
 settings_honoured = ["stability"]
+# Keep "expressive": the preflight hint for a stranded one-word sentence (the
+# "cannot scale. Them." defect, lint.py) fires on expressive models only.
 long_form = "expressive"
 languages = 70
 concurrency_group = "standard"
@@ -115,7 +128,7 @@ dialogue = true
 dialogue_max_chars = 2000
 dialogue_cost_multiplier = 1.0
 dialogue_cost_verified = false
-note = "Richest delivery and audio tags, and the only model that can do multi-speaker dialogue. No cross-chunk continuity at all — seams are unavoidable."
+note = "The default. Richest delivery, audio tags, 70 languages, and the only model that can do multi-speaker dialogue. Each chunk is generated on its own — no cross-chunk continuity."
 
 # ---------------------------------------------------------------------------
 # Flash v2.5 — half price, huge requests, flatter delivery.
@@ -153,13 +166,20 @@ concurrency_group = "turbo"
 note = "English only."
 
 # ---------------------------------------------------------------------------
-# v3 Conversational — v3's expressiveness at half the price.
+# v3 Conversational — v3's voice at half the price, built for live dialogue.
 #
-# The prose docs omit this model entirely from both the model_id table and the
-# character-limit table. GET /v1/models settles it: 5,000 characters,
-# can_do_text_to_speech = true, and a 0.5 character-cost multiplier — so it is
-# usable on the plain TTS endpoint and costs half what v3 does. Worth trying
-# before v3 on cost grounds alone.
+# GET /v1/models: 5,000 characters, can_do_text_to_speech = true, and a 0.5
+# character-cost multiplier, so it works on the plain TTS endpoint at half v3's
+# price. That made it look like the obvious choice for narration, and it is not
+# one. ElevenLabs documents it as "an ultra-low-latency version of Eleven v3,
+# optimized for live, back-and-forth dialogue" — for agents and assistants —
+# and its model guide recommends eleven_v3 or eleven_multilingual_v2 for
+# "audiobooks & video narration" instead.
+#
+# A 21-minute episode rendered on it had five defects the input did not: a
+# word reduced to noise, two unscripted words, a swapped word, a plural. No
+# model is documented as never doing this, so `narrate verify` stays the check
+# whatever is chosen — but for narration, prefer eleven_v3.
 # ---------------------------------------------------------------------------
 [models.eleven_v3_conversational]
 label = "v3 Conversational"
@@ -177,7 +197,7 @@ settings_honoured = ["stability", "use_speaker_boost"]
 long_form = "expressive"
 languages = 70
 concurrency_group = "standard_eleven_v3"
-note = "Half the price of v3, same 5,000-character limit. No request stitching."
+note = "Half the price of v3, but documented for live dialogue, not narration — prefer eleven_v3 for long-form. No request stitching."
 
 # ---------------------------------------------------------------------------
 # Deprecated. Listed so the CLI can name the replacement instead of failing

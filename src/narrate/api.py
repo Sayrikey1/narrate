@@ -18,6 +18,7 @@ import contextlib
 import hashlib
 import json
 import tempfile
+import threading
 import zipfile
 from collections.abc import AsyncIterator
 from dataclasses import asdict
@@ -34,6 +35,7 @@ from narrate import audio, ledger, previews, templates
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
+from narrate import regenerate as regen
 from narrate import voices as voices_mod
 from narrate.db.models import (
     CastMember,
@@ -52,6 +54,7 @@ from narrate.export import NothingToExport, export_script
 from narrate.ingest import ScriptHasTakes, UnsupportedScript, decode_script, ingest_script
 from narrate.money import fmt_usd
 from narrate.plan import gather_context, render_plan, render_timeline_json
+from narrate.provider.base import SFXProvider, TTSProvider
 from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
 from narrate.publish import (
@@ -61,9 +64,13 @@ from narrate.publish import (
     render_publish_json,
     render_publish_pack,
 )
-from narrate.registry import Registry
+from narrate.registry import Registry, UnknownModel
 from narrate.settings import Settings, get_settings, resolve_provider
 from narrate.timeline import build_timeline, voices_used
+from narrate.verify import service as verify_service
+from narrate.verify import transcribe as stt
+from narrate.verify.compare import INFO, Word
+from narrate.verify.transcribe import Transcriber
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 
@@ -88,7 +95,13 @@ class RunTracker:
     def start(self, run_key: str) -> asyncio.Queue[str | None]:
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._queues[run_key] = queue
+        # A new run's result must not be mistaken for the last one's.
+        self._results.pop(run_key, None)
         return queue
+
+    def busy(self, run_key: str) -> bool:
+        """A run has started under this key and not yet finished."""
+        return run_key in self._queues and run_key not in self._results
 
     def emit(self, run_key: str, message: str) -> None:
         queue = self._queues.get(run_key)
@@ -154,6 +167,26 @@ class CastIn(BaseModel):
     note: str = ""
 
 
+class VerifyIn(BaseModel):
+    chunks: list[int] | None = None
+    recheck: bool = False
+    all_takes: bool = False
+
+
+class RegenerateIn(BaseModel):
+    chunks: list[int]
+    # New words for the chunk first — one chunk, v3-family models only.
+    text: str | None = None
+    attempts: int = 1
+    # "better" (default): the cut moves only to a take that checks strictly
+    # better. "new": to the new take unless it checks worse. "never".
+    move: str = "better"
+    max_spend_usd: float | None = None
+    accept_unknown: bool = False
+    # False returns the price and sends nothing. The button asks first.
+    confirm: bool = False
+
+
 class GenerateIn(BaseModel):
     only: list[int] | None = None
     force: bool = False
@@ -191,20 +224,90 @@ class EffectsGenerateIn(BaseModel):
     dry_run: bool = True
 
 
-def create_app(engine: Engine | None = None, settings: Settings | None = None) -> FastAPI:
+class _Locked:
+    """A transcriber whose every call holds a lock."""
+
+    def __init__(self, inner: Transcriber, lock: threading.Lock) -> None:
+        self._inner = inner
+        self._lock = lock
+
+    @property
+    def identity(self) -> str:
+        return self._inner.identity
+
+    def transcribe(self, path: Path, window: tuple[float, float] | None = None) -> list[Word]:
+        with self._lock:
+            return self._inner.transcribe(path, window)
+
+
+def _check_payload(result: verify_service.TakeCheck) -> dict[str, Any]:
+    return {
+        "take_id": result.take_id,
+        "chunk_ordinal": result.chunk_ordinal,
+        "take_ordinal": result.take_ordinal,
+        "status": result.status,
+        "in_cut": result.in_cut,
+        "seconds": result.seconds,
+        "error": result.error,
+        "findings": [
+            {**f.as_dict(), "summary": f.summary} for f in result.findings if f.severity != INFO
+        ],
+    }
+
+
+def create_app(
+    engine: Engine | None = None,
+    settings: Settings | None = None,
+    transcriber: Transcriber | None = None,
+) -> FastAPI:
     app = FastAPI(title="narrate", docs_url="/api/docs", openapi_url="/api/openapi.json")
     db = engine or open_db()
     config = settings or get_settings()
     registry = Registry.load()
     tracker = RunTracker()
 
+    # One speech model per process, loaded on first use: it is half a gigabyte
+    # in memory and takes seconds to load. The lock keeps two checks from
+    # transcribing at once — they would only compete for the same CPU.
+    stt_lock = threading.Lock()
+    loaded: dict[str, Transcriber] = {}
+
+    def speech_to_text() -> Transcriber | None:
+        if transcriber is not None:
+            return transcriber
+        if not (stt.stt_available() and stt.model_ready()):
+            return None
+        if "local" not in loaded:
+            loaded["local"] = stt.LocalWhisper()
+        return loaded["local"]
+
+    def locked(inner: Transcriber | None) -> Transcriber | None:
+        """The shared model, taken one transcription at a time.
+
+        Regeneration checks its takes from a worker thread while `verify` may be
+        running on another; both go through this lock rather than competing for
+        the same model and the same CPU.
+        """
+        return None if inner is None else _Locked(inner, stt_lock)
+
+    def verify_blocking(script_id: int, **options: Any) -> list[verify_service.TakeCheck]:
+        with stt_lock:
+            return verify_service.verify_script(
+                db, script_id, speech_to_text(), registry, **options
+            )
+
     # -- reference data ----------------------------------------------------
 
     @app.get("/api/models")
     def list_models() -> list[dict[str, Any]]:
+        default = registry.recommended().model_id
         return [
             {
                 "model_id": spec.model_id,
+                # What a new project gets when none is chosen. Sent rather than
+                # re-derived in the browser, so the form, the CLI and the API
+                # cannot disagree about it.
+                "default": spec.model_id == default,
                 "label": spec.label,
                 "usd_per_1k": spec.usd_per_1k,
                 "max_chars": spec.effective_max_chars,
@@ -292,6 +395,15 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
         model_id = body.model_id or registry.recommended().model_id
         if model_id not in registry:
             raise HTTPException(400, f"Unknown model {model_id!r}")
+        spec = registry.get(model_id)
+        if body.prefix_tags and not spec.audio_tags:
+            # The same refusal the CLI and PATCH make: the tags would be read
+            # aloud, and billed, on every chunk.
+            raise HTTPException(
+                422,
+                f"{spec.label} does not support audio tags. Drop the prefix tags or "
+                "choose a model that does.",
+            )
         with session_scope(db) as session:
             if session.scalar(select(Project).where(Project.name == body.name)):
                 raise HTTPException(409, f"A project named {body.name!r} already exists")
@@ -336,6 +448,16 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 if body.prefix_tags and not spec.audio_tags:
                     raise HTTPException(400, f"{spec.label} does not support audio tags")
                 project.prefix_tags = body.prefix_tags
+            elif project.prefix_tags and not spec.audio_tags:
+                # A model change that would leave the project's tags on a model
+                # that reads them aloud. Refused here (the whole change is rolled
+                # back), not discovered when a generation fails.
+                raise HTTPException(
+                    422,
+                    f"{spec.label} does not support audio tags, and this project has "
+                    f"prefix tags {project.prefix_tags!r}. Clear them in the same change, "
+                    "or keep a model that honours them.",
+                )
 
             rejected: list[str] = []
             if body.settings is not None:
@@ -601,6 +723,11 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                                 "duration_s": take.duration_s,
                                 "model_id": take.model_id,
                                 "in_cut": selected.get(row.id) == take.id,
+                                "verify_status": take.verify_status,
+                                "findings": [
+                                    {**f.as_dict(), "summary": f.summary}
+                                    for f in verify_service.findings_of(take)
+                                ],
                             }
                             for take in takes
                         ],
@@ -750,15 +877,39 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
         channel, so the UI never blocks on a run.
         """
         run_key = f"script-{script_id}"
-        tracker.start(run_key)
+        # Priced before the run is marked started: a projection that cannot be
+        # made (a chunk naming a model the rate card no longer has) must answer
+        # with the reason, not leave the script marked busy until a restart.
+        try:
+            projection = produce_mod.project(
+                db,
+                script_id,
+                registry,
+                with_effects=body.with_effects,
+                only=body.only,
+                force=body.force,
+                settings=config,
+            )
+        except UnknownModel as exc:
+            raise HTTPException(422, str(exc.args[0])) from exc
 
-        projection = produce_mod.project(db, script_id, registry, with_effects=body.with_effects)
+        # One run per script: a second would share the run's event stream and,
+        # worse, generate the same chunks as a regeneration already in flight.
+        # Nothing awaits between the check and the start, so two requests cannot
+        # both pass it.
+        if tracker.busy(run_key):
+            raise HTTPException(409, "A run is already in progress for this script.")
+        tracker.start(run_key)
 
         async def work() -> None:
             mocked = resolve_provider() == "mock" or body.dry_run
-            tts = MockProvider() if mocked else ElevenLabsProvider(config)
-            sfx = MockSFXProvider() if mocked else ElevenLabsProvider(config)
+            tts: TTSProvider | None = None
+            sfx: SFXProvider | None = None
             try:
+                # Inside the try: a provider that cannot be built (no key, say)
+                # must still finish the run, or the script stays "busy" for good.
+                tts = MockProvider() if mocked else ElevenLabsProvider(config)
+                sfx = MockSFXProvider() if mocked else ElevenLabsProvider(config)
                 report = await produce_mod.produce(
                     db,
                     script_id,
@@ -771,7 +922,9 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                     dry_run=body.dry_run,
                     force=body.force,
                     max_spend_micros=(
-                        int(body.max_spend_usd * 1_000_000) if body.max_spend_usd else None
+                        round(body.max_spend_usd * 1_000_000)
+                        if body.max_spend_usd is not None
+                        else None
                     ),
                     override_cap=body.override_cap,
                     on_event=lambda m: tracker.emit(run_key, m),
@@ -797,8 +950,10 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
             except Exception as exc:
                 tracker.finish(run_key, {"error": str(exc)})
             finally:
-                await tts.aclose()
-                await sfx.aclose()
+                if tts is not None:
+                    await tts.aclose()
+                if sfx is not None:
+                    await sfx.aclose()
 
         background.add_task(work)
         return {
@@ -837,6 +992,165 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 yield f"data: {json.dumps({'message': message})}\n\n"
 
         return StreamingResponse(stream(), media_type="text/event-stream")
+
+    # -- verify and regenerate ------------------------------------------------
+
+    @app.get("/api/verify")
+    def verify_capability() -> dict[str, Any]:
+        """Whether takes can be checked, and what to do if not."""
+        return {
+            "available": transcriber is not None or stt.stt_available(),
+            "model_ready": transcriber is not None or stt.model_ready(),
+            "model": stt.DEFAULT_MODEL,
+            "model_mb": stt.MODEL_SIZE_MB.get(stt.DEFAULT_MODEL, 0),
+            "install_hint": stt.INSTALL_HINT,
+            "download_hint": "narrate verify --download-model",
+        }
+
+    @app.post("/api/scripts/{script_id}/verify")
+    async def verify_takes(
+        script_id: int, body: VerifyIn, background: BackgroundTasks
+    ) -> dict[str, Any]:
+        """Check takes against the script. Costs nothing; streamed like a run."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+        run_key = f"verify-{script_id}"
+        # Before the run is marked busy: finding the speech model touches the
+        # disk and can raise, and an exception after start() would leave the
+        # button answering 409 until a restart.
+        mode = "speech-to-text" if speech_to_text() is not None else "waveform only"
+        if tracker.busy(run_key):
+            raise HTTPException(409, "A check is already running for this script.")
+        tracker.start(run_key)
+
+        async def work() -> None:
+            def progress(result: verify_service.TakeCheck) -> None:
+                tracker.emit(
+                    run_key,
+                    f"chunk {result.chunk_ordinal} take {result.take_ordinal}: {result.status}",
+                )
+
+            try:
+                results = await asyncio.to_thread(
+                    verify_blocking,
+                    script_id,
+                    chunks=body.chunks,
+                    scope="all" if body.all_takes else "cut",
+                    recheck=body.recheck,
+                    on_result=progress,
+                )
+                tracker.finish(
+                    run_key,
+                    {
+                        "mode": mode,
+                        "checked": len(results),
+                        "results": [_check_payload(r) for r in results],
+                    },
+                )
+            except Exception as exc:
+                tracker.finish(run_key, {"error": str(exc)})
+
+        background.add_task(work)
+        return {"run_key": run_key, "mode": mode}
+
+    @app.post("/api/scripts/{script_id}/regenerate")
+    async def regenerate_chunks(
+        script_id: int, body: RegenerateIn, background: BackgroundTasks
+    ) -> dict[str, Any]:
+        """Price a regeneration, or — with `confirm` — run it in the background."""
+        if body.move not in (regen.MOVE_BETTER, regen.MOVE_NEW, regen.MOVE_NEVER):
+            raise HTTPException(422, "move must be 'better', 'new' or 'never'.")
+        if not body.chunks:
+            raise HTTPException(422, "Name at least one chunk to regenerate.")
+        if body.text is not None and len(body.chunks) != 1:
+            raise HTTPException(422, "New text replaces one chunk's words; name one chunk.")
+        texts = {body.chunks[0]: body.text} if body.text is not None else None
+        limit = round(body.max_spend_usd * 1_000_000) if body.max_spend_usd is not None else None
+        try:
+            plans = regen.plan(
+                db, script_id, registry, chunks=body.chunks, texts=texts, settings=config
+            )
+        except regen.ScriptNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except regen.RegenerateRefused as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        tries = max(1, min(body.attempts, regen.MAX_ATTEMPTS))
+        runnable = [p for p in plans if body.accept_unknown or not p.blocker]
+        # Once the words change, the old take says something the script no
+        # longer does, so the new take wins unless it checks worse.
+        move = (
+            regen.MOVE_NEW
+            if body.text is not None and body.move == regen.MOVE_BETTER
+            else body.move
+        )
+        worst = sum(p.price_micros for p in runnable) * tries
+        if limit is not None:
+            worst = min(worst, limit)
+        quote = {
+            "plans": [asdict(p) for p in plans],
+            "attempts": tries,
+            "worst_micros": worst,
+            "worst_usd": fmt_usd(worst, 4),
+            "checked_with": "speech-to-text" if speech_to_text() is not None else "waveform only",
+            "mock": resolve_provider() == "mock",
+        }
+        if not body.confirm:
+            return {"dry_run": True, **quote}
+        if not runnable:
+            raise HTTPException(409, "Every chunk named has an unknown outcome to reconcile.")
+        cheapest = min(p.price_micros for p in runnable)
+        if limit is not None and limit < cheapest:
+            raise HTTPException(
+                422,
+                f"A limit of {fmt_usd(limit, 4)} is below the price of one try "
+                f"({fmt_usd(cheapest, 4)}), so nothing would be sent.",
+            )
+
+        run_key = f"script-{script_id}"
+        if tracker.busy(run_key):
+            raise HTTPException(409, "A run is already in progress for this script.")
+        tracker.start(run_key)
+
+        async def work() -> None:
+            mocked = resolve_provider() == "mock"
+            tts: TTSProvider | None = None
+            try:
+                # Inside the try: a provider that cannot be built (no key, say)
+                # must still finish the run, or the script stays "busy" for good.
+                tts = MockProvider() if mocked else ElevenLabsProvider(config)
+                results = await regen.regenerate(
+                    db,
+                    script_id,
+                    [p.ordinal for p in runnable],
+                    tts,
+                    MockSFXProvider(),
+                    registry,
+                    config,
+                    transcriber=locked(speech_to_text()),
+                    attempts=tries,
+                    max_spend_micros=limit,
+                    move_cut=move,
+                    accept_unknown=body.accept_unknown,
+                    texts=texts,
+                    on_event=lambda m: tracker.emit(run_key, m),
+                )
+                tracker.finish(
+                    run_key,
+                    {
+                        "regenerated": [{**asdict(r), "moved": r.moved} for r in results],
+                        "spent_micros": sum(r.spent_micros for r in results),
+                        "mock": mocked,
+                    },
+                )
+            except Exception as exc:
+                tracker.finish(run_key, {"error": str(exc)})
+            finally:
+                if tts is not None:
+                    await tts.aclose()
+
+        background.add_task(work)
+        return {"dry_run": False, "run_key": run_key, **quote}
 
     @app.post("/api/scripts/{script_id}/cut")
     def set_cut(script_id: int, body: CutIn) -> dict[str, Any]:

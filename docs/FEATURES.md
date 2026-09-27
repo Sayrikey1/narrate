@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 49 CLI commands, 39 HTTP endpoints, 7 pages, and 496 Python plus 67
+memory — 67 CLI commands, 46 HTTP endpoints, 8 pages, and 769 Python plus 93
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -115,11 +115,16 @@ Rates live in `config/models.toml`, not in code — ElevenLabs repriced during
 
 | Model | Rate | Ceiling | Continuity | Also |
 | --- | --- | --- | --- | --- |
-| `eleven_multilingual_v2` | $0.10/1k | 10,000 | request stitching | the long-form default |
-| `eleven_v3` | $0.10/1k | 5,000 | **none** | audio tags, **dialogue** |
-| `eleven_v3_conversational` | $0.05/1k | 5,000 | **none** | audio tags |
+| `eleven_v3` | $0.10/1k | 5,000 | **none** | **the default**; audio tags, **dialogue** |
+| `eleven_multilingual_v2` | $0.10/1k | 10,000 | request stitching | most seamless over long form; no audio tags |
+| `eleven_v3_conversational` | $0.05/1k | 5,000 | **none** | audio tags; built for live dialogue, not narration |
 | `eleven_flash_v2_5` | $0.05/1k | 40,000 | request stitching | separate concurrency pool |
 | `eleven_flash_v2` | $0.05/1k | 30,000 | request stitching | English only |
+
+New projects get `eleven_v3` unless another model is named — the CLI, the API
+and the web form all read one `default_model` in `models.toml`, which is checked
+when the rate card loads, so a typo fails loudly instead of quietly handing new
+projects some other model. An existing project keeps its stored model.
 
 Two deprecated Turbo models are listed so the CLI can name the replacement
 rather than fail with an opaque error. `narrate models --sync` reconciles the
@@ -333,12 +338,12 @@ builds the WAL index and creates files.
 
 ## 10. Surfaces
 
-**CLI** — 65 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
+**CLI** — 67 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
 `effects`, `cost`, `db`, `publish`, `write`, plus `doctor`, `models`, `voices`,
 `estimate`, `generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`,
-`retention`, `serve` and `probe`.
+`retention`, `verify`, `regenerate`, `serve` and `probe`.
 
-**HTTP** — 40 endpoints. Deliberately thin: every one calls the same functions
+**HTTP** — 46 endpoints. Deliberately thin: every one calls the same functions
 the CLI does. Two entry points that disagreed about what a re-roll costs would
 be worse than having one.
 
@@ -370,9 +375,9 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 603 Python + 75 frontend. None touches the network |
-| Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `retention`, `formats`, `media`, `cost *`, `db *`, `publish write/show/set/title/titles/accept/briefs/choose`, `write beats/beat/sync`, and every voice audition |
-| Dry run is the default | Every command that spends — `generate`, `effects generate`, `effects suggest`, `publish draft`, `publish brief`, `write outline`, `write expand` — does nothing without `--go`, and says what it would have cost |
+| Tests | 769 Python + 93 frontend. None touches the network |
+| Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `retention`, `verify`, `formats`, `media`, `cost *`, `db *`, `publish write/show/set/title/titles/accept/briefs/choose`, `write beats/beat/sync`, and every voice audition |
+| Dry run is the default | Every command that spends — `generate`, `regenerate`, `effects generate`, `effects suggest`, `publish draft`, `publish brief`, `write outline`, `write expand` — does nothing without `--go`, and says what it would have cost |
 
 `narrate probe --live` is the only command that spends without being asked
 twice, and it costs about two cents. What it settled is written down in
@@ -421,6 +426,36 @@ Full reference in **[PUBLISHING.md](PUBLISHING.md)**.
 
 ---
 
+## 14. Checking takes, and regenerating them
+
+A speech model occasionally renders a take that is not what it was sent — a
+word dropped or reduced to a noise, a word that was never in the script, a word
+swapped. One 21-minute episode had five, including an unscripted "God". Full
+guide in **[VERIFY.md](VERIFY.md)**.
+
+| Feature | Detail |
+| --- | --- |
+| `narrate verify` | Transcribes each take locally and compares it word by word with what it was asked to say. **Free** — nothing is uploaded or billed. About two minutes for 21 minutes of audio |
+| Quiet on noise | 23 of 28 raw differences on the real episode were the transcriber's spelling. Whisper's own normaliser, a scored alignment, and a **second listen** to any uncertain extra word leave exactly the five real defects |
+| The waveform as a witness | A short loud burst walled in by digital silence is how a word gets garbled on eleven_v3. On its own it is only worth a listen; with the transcript it confirms the fail |
+| Verdicts | *suspect*, *review*, *no issues found* — never a tick, because a word clipped but still recognisable passes every check |
+| Where it shows | `narrate takes`, `timeline`, a **Takes to check** section in plan.md, publish.md's summary, an export warning, and on each take in the web UI with ▶ to play the exact spot |
+| `narrate regenerate` / **Regenerate…** | Price first, nothing sent without confirmation. Every earlier take is kept |
+| The cut moves only when earned | By default, only to a take that checks **strictly better**. A take you simply did not like stays until you have listened to both |
+| Retry until clean | `--attempts` up to 3, each a separate billed request, stopping at the first clean take |
+| Change the words first | Allowed on the v3 family only — on stitched models it would re-bill the neighbouring chunks, and it is refused with the price, before confirming |
+| Refuses a double charge | A chunk with a request whose outcome is unknown, or past the monthly cap, is not regenerated |
+| `generate --verify` | Checks new takes as they are made |
+| Preflight hint | A one-word sentence ending a paragraph after a long one — the shape that lost "Them" — and `[tags]` on a model that would read them aloud |
+| Optional | `uv sync --extra verify` — faster-whisper, no torch. The model downloads once, only when asked |
+
+Fixed on the way: a forced re-roll of a finished chunk was priced at nothing,
+so `narrate generate --only 5 --force --go` said "Nothing to generate" and sent
+nothing; and adopting a pre-Alembic database skipped two columns, so it was
+stamped at a schema it did not match.
+
+---
+
 ## Not supported
 
 Stated plainly, because a gap you know about is cheaper than one you discover:
@@ -442,3 +477,6 @@ Stated plainly, because a gap you know about is cheaper than one you discover:
 - **Niche research.** narrate can only see your own projects. It has no data
   about other channels, their performance, or what a subniche is worth
 - **Uploading.** narrate produces the pack; you paste it
+- **Judging delivery.** `narrate verify` checks the words, not how they were
+  said — emphasis, pace and a mispronounced but recognisable name need a
+  listener

@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderName = Literal["elevenlabs", "mock"]
@@ -50,6 +50,20 @@ class Settings(BaseSettings):
     # response from becoming a parsing problem. The larger one reads a scene
     # better; the smaller is half the price.
     groq_model: str = "openai/gpt-oss-120b"
+
+    # Where the speech-to-text model for `narrate verify` lives, when it is not
+    # in the default place beside the database — an offline machine, a model
+    # copied from elsewhere. NARRATE_STT_MODEL_DIR, in the environment or .env.
+    stt_model_dir: Path | None = None
+
+    @field_validator("stt_model_dir", mode="before")
+    @classmethod
+    def _unset_when_empty(cls, value: object) -> object:
+        # `NARRATE_STT_MODEL_DIR=` would otherwise parse as Path("."), and a
+        # model download would land in whichever directory the command ran in.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     # Defaults to a managed location outside the project — see
     # [db/locate.py](db/locate.py) for why a project directory is the wrong

@@ -342,11 +342,20 @@ narrate models
 
 | Model | Rate /1k | Ceiling | Continuity | Notes |
 | --- | --- | --- | --- | --- |
-| `eleven_multilingual_v2` | $0.10 | 10,000 | request stitching | 🏆 the long-form default |
-| `eleven_v3` | $0.10 | 5,000 | **none** | audio tags, 🎭 multi-speaker dialogue |
-| `eleven_v3_conversational` | $0.05 | 5,000 | **none** | audio tags, half the price of v3 |
+| `eleven_v3` | $0.10 | 5,000 | **none** | 🏆 the default — audio tags, 🎭 multi-speaker dialogue |
+| `eleven_multilingual_v2` | $0.10 | 10,000 | request stitching | the most seamless over long form; no audio tags |
+| `eleven_v3_conversational` | $0.05 | 5,000 | **none** | audio tags, half the price of v3 — built for live dialogue, not narration |
 | `eleven_flash_v2_5` | $0.05 | 40,000 | request stitching | separate concurrency pool |
 | `eleven_flash_v2` | $0.05 | 30,000 | request stitching | English only |
+
+**New projects get `eleven_v3`** — preselected in the web form, and what
+`narrate project new` and `POST /api/projects` use when no model is named. It is
+the richer narrator and honours audio tags, at the same price as
+`multilingual_v2`. What it gives up is continuity: no request stitching, so each
+chunk is generated on its own. For one long narrator where seamless prosody
+matters more than expressive delivery, choose `eleven_multilingual_v2`. An
+existing project keeps the model it was created with. The default is declared
+once, as `default_model` in `config/models.toml`.
 
 The picker shows only the delivery controls a model **actually honours** — on v3
 that is stability alone, because speed, similarity and speaker boost do nothing
@@ -377,7 +386,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 496 Python + 67 frontend tests
+just check                        # 769 Python + 93 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -411,6 +420,7 @@ second, rounded up** — not the 40 credits/second the subscription docs quote.
 | 📋 **[docs/FEATURES.md](docs/FEATURES.md)** | Everything supported, read from the code — and a plain list of what is not |
 | 🎭 **[docs/VOICES.md](docs/VOICES.md)** | Clones, registering a voice, slot limits, and two versions of one episode |
 | 📦 **[docs/PUBLISHING.md](docs/PUBLISHING.md)** | Chapters, the nine title formulas, the twelve thumbnail compositions, retention targets, and outline-first drafting |
+| 🔎 **[docs/VERIFY.md](docs/VERIFY.md)** | Catching takes that dropped, added or swapped a word — and regenerating them, price first |
 | 🔬 **[docs/probe-results.md](docs/probe-results.md)** | What live probing settled about billing |
 | 📐 **[docs/PRD.md](docs/PRD.md)** | The original brief, kept for the reasoning behind the design |
 
@@ -429,7 +439,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                496 Python tests
+tests/                769 Python tests
 assets/               generated audio (gitignored)
 ```
 
