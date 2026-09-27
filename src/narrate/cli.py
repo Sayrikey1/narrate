@@ -2597,6 +2597,13 @@ def regenerate_cmd(
                     "[yellow]  The chunk now holds the new words; the take in the cut still "
                     "has the old ones.[/yellow]"
                 )
+        if result.joined_takes:
+            console.print(
+                f"[dim]  {len(result.joined_takes)} of those made with a paragraph break "
+                "joined, where the problem sat — the same words, one fewer pause."
+                + (" The chunk keeps it joined." if result.break_joined else "")
+                + "[/dim]"
+            )
         if result.steady_takes:
             console.print(
                 f"[dim]  {len(result.steady_takes)} of those made with the steadiest delivery "

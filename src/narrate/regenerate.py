@@ -40,6 +40,7 @@ which rewording one block of text cannot update.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -54,10 +55,10 @@ from narrate.db.session import session_scope
 from narrate.provider.base import SFXProvider, TTSProvider
 from narrate.registry import ModelSpec, Registry, UnknownModel
 from narrate.runner import build_jobs, resolve_chunk_config
-from narrate.script_parse import parse_script
+from narrate.script_parse import parse_script, spoken_text
 from narrate.settings import Settings, get_settings
 from narrate.verify import service as verify_service
-from narrate.verify.compare import FAIL, REVIEW, Finding
+from narrate.verify.compare import FAIL, REVIEW, Finding, canon, normalise
 from narrate.verify.transcribe import ModelBroken, ModelMissing, SttUnavailable, Transcriber
 
 # A manual regeneration is one attempt; an automatic repair may try again, but
@@ -128,12 +129,23 @@ class ChunkResult:
     # New takes made with the steadiest delivery, because plain tries had
     # already come back flagged.
     steady_takes: list[int] = field(default_factory=list)
+    # New takes made with a paragraph break joined — the same words — because
+    # the problem sat at that break. `break_joined` when the chunk keeps it.
+    joined_takes: list[int] = field(default_factory=list)
+    break_joined: bool = False
     # Why the cut ended where it did, when that was not this module's choice.
     cut_note: str | None = None
 
     @property
     def moved(self) -> bool:
         return self.cut_after != self.cut_before
+
+
+@dataclass
+class _Join:
+    """The chunk's words before a break was joined automatically, if one was."""
+
+    original: str | None = None
 
 
 def _spec_for(
@@ -464,10 +476,12 @@ async def regenerate(
             )
 
         original: str | None = None
+        reworded_by_hand = bool(texts and chunk_plan.ordinal in texts)
         if texts and chunk_plan.ordinal in texts and remaining >= chunk_plan.price_micros:
             original = edit_text(
                 engine, script_id, chunk_plan.ordinal, texts[chunk_plan.ordinal], registry
             )
+        join = _Join()
         try:
             await _attempt(
                 engine,
@@ -483,9 +497,25 @@ async def regenerate(
                 remaining,
                 reserve,
                 on_event,
+                join if not reworded_by_hand else None,
             )
+        except BaseException:
+            # Interrupted before the cut was settled: the joined break stays
+            # only if the cut already plays a take made with it.
+            if join.original is not None:
+                with session_scope(engine) as session:
+                    playing = session.get(Cut, chunk_plan.chunk_id)
+                    playing_id = playing.take_id if playing else None
+                if playing_id not in result.joined_takes:
+                    _put_back(engine, chunk_plan.chunk_id, join.original)
+                    join.original = None
+            raise
         finally:
             remaining -= result.spent_micros
+            if join.original is not None and not result.joined_takes:
+                # The break was joined but no take was made with it.
+                _put_back(engine, chunk_plan.chunk_id, join.original)
+                join.original = None
             if original is not None:
                 # An interruption can land after the runner committed a paid take
                 # but before it was reported here. The database is the record:
@@ -502,6 +532,13 @@ async def regenerate(
                     result.words_restored = True
 
         _settle_cut(engine, chunk_plan.chunk_id, result, move_cut)
+        if join.original is not None:
+            # The chunk keeps the joined break only if the take in its cut was
+            # made with it; otherwise its words describe the take it plays.
+            if result.cut_after in result.joined_takes:
+                result.break_joined = True
+            else:
+                _put_back(engine, chunk_plan.chunk_id, join.original)
         if result.moved:
             note(f"chunk {chunk_plan.ordinal}: the cut now uses the new take")
     return results
@@ -521,13 +558,17 @@ async def _attempt(
     remaining: int,
     reserve: int,
     on_event: Callable[[str], None] | None,
+    join: _Join | None = None,
 ) -> None:
     """Generate and check one chunk, trying again while the new take is flagged.
 
-    A plain retry first. If a plain try has already come back flagged — in this
-    run, or twice before it — the next is made with the steadiest delivery
-    (`STEADY_STABILITY`), on a model that honours stability: the same defect
-    returning is a sign the delivery, not luck, is producing it.
+    A plain retry first. When a try comes back flagged, the next changes tactic:
+
+    * if the problem sits at a paragraph break, that break is joined — the same
+      words, one fewer pause for the model to fill with a reaction of its own
+      (with `join`, and only where rewording is allowed);
+    * otherwise the steadiest delivery (`STEADY_STABILITY`), on a model that
+      honours stability. A chunk already flagged twice before starts with it.
 
     Everything it learns goes on `result`, so the caller can still settle the
     words and the cut if this is interrupted part-way.
@@ -556,8 +597,21 @@ async def _attempt(
                     else "the spending limit for this regeneration was reached"
                 )
                 return
-        steady = can_steady and (steady_now or attempt > 1)
-        if steady:
+        steady = can_steady and steady_now and attempt == 1
+        joined_now = False
+        if attempt > 1 and result.new_takes:
+            if join is not None and join.original is None:
+                at = _break_to_join(engine, result.new_takes[-1], chunk_plan.chunk_id, registry)
+                if at:
+                    join.original = _join_break(engine, script_id, chunk_plan.ordinal, at, registry)
+                    joined_now = join.original is not None
+            steady = can_steady and not joined_now
+        if joined_now:
+            note(
+                f"chunk {chunk_plan.ordinal}: the problem sits at a paragraph break — "
+                "joining it (the same words, one fewer pause for the model to fill)"
+            )
+        elif steady:
             note(
                 f"chunk {chunk_plan.ordinal}: the problem keeps coming back — trying the "
                 f"steadiest delivery (stability {STEADY_STABILITY:.1f}: fewer invented words, "
@@ -606,6 +660,8 @@ async def _attempt(
         result.new_takes.append(take_id)
         if steady:
             result.steady_takes.append(take_id)
+        if join is not None and join.original is not None:
+            result.joined_takes.append(take_id)
         # Off the event loop: transcription is seconds of CPU, and in the web
         # server it would otherwise freeze every other request meanwhile.
         status = await asyncio.to_thread(_check, engine, script_id, take_id, transcriber, registry)
@@ -616,6 +672,129 @@ async def _attempt(
         # burst on its own may be the voice itself.
         if status not in _RETRY or not _wrong_words(engine, take_id):
             break
+
+
+# A paragraph break in a chunk's text.
+_PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
+
+
+def _break_to_join(
+    engine: Engine, take_id: int, chunk_id: int, registry: Registry
+) -> list[int] | None:
+    """The paragraph breaks a take's problem sits at, if it sits at one.
+
+    Counted in the same normalised words the check compares; a problem on the
+    last word before a break or the first after it is "at" the break. Several
+    breaks share a place when a paragraph between them holds no words — an
+    audio tag on its own — and then all of them are returned, since which of
+    those pauses the model filled cannot be told. None when the model would
+    not allow rewording, or the words do not line up — then nothing is joined.
+    """
+    with session_scope(engine) as session:
+        take = session.get(Take, take_id)
+        chunk = session.get(Chunk, chunk_id)
+        if take is None or chunk is None or chunk.turns_json:
+            return None
+        script = session.get(Script, chunk.script_id)
+        project = session.get(Project, script.project_id) if script else None
+        if script is None or project is None:
+            return None
+        spec = _spec_for(chunk, script, project, registry)
+        if spec.continuity_mode != "none":
+            return None
+        found = [
+            f
+            for f in verify_service.findings_of(take)
+            if f.severity in (FAIL, REVIEW) and f.kind != "burst" and f.word is not None
+        ]
+        paragraphs = _PARAGRAPH_BREAK.split(chunk.text)
+        if not found or len(paragraphs) < 2:
+            return None
+        whole = normalise(verify_service.expected_text(take, chunk, registry))
+        # Each break's place, from the text up to it, tokenised the way the
+        # whole is. A prefix ends where the text does not, so a trailing "..."
+        # can leave a stray "." token there; it is not a word, and is dropped.
+        places: list[int] = []
+        for index in range(1, len(paragraphs)):
+            before = "\n\n".join(paragraphs[:index])
+            tokens = normalise(spoken_text(before, audio_tags=spec.audio_tags))
+            while tokens and not any(c.isalnum() for c in tokens[-1]):
+                tokens.pop()
+            if whole[: len(tokens)] != tokens:
+                return None
+            places.append(len(tokens))
+        for place in places:
+            if any(_at_break(f, place, whole) for f in found):
+                return [i for i, p in enumerate(places, start=1) if p == place]
+        return None
+
+
+def _at_break(finding: Finding, boundary: int, words: list[str] | None = None) -> bool:
+    """Whether a problem sits at the break before script word `boundary`.
+
+    An extra word must come right before the new paragraph's first word — one
+    word earlier is mid-sentence — unless it echoes the word it follows: the
+    last word of a paragraph repeated across the pause reads, to the aligner,
+    as the first copy being the extra one. A missing run counts by either end,
+    so a phrase dropped just before the break is at it.
+    """
+    assert finding.word is not None
+    if finding.kind == "extra":
+        echo = (
+            words is not None
+            and finding.word == boundary - 1
+            and 0 < boundary <= len(words)
+            and canon([finding.heard]) == canon([words[boundary - 1]])
+        )
+        return finding.word == boundary or echo
+    edges = {finding.word}
+    if finding.kind == "missing" and finding.word_end is not None:
+        edges.add(finding.word_end)
+    return any(edge in (boundary - 1, boundary) for edge in edges)
+
+
+def _join_break(
+    engine: Engine, script_id: int, ordinal: int, at: list[int], registry: Registry
+) -> str | None:
+    """Join these paragraph breaks of a chunk (1-based). Returns the old text.
+
+    The chunk's text was parsed once, at ingest, and is stored exactly as built
+    here: running it through the Markdown parser again is not a no-op — a line
+    left starting "2." or "# " would lose its words. And the words are checked
+    to be the same before and after, or nothing is joined.
+    """
+    with session_scope(engine) as session:
+        chunk = session.scalar(
+            select(Chunk).where(Chunk.script_id == script_id, Chunk.ordinal == ordinal)
+        )
+        if chunk is None:
+            return None
+        script = session.get(Script, script_id)
+        project = session.get(Project, script.project_id) if script else None
+        if script is None or project is None:
+            return None
+        breaks = list(_PARAGRAPH_BREAK.finditer(chunk.text))
+        if not at or max(at) > len(breaks):
+            return None
+        joined = chunk.text
+        # From the last, so the earlier breaks' positions stay put.
+        for index in sorted(at, reverse=True):
+            gap = breaks[index - 1]
+            joined = joined[: gap.start()] + " " + joined[gap.end() :]
+        spec = _spec_for(chunk, script, project, registry)
+        same = normalise(spoken_text(joined, audio_tags=spec.audio_tags)) == normalise(
+            spoken_text(chunk.text, audio_tags=spec.audio_tags)
+        )
+        if not same:
+            return None
+        try:
+            # For its refusals only: a conversation, neighbours whose requests
+            # carry this text, a length the model will not take.
+            _validated_words(session, script, project, chunk, joined, registry)
+        except RegenerateRefused:
+            return None
+        old, chunk.text = chunk.text, joined
+        return old
 
 
 def _cap_headroom(engine: Engine, script_id: int) -> int | None:

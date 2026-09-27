@@ -31,6 +31,9 @@ class HearsTheScript:
     extras: dict[str, tuple[str, float]] = field(default_factory=dict)
     # file names whose extra word vanishes on a second listen (a phantom).
     phantoms: set[str] = field(default_factory=set)
+    # file name -> (index, word): a word spoken but never written, before the
+    # script word at that index — say, at the start of a paragraph.
+    inserts: dict[str, tuple[int, str]] = field(default_factory=dict)
     calls: list[tuple[str, tuple[float, float] | None]] = field(default_factory=list)
     identity: str = "hears-the-script"
 
@@ -43,6 +46,10 @@ class HearsTheScript:
         words: list[Word] = []
         cursor = 0.0
         for index, word in enumerate(text.split()):
+            if path.name in self.inserts and self.inserts[path.name][0] == index:
+                extra = self.inserts[path.name][1]
+                words.append(Word(f" {extra}", cursor, cursor + STEP_S * 0.9, 0.99))
+                cursor += STEP_S
             if self.drops.get(path.name) == word.strip(".,").lower():
                 cursor += HOLE_S
                 continue

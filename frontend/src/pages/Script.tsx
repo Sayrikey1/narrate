@@ -184,6 +184,7 @@ export function ScriptPage({
           words_restored: boolean;
           unknown_takes: number[];
           steady_takes: number[];
+          joined_takes: number[];
           cut_note: string | null;
         }[];
         const lines = done.map((r) => {
@@ -202,7 +203,8 @@ export function ScriptPage({
               ? ` — now in the cut${r.cut_note ? ` (${r.cut_note})` : ""}`
               : " — the cut is unchanged; listen and choose") +
             (r.reworded && !r.moved ? " (the take in the cut still has the old words)" : "") +
-            (r.steady_takes?.length ? ` — ${r.steady_takes.length} made with the steadiest delivery` : "")
+            (r.steady_takes?.length ? ` — ${r.steady_takes.length} made with the steadiest delivery` : "") +
+            (r.joined_takes?.length ? " — a paragraph break joined where the problem sat" : "")
           );
         });
         const spent = usd(Number(result.spent_micros ?? 0));

@@ -1043,3 +1043,220 @@ async def test_under_the_monthly_cap_the_next_chunk_still_gets_its_first_try(
 
     assert len(first.new_takes) == 1 and first.stopped
     assert len(second.new_takes) == 1
+
+
+# --------------------------------------------------------------------------
+# A problem at a paragraph break: join it, change no word
+# --------------------------------------------------------------------------
+
+TWO_PARAGRAPHS = "Dr. Halvorsen kept a careful record.\n\nThe entries grew shorter each year."
+# "The" is word 6 of the text as sent; an invented word lands just before it.
+AT_THE_BREAK = (6, "great")
+
+
+def _two_paragraphs(engine: Engine) -> None:
+    with session_scope(engine) as session:
+        chunk = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK)))
+        chunk.text = TWO_PARAGRAPHS
+
+
+async def test_a_word_invented_at_a_paragraph_break_is_fixed_by_joining_it(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """What fixed chunk 3 of the real episode: the model filled the pause after a
+    punchline with a word of its own, and one fewer break left it nothing to
+    fill. Tried before the steadiest delivery, which would soften the tags."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    _two_paragraphs(engine)
+    hears = HearsTheScript(engine, inserts={FIRST: AT_THE_BREAK, SECOND: AT_THE_BREAK})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    _plain, joined = result.new_takes
+    assert result.statuses == ["suspect", "clear"]
+    assert result.joined_takes == [joined] and not result.steady_takes
+    assert result.cut_after == joined and result.break_joined
+    with session_scope(engine) as session:
+        chunk = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK)))
+        assert chunk.text == TWO_PARAGRAPHS.replace("\n\n", " ")
+    # Not a word changed, and the next ordinary run finds the take it plays.
+    ordinary = produce_mod.project(
+        engine, script_id, registry, with_effects=False, settings=settings
+    )
+    assert ordinary.chunks == 0
+
+
+async def test_a_joined_break_is_undone_when_its_take_does_not_win(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """The chunk's words describe the take it plays."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    _two_paragraphs(engine)
+    hears = HearsTheScript(
+        engine, inserts={FIRST: AT_THE_BREAK, SECOND: AT_THE_BREAK, THIRD: (5, "great")}
+    )
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=2)
+
+    assert result.joined_takes and not result.moved and not result.break_joined
+    with session_scope(engine) as session:
+        chunk = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK)))
+        assert chunk.text == TWO_PARAGRAPHS
+
+
+async def test_a_break_is_never_joined_where_rewording_would_rebill_neighbours(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """On a stitched model a chunk's text travels with its neighbours' requests."""
+    _, script_id = project_and_script
+    _two_paragraphs(engine)
+    hears = HearsTheScript(engine, inserts={FIRST: AT_THE_BREAK, SECOND: AT_THE_BREAK})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=2)
+
+    assert not result.joined_takes
+    assert result.steady_takes == result.new_takes[1:]
+
+
+# Found in review: the join must never cost a word
+
+
+async def test_joining_a_break_keeps_every_word_of_a_numbered_list(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """The chunk's text was parsed once already; a second pass would read a line
+    starting "2." as a list marker and drop the number."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    listed = "Two rules run this whole game.\n\n1. Never lose money.\n\n2. Never forget rule one."
+    with session_scope(engine) as session:
+        require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))).text = listed
+    hears = HearsTheScript(engine, inserts={FIRST: (6, "great"), SECOND: (6, "great")})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.joined_takes and result.break_joined
+    with session_scope(engine) as session:
+        text = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))).text
+    assert text == listed.replace("game.\n\n1.", "game. 1.")
+
+
+async def test_an_extra_word_mid_sentence_is_not_a_reason_to_join(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """ "…careful great record." is one word short of the break, inside a sentence."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    _two_paragraphs(engine)
+    hears = HearsTheScript(engine, inserts={FIRST: (5, "great"), SECOND: (5, "great")})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=2)
+
+    assert not result.joined_takes
+
+
+def test_what_counts_as_at_a_paragraph_break() -> None:
+    from narrate.verify.compare import FAIL, Finding
+
+    def extra(word: int) -> Finding:
+        return Finding(severity=FAIL, kind="extra", heard="great", word=word)
+
+    def missing(words: str, word: int, end: int | None = None) -> Finding:
+        last = end if end is not None else word + len(words.split()) - 1
+        return Finding(severity=FAIL, kind="missing", expected=words, word=word, word_end=last)
+
+    script = "doctor halvorsen kept a careful record the entries grew shorter".split()
+    # The break sits before script word 6.
+    assert regen._at_break(extra(6), 6)
+    assert not regen._at_break(extra(5), 6)
+    assert regen._at_break(missing("the", 6), 6)
+    assert regen._at_break(missing("record", 5), 6)
+    assert regen._at_break(missing("careful record", 4), 6)
+    assert not regen._at_break(missing("kept", 2), 6)
+    # Dropped words need not be next to each other: "a … record", with
+    # "careful" misheard between them, ends at the break.
+    assert regen._at_break(missing("a record", 3, end=5), 6)
+    # The paragraph's last word echoed across the pause.
+    echo = Finding(severity=FAIL, kind="extra", heard="record", word=5)
+    assert regen._at_break(echo, 6, script)
+    assert not regen._at_break(extra(5), 6, script)
+
+
+async def test_an_interruption_while_the_joined_take_is_checked_leaves_the_words_as_played(
+    engine: Engine,
+    project_and_script: tuple[int, int],
+    settings: Settings,
+    registry: Registry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, script_id = project_and_script
+    _on_v3(engine)
+    _two_paragraphs(engine)
+    hears = HearsTheScript(engine, inserts={FIRST: AT_THE_BREAK, SECOND: AT_THE_BREAK})
+    await _episode(engine, script_id, settings, registry, hears)
+    real = regen._check
+    calls: list[int] = []
+
+    def interrupted_on_the_joined_take(
+        engine: Engine, script_id: int, take_id: int, transcriber: object, registry: Registry
+    ) -> str:
+        calls.append(take_id)
+        if len(calls) == 2:
+            raise asyncio.CancelledError
+        return real(engine, script_id, take_id, transcriber, registry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(regen, "_check", interrupted_on_the_joined_take)
+    with pytest.raises(asyncio.CancelledError):
+        await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    with session_scope(engine) as session:
+        chunk = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK)))
+        assert chunk.text == TWO_PARAGRAPHS
+
+
+async def test_a_paragraph_ending_in_an_ellipsis_can_still_be_joined(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """ "…record..." tokenises with a stray "." when it ends the text, which
+    once made every break of the chunk look out of line."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    with session_scope(engine) as session:
+        require(
+            session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))
+        ).text = TWO_PARAGRAPHS.replace("record.", "record...")
+    hears = HearsTheScript(engine, inserts={FIRST: AT_THE_BREAK, SECOND: AT_THE_BREAK})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.joined_takes and result.break_joined
+
+
+async def test_breaks_around_a_tag_on_its_own_are_joined_together(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Which of the two pauses around "[sighs]" the model filled cannot be told."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    with session_scope(engine) as session:
+        require(
+            session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))
+        ).text = TWO_PARAGRAPHS.replace("\n\n", "\n\n[sighs]\n\n")
+    # "[sighs]" is a word of the text as sent, so "The" is word 7 here.
+    hears = HearsTheScript(engine, inserts={FIRST: (7, "great"), SECOND: (7, "great")})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.joined_takes and result.break_joined
+    with session_scope(engine) as session:
+        text = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))).text
+    assert "\n\n" not in text and "[sighs]" in text

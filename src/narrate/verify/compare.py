@@ -157,6 +157,13 @@ class Finding:
     context: str = ""
     confirm: bool = False
     note: str = ""
+    # Where in the script's words this sits, as an index into the normalised
+    # expected tokens — for an extra word, the word it came before. Lets a
+    # regeneration tell a slip at a paragraph break from one mid-sentence.
+    word: int | None = None
+    # The last script word of a missing run — which need not be `word` plus its
+    # length: the words a take drops are not always next to each other.
+    word_end: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         # Empty fields are left out to keep stored findings small — but by
@@ -616,6 +623,7 @@ def _region(
                 start_s=heard[h_idx[0]].start,
                 end_s=heard[h_idx[-1]].end,
                 context=context,
+                word=e_idx[0],
             )
         ]
 
@@ -626,13 +634,23 @@ def _region(
         return REVIEW if numeric and severity == FAIL else severity
 
     out: list[Finding] = []
-    deleted = [expected[o.e] for o in region if o.op == "-" and o.e is not None]
+    deleted_at = [o.e for o in region if o.op == "-" and o.e is not None]
+    deleted = [expected[i] for i in deleted_at]
     inserted = [o.h for o in region if o.op == "+" and o.h is not None]
     substituted = [
-        (expected[o.e], heard[o.h])
+        (expected[o.e], heard[o.h], o.e)
         for o in region
         if o.op == "~" and o.e is not None and o.h is not None
     ]
+
+    def word_before(j: int) -> int:
+        """The script word a heard word came before, from the full alignment."""
+        pos = next((t for t, o in enumerate(ops) if o.h == j), len(ops))
+        for t in range(pos, len(ops)):
+            e = ops[t].e
+            if e is not None:
+                return e
+        return len(expected)
 
     if deleted:
         pure = not inserted and not substituted
@@ -650,6 +668,8 @@ def _region(
                 end_s=after.start if after else None,
                 gap_s=round(gap, 2) if gap else None,
                 context=context,
+                word=min(deleted_at),
+                word_end=max(deleted_at),
             )
         )
 
@@ -680,10 +700,11 @@ def _region(
                 probability=round(h.probability, 2),
                 context=context,
                 confirm=confirm,
+                word=word_before(j),
             )
         )
 
-    for expected_word, h in substituted:
+    for expected_word, h, at in substituted:
         similarity = difflib.SequenceMatcher(None, expected_word, h.token).ratio()
         inflected = _inflection(expected_word, h.token)
         reworded = similarity < REWORD_SIM and h.probability >= REWORD_P and not inflected
@@ -705,6 +726,7 @@ def _region(
                 end_s=h.end,
                 probability=round(h.probability, 2),
                 context=context,
+                word=at,
             )
         )
     return out

@@ -184,9 +184,16 @@ A regeneration keeps going while the new take is still flagged — *suspect* or
 them, and `--attempts 1` or `--max-spend` bounds it lower.
 
 The tries are not all the same. The first is a plain retry, since most defects
-are bad luck. Once a plain try has come back flagged — in this run, or twice
-before it — the next is made with the **steadiest delivery** (stability 1.0).
-ElevenLabs documents v3's most expressive setting as *"prone to
+are bad luck. When a try comes back flagged, the next changes tactic:
+
+1. **If the problem sits at a paragraph break**, that break is joined — the same
+   words, one fewer pause for the model to fill with a word of its own. Only on
+   the v3 family, where rewording re-bills no neighbour; the chunk keeps the
+   joined break only if the take in its cut was made with it.
+2. **Otherwise, the steadiest delivery** (stability 1.0) — and after a joined
+   try that still failed. A chunk already flagged twice before starts here.
+
+About the steadiest delivery: ElevenLabs documents v3's most expressive setting as *"prone to
 hallucinations"* and its steadiest as *"highly stable … consistent"*, at the
 cost that it *"reduces responsiveness to directional prompts"*: invented words
 become less likely, and tags like `[urgent]` land more softly. It applies to
@@ -206,8 +213,9 @@ with a reaction of its own:
 | 5 | *"…more seductive than it's ever been."* ¶ *"The modern S…"* | *"God,"* in two plain takes and one steady | the second steady take |
 | 3 | *"…selling you a course."* ¶ *"The problem isn't the job."* | *"Our"* for *"The"*, then *"work"*, *"great"*, *"great"* | joining the two paragraphs — the same words, one fewer break — clean on the first try |
 
-Joining paragraphs changes no word, so it is the first reword to try:
-`--text` with the chunk's own words and that one blank line removed.
+Joining paragraphs changes no word, so regeneration now tries it by itself
+when a problem sits at a break (above). By hand, it is `--text` with the
+chunk's own words and that one blank line removed.
 
 ### Changing the words first
 
