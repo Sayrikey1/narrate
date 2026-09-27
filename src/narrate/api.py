@@ -22,6 +22,7 @@ import threading
 import zipfile
 from collections.abc import AsyncIterator
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,7 @@ from narrate.db.models import (
     TitleCandidate,
 )
 from narrate.db.session import open_db, session_scope
-from narrate.export import NothingToExport, export_script
+from narrate.export import ExportResult, NothingToExport, export_is_current, export_script
 from narrate.ingest import ScriptHasTakes, UnsupportedScript, decode_script, ingest_script
 from narrate.money import fmt_usd
 from narrate.plan import gather_context, render_plan, render_timeline_json
@@ -177,12 +178,19 @@ class RegenerateIn(BaseModel):
     chunks: list[int]
     # New words for the chunk first — one chunk, v3-family models only.
     text: str | None = None
-    attempts: int = 1
+    # Tries per chunk while the new take is still flagged; stops at the first
+    # clean one. The quote is for all of them.
+    attempts: int = regen.MAX_ATTEMPTS
     # "better" (default): the cut moves only to a take that checks strictly
     # better. "new": to the new take unless it checks worse. "never".
     move: str = "better"
     max_spend_usd: float | None = None
     accept_unknown: bool = False
+    # Rebuild the episode afterwards if the cut changed (or the last export is
+    # stale), so the audio people download is the fixed one — in the formats
+    # asked for, or every stale master would keep the old take.
+    export: bool = False
+    export_formats: list[str] | None = None
     # False returns the price and sends nothing. The button asks first.
     confirm: bool = False
 
@@ -252,6 +260,21 @@ def _check_payload(result: verify_service.TakeCheck) -> dict[str, Any]:
         "findings": [
             {**f.as_dict(), "summary": f.summary} for f in result.findings if f.severity != INFO
         ],
+    }
+
+
+def _export_payload(result: ExportResult) -> dict[str, Any]:
+    return {
+        "out_dir": str(result.out_dir),
+        "master": result.master.name,
+        "masters": {k: v.name for k, v in result.masters.items()},
+        "mp3": result.mp3.name if result.mp3 else None,
+        "plan": result.plan.name,
+        "duration_s": result.duration_s,
+        "chunks": result.chunks,
+        "effects": result.effects,
+        "planned": result.planned,
+        "names": result.names,
     }
 
 
@@ -482,6 +505,7 @@ def create_app(
                 chunks = list(
                     session.scalars(select(Chunk).where(Chunk.script_id == script.id)).all()
                 )
+                project = session.get(Project, script.project_id)
                 out.append(
                     {
                         "id": script.id,
@@ -489,6 +513,10 @@ def create_app(
                         "title": script.title,
                         "chunks": len(chunks),
                         "chars": sum(len(c.text) for c in chunks),
+                        # The script's own model where it has one: a script can
+                        # be added on another model than its project's, and the
+                        # page's continuity notice must describe this script.
+                        "model_id": script.model_id or (project.model_id if project else None),
                     }
                 )
             return out
@@ -1135,14 +1163,32 @@ def create_app(
                     texts=texts,
                     on_event=lambda m: tracker.emit(run_key, m),
                 )
-                tracker.finish(
-                    run_key,
-                    {
-                        "regenerated": [{**asdict(r), "moved": r.moved} for r in results],
-                        "spent_micros": sum(r.spent_micros for r in results),
-                        "mock": mocked,
-                    },
-                )
+                payload: dict[str, Any] = {
+                    "regenerated": [{**asdict(r), "moved": r.moved} for r in results],
+                    "spent_micros": sum(r.spent_micros for r in results),
+                    "mock": mocked,
+                }
+                if body.export:
+                    with session_scope(db) as session:
+                        stale = not export_is_current(session, script_id)
+                    if stale or any(r.moved for r in results):
+                        try:
+                            # Off the event loop: stitching is seconds of ffmpeg.
+                            rebuilt = await asyncio.to_thread(
+                                partial(
+                                    export_script,
+                                    db,
+                                    script_id,
+                                    config,
+                                    formats=body.export_formats,
+                                )
+                            )
+                            payload["exported"] = _export_payload(rebuilt)
+                        except Exception as exc:
+                            # The regeneration is done and paid for; report it
+                            # whatever became of the rebuild.
+                            payload["export_error"] = str(exc)
+                tracker.finish(run_key, payload)
             except Exception as exc:
                 tracker.finish(run_key, {"error": str(exc)})
             finally:
@@ -1280,18 +1326,7 @@ def create_app(
             raise HTTPException(409, str(exc)) from exc
         except audio.UnknownFormat as exc:
             raise HTTPException(400, str(exc)) from exc
-        return {
-            "out_dir": str(result.out_dir),
-            "master": result.master.name,
-            "masters": {k: v.name for k, v in result.masters.items()},
-            "mp3": result.mp3.name if result.mp3 else None,
-            "plan": result.plan.name,
-            "duration_s": result.duration_s,
-            "chunks": result.chunks,
-            "effects": result.effects,
-            "planned": result.planned,
-            "names": result.names,
-        }
+        return _export_payload(result)
 
     # -- projects in detail, and their media --------------------------------
 

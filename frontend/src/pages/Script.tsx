@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, usd } from "../api";
 import { ChunkList } from "../components/ChunkList";
+import { RegeneratePanel } from "../components/RegeneratePanel";
 import { CostPanel } from "../components/CostPanel";
 import { DownloadIcon, SparkIcon } from "../components/Icon";
 import { TimelineView } from "../components/Timeline";
@@ -49,9 +50,23 @@ export function ScriptPage({
   const [exported, setExported] = useState<ExportResult | null>(null);
   const [detail, setDetail] = useState(false);
 
-  const flagged = chunks
-    .filter((c) => c.takes.some((t) => t.in_cut && t.verify_status === "suspect"))
-    .map((c) => c.ordinal);
+  // Suspect and to-review alike: the aim is an episode with nothing to hear.
+  const flaggedRows = chunks.filter((c) =>
+    c.takes.some((t) => t.in_cut && (t.verify_status === "suspect" || t.verify_status === "review")),
+  );
+  const flagged = flaggedRows.map((c) => c.ordinal);
+  const [fixing, setFixing] = useState(false);
+  const fixButton = useRef<HTMLButtonElement | null>(null);
+  // Nothing left to fix closes the panel, rather than leaving it to reopen by
+  // itself the next time something is flagged.
+  useEffect(() => {
+    if (!flagged.length) setFixing(false);
+  }, [flagged.length]);
+
+  function closeFixing() {
+    setFixing(false);
+    requestAnimationFrame(() => fixButton.current?.focus());
+  }
 
   useEffect(() => {
     api
@@ -147,7 +162,12 @@ export function ScriptPage({
     setBusy(true);
     setError(null);
     try {
-      const started = await api.regenerate(scriptId, body);
+      // The rebuild writes the formats chosen on this page, so no master is
+      // left behind still playing the old take.
+      const started = await api.regenerate(
+        scriptId,
+        body.export ? { ...body, export_formats: chosen } : body,
+      );
       if (!started.run_key) {
         setBusy(false);
         return;
@@ -163,6 +183,7 @@ export function ScriptPage({
           reworded: boolean;
           words_restored: boolean;
           unknown_takes: number[];
+          steady_takes: number[];
           cut_note: string | null;
         }[];
         const lines = done.map((r) => {
@@ -180,13 +201,19 @@ export function ScriptPage({
             (r.moved
               ? ` — now in the cut${r.cut_note ? ` (${r.cut_note})` : ""}`
               : " — the cut is unchanged; listen and choose") +
-            (r.reworded && !r.moved ? " (the take in the cut still has the old words)" : "")
+            (r.reworded && !r.moved ? " (the take in the cut still has the old words)" : "") +
+            (r.steady_takes?.length ? ` — ${r.steady_takes.length} made with the steadiest delivery` : "")
           );
         });
         const spent = usd(Number(result.spent_micros ?? 0));
-        return [...lines, result.mock ? `${spent} recorded (mock — nothing billed)` : `spent ${spent}`].join(
-          "\n",
-        );
+        const rebuilt = result.exported as ExportResult | undefined;
+        if (rebuilt) setExported(rebuilt);
+        return [
+          ...lines,
+          result.mock ? `${spent} recorded (mock — nothing billed)` : `spent ${spent}`,
+          ...(rebuilt ? ["The episode was rebuilt with the new takes."] : []),
+          ...(result.export_error ? [`The episode was not rebuilt: ${String(result.export_error)}`] : []),
+        ].join("\n");
       });
     } catch (e) {
       setBusy(false);
@@ -286,8 +313,28 @@ export function ScriptPage({
               {flagged.length > 0 && (
                 <Notice tone="warn" title={`${flagged.length} take(s) in the cut are flagged`}>
                   Words missing, added or changed in chunk {flagged.join(", ")}. Press ▶ beside
-                  each finding to hear the spot, then Regenerate if it is what it looks like.
+                  each finding to hear the spot, or fix them all at once.{" "}
+                  <button
+                    ref={fixButton}
+                    className="small"
+                    aria-expanded={fixing}
+                    aria-disabled={busy}
+                    onClick={() => {
+                      if (!busy) setFixing((v) => !v);
+                    }}
+                  >
+                    {fixing ? "Cancel" : "Fix all flagged…"}
+                  </button>
                 </Notice>
+              )}
+              {fixing && flaggedRows.length > 0 && (
+                <RegeneratePanel
+                  scriptId={scriptId}
+                  chunks={flaggedRows}
+                  busy={busy}
+                  onRun={regenerate}
+                  onClose={closeFixing}
+                />
               )}
               <ChunkList
                 chunks={chunks}

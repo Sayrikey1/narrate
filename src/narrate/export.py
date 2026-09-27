@@ -84,6 +84,20 @@ def selected_takes(session: Session, script_id: int) -> list[tuple[int, Take]]:
     return [(ordinal, take) for ordinal, take in rows]
 
 
+def export_is_current(session: Session, script_id: int) -> bool:
+    """Whether the newest export was made from the cut as it is now.
+
+    A regeneration moves the cut; an export made before it plays the old takes.
+    """
+    latest = session.scalars(
+        select(Export).where(Export.script_id == script_id).order_by(Export.id.desc()).limit(1)
+    ).first()
+    if latest is None:
+        return False
+    current = cut_fingerprint([take.id for _, take in selected_takes(session, script_id)])
+    return latest.cut_fingerprint == current
+
+
 def _variant_slug(label: str) -> str:
     """A filename-safe tag for a variant. Short, because it is a suffix."""
     safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in label).strip("-")

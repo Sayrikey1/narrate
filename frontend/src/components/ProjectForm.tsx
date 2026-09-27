@@ -121,6 +121,15 @@ export function ProjectForm({
         />
       )}
 
+      {editing && project && modelId && modelId !== project.model_id && (
+        <Notice tone="warn">
+          The model is part of every request, so chunks already generated on the
+          project's model — in any script without a model of its own — would be
+          generated and billed again on their next run, unless they already have
+          takes on this one. To try another model without that, add a new script on it.
+        </Notice>
+      )}
+
       <button className="primary" disabled={busy || (!editing && (!name.trim() || !modelId))}>
         {busy ? "Saving…" : editing ? "Save" : "Create project"}
       </button>

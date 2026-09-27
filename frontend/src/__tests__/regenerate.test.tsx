@@ -113,7 +113,7 @@ describe("regenerating is priced before it is paid for", () => {
     const fetch = stubQuote(quote());
     const onRun = vi.fn(async () => undefined);
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={onRun} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={onRun} onClose={() => {}} />,
     );
 
     await click(button("Price it"));
@@ -130,7 +130,7 @@ describe("regenerating is priced before it is paid for", () => {
   it("throws the price away when an option changes, so the button is never stale", async () => {
     stubQuote(quote());
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={vi.fn()} onClose={() => {}} />,
     );
     await click(button("Price it"));
     expect(button("Regenerate for up to")).toBeTruthy();
@@ -150,7 +150,7 @@ describe("regenerating is priced before it is paid for", () => {
     blocked.plans[0].blocker = "It may already have been billed.";
     stubQuote(blocked);
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={vi.fn()} onClose={() => {}} />,
     );
     await click(button("Price it"));
 
@@ -161,7 +161,7 @@ describe("regenerating is priced before it is paid for", () => {
   it("says plainly when nothing will be billed", async () => {
     stubQuote(quote({ mock: true }));
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={vi.fn()} onClose={() => {}} />,
     );
     await click(button("Price it"));
     expect(host.textContent).toContain("nothing is billed");
@@ -177,20 +177,20 @@ describe("found in review", () => {
       vi.fn(() => new Promise<Response>((resolve) => (answer = resolve))),
     );
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={vi.fn()} onClose={() => {}} />,
     );
     await click(button("Price it"));
 
     const select = host.querySelector("select") as HTMLSelectElement;
     await act(async () => {
-      select.value = "3";
+      select.value = "1";
       select.dispatchEvent(new Event("change", { bubbles: true }));
     });
     await act(async () => {
       answer(new Response(JSON.stringify(quote()), { status: 200 }));
     });
 
-    // The late answer was for one try, not three: it must not reach the button.
+    // The late answer was for three tries, not one: it must not reach the button.
     expect(button("Regenerate for up to")).toBeFalsy();
   });
 
@@ -200,7 +200,7 @@ describe("found in review", () => {
     const fetch = stubQuote(blocked);
     const onRun = vi.fn(async () => undefined);
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={onRun} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={onRun} onClose={() => {}} />,
     );
     await click(button("Price it"));
     expect((button("Regenerate for up to") as HTMLButtonElement).disabled).toBe(true);
@@ -219,7 +219,7 @@ describe("found in review", () => {
 
   it("moves focus into the panel when it opens", async () => {
     await render(
-      <RegeneratePanel scriptId={5} chunk={chunk([take()])} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+      <RegeneratePanel scriptId={5} chunks={[chunk([take()])]} busy={false} onRun={vi.fn()} onClose={() => {}} />,
     );
     expect(host.contains(document.activeElement)).toBe(true);
   });
@@ -303,5 +303,68 @@ describe("found checking the review fixes", () => {
 
     await click(toggle);
     expect(button("Price it")).toBeFalsy();
+  });
+});
+
+describe("fixing everything flagged at once", () => {
+  it("prices every flagged chunk, keeps trying, and rebuilds the episode", async () => {
+    const fetch = stubQuote(quote());
+    const three = { ...chunk([take()]), ordinal: 3 };
+    await render(
+      <RegeneratePanel
+        scriptId={5}
+        chunks={[three, chunk([take()])]}
+        busy={false}
+        onRun={vi.fn()}
+        onClose={() => {}}
+      />,
+    );
+
+    // Rewording is one chunk's words, so it is not offered for several.
+    expect(host.textContent).not.toContain("Change the words first");
+
+    await click(button("Price it"));
+    const sent = JSON.parse(String(fetch.mock.calls[0][1]?.body));
+    expect(sent).toMatchObject({ chunks: [3, 5], attempts: 3, export: true, confirm: false });
+  });
+});
+
+describe("the fix-all panel never spends past its button", () => {
+  it("keeps to the chunks it was opened for, and sends the quote as the limit", async () => {
+    stubQuote(quote({ worst_micros: 330_000, worst_usd: "$0.3300" }));
+    const onRun = vi.fn(async () => undefined);
+    const five = chunk([take()]);
+    const panel = (rows: ChunkRow[]) => (
+      <RegeneratePanel scriptId={5} chunks={rows} busy={false} onRun={onRun} onClose={() => {}} />
+    );
+    await render(panel([five]));
+    await click(button("Price it"));
+
+    // A refresh flags chunk 9 while the panel is open.
+    await render(panel([five, { ...five, ordinal: 9 }]));
+    await click(button("Regenerate for up to $0.3300"));
+
+    expect(onRun).toHaveBeenCalledWith(
+      expect.objectContaining({ chunks: [5], max_spend_usd: 0.33, confirm: true }),
+    );
+  });
+
+  it("skips a blocked chunk and still fixes the others", async () => {
+    const mixed = quote();
+    mixed.plans = [
+      { ...mixed.plans[0], ordinal: 5, blocker: "It may already have been billed." },
+      { ...mixed.plans[0], ordinal: 8, blocker: "Take 3 of chunk 8 got no answer." },
+      { ...mixed.plans[0], ordinal: 9, blocker: null },
+    ];
+    stubQuote(mixed);
+    const rows = [5, 8, 9].map((ordinal) => ({ ...chunk([take()]), ordinal }));
+    await render(
+      <RegeneratePanel scriptId={5} chunks={rows} busy={false} onRun={vi.fn()} onClose={() => {}} />,
+    );
+    await click(button("Price it"));
+
+    expect(host.textContent).toContain("Chunk 5 will be skipped");
+    expect(host.textContent).toContain("Chunk 8 will be skipped");
+    expect((button("Regenerate for up to") as HTMLButtonElement).disabled).toBe(false);
   });
 });

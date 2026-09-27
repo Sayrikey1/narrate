@@ -153,8 +153,15 @@ def build_jobs(
     registry: Registry,
     settings: Settings,
     only: list[int] | None = None,
+    voice_overrides: dict[int, dict[str, Any]] | None = None,
 ) -> list[_Job]:
-    """Turn chunks into fully-formed requests, continuity included."""
+    """Turn chunks into fully-formed requests, continuity included.
+
+    `voice_overrides` maps a chunk ordinal to voice settings laid over its own
+    for this run only — a regeneration trying a steadier delivery. Nothing is
+    stored on the chunk: the take records the request it was made from, and the
+    next ordinary run still finds the chunk's own take by its own request.
+    """
     chunks = list(
         session.scalars(
             select(Chunk).where(Chunk.script_id == script.id).order_by(Chunk.ordinal)
@@ -171,6 +178,8 @@ def build_jobs(
             continue
 
         model_id, voice_id, raw_settings, prefix = resolve_chunk_config(chunk, script, project)
+        if voice_overrides and chunk.ordinal in voice_overrides:
+            raw_settings = {**raw_settings, **voice_overrides[chunk.ordinal]}
         spec = registry.get(model_id)
 
         if prefix and not spec.audio_tags:
@@ -369,6 +378,7 @@ async def generate(
     override_cap: bool = False,
     extra_projected_micros: int = 0,
     on_event: Callable[[str], None] | None = None,
+    voice_overrides: dict[int, dict[str, Any]] | None = None,
 ) -> RunReport:
     """Generate every chunk of a script that does not already have a take.
 
@@ -390,7 +400,7 @@ async def generate(
         project = session.get(Project, script.project_id)
         if project is None:
             raise ValueError(f"Script {script_id} has no project.")
-        jobs = build_jobs(session, script, project, registry, settings, only)
+        jobs = build_jobs(session, script, project, registry, settings, only, voice_overrides)
 
         # Resume: anything already generated with an identical request is done.
         pending: list[_Job] = []

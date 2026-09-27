@@ -60,6 +60,7 @@ from narrate.effects import (
 )
 from narrate.export import (
     NothingToExport,
+    export_is_current,
     export_script,
     write_plan_only,
     write_publish_pack_only,
@@ -453,6 +454,37 @@ def project_list() -> None:
     console.print(table)
 
 
+def _warn_rekeyed(session: Session, project: Project, model: str) -> None:
+    """Say which generated scripts a model change will send again in full.
+
+    The model is part of every request, so a script that follows the project's
+    model gets new requests, and its next run generates — and bills — every
+    chunk again. Nothing is spent here; the run still shows its price.
+    """
+    # Only chunks that follow the project's model — a script or chunk with a
+    # model of its own keeps its requests — and only those with no take on the
+    # new model already: switching back to where they were made re-bills nothing.
+    generated: list[int] = []
+    for script in session.scalars(
+        select(Script).where(Script.project_id == project.id, Script.model_id.is_(None))
+    ).all():
+        for chunk in script.chunks:
+            if chunk.model_id is not None:
+                continue
+            made = [t for t in chunk.takes if t.status == "succeeded"]
+            if made and not any(t.model_id == model for t in made):
+                generated.append(script.id)
+                break
+    if generated:
+        listed = ", ".join(map(str, generated))
+        console.print(
+            f"[yellow]Script(s) {listed} have generated chunks that follow the project's "
+            f"model.[/yellow] On their next run those chunks would be generated — and "
+            f"billed — again on {model}. To try another model without that, add a new "
+            "script with --model."
+        )
+
+
 @project_app.command("set")
 def project_set(
     project: str,
@@ -479,6 +511,8 @@ def project_set(
         if model:
             if model not in registry:
                 _die(f"Unknown model {model!r}.")
+            if model != row.model_id:
+                _warn_rekeyed(session, row, model)
             row.model_id = model
         if voice:
             row.voice_id = voices_mod.resolve(session, voice)
@@ -2308,13 +2342,21 @@ def verify(
             "[dim]No issues found is not a guarantee: a word clipped short but still "
             "recognisable passes. Listen to anything that matters.[/dim]"
         )
-    suspects = sorted({r.chunk_ordinal for r in results if r.status == "suspect"})
-    if suspects:
-        listed = ",".join(map(str, suspects))
+    # In the cut only: with --all-takes, an old take the cut has moved past is
+    # history, not something a script gating on this should stop for.
+    suspects = sorted({r.chunk_ordinal for r in results if r.in_cut and r.status == "suspect"})
+    # Only takes in the cut are worth regenerating for: with --all-takes, an old
+    # flagged take the cut has already moved past must not send you back to it.
+    to_fix = sorted(
+        {r.chunk_ordinal for r in results if r.in_cut and r.status in ("suspect", "review")}
+    )
+    if to_fix:
+        listed = ",".join(map(str, to_fix))
         console.print(
-            f"Regenerate them (shows the price, sends nothing):  "
-            f"[bold]narrate regenerate {script_id} --chunk {listed}[/bold]"
+            f"Fix them (shows the price, sends nothing):  "
+            f"[bold]narrate regenerate {script_id} --chunk {listed} --export[/bold]"
         )
+    if suspects:
         raise typer.Exit(EXIT_SUSPECT)
     if flagged:
         console.print("[dim]Review items are worth a listen; nothing is clearly wrong.[/dim]")
@@ -2358,16 +2400,22 @@ def regenerate_cmd(
     script_id: int,
     chunk: str = typer.Option(None, "--chunk", "-c", help="Chunks to regenerate, e.g. 5 or 5,8."),
     suspect: bool = typer.Option(
-        False, "--suspect", help="Every chunk whose take in the cut `verify` flagged."
+        False, "--suspect", help="Every chunk whose take in the cut `verify` found suspect."
+    ),
+    flagged: bool = typer.Option(
+        False,
+        "--flagged",
+        help="Every chunk whose take in the cut is suspect or to review — fix everything found.",
     ),
     text: str = typer.Option(
         None, "--text", help="New words for the chunk first. One chunk; v3-family models only."
     ),
     attempts: int = typer.Option(
-        1,
+        regen.MAX_ATTEMPTS,
         "--attempts",
-        help=f"If the new take is still flagged, try again up to this many times "
-        f"(max {regen.MAX_ATTEMPTS}). Each try is billed.",
+        help=f"Tries per chunk while the new take is still flagged (max "
+        f"{regen.MAX_ATTEMPTS}). Stops at the first clean take; each try is billed. "
+        "After a plain try fails, the next uses the steadiest delivery.",
     ),
     use_new: bool = typer.Option(
         False, "--use-new", help="Use the new take unless it checks worse."
@@ -2386,6 +2434,9 @@ def regenerate_cmd(
     go: bool = typer.Option(False, "--go", help="Actually spend. Without this it is a dry run."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
     provider_name: str = typer.Option(None, "--provider", help="elevenlabs | mock"),
+    rebuild: bool = typer.Option(
+        False, "--export", help="Rebuild the episode audio afterwards, if the cut changed."
+    ),
 ) -> None:
     """Generate chosen chunks again, keeping every earlier take.
 
@@ -2396,8 +2447,11 @@ def regenerate_cmd(
     """
     if use_new and keep_cut:
         _die("Pass --use-new or --keep-cut, not both.")
-    if not chunk and not suspect:
-        _die("Name the chunks with --chunk 5,8, or pass --suspect for every flagged one.")
+    if not chunk and not suspect and not flagged:
+        _die(
+            "Name the chunks with --chunk 5,8, or pass --flagged for every flagged one "
+            "(--suspect for the suspect ones only)."
+        )
     settings = get_settings()
     engine = _engine()
     registry = _registry()
@@ -2412,14 +2466,18 @@ def regenerate_cmd(
             registry,
             chunks=chunks,
             suspect_only=suspect,
+            flagged_only=flagged,
             texts={chunks[0]: text} if text is not None and chunks else None,
         )
     except regen.RegenerateRefused as exc:
         _die(str(exc))
     if not plans:
+        which = "suspect" if suspect and not flagged else "flagged"
         console.print(
-            "[green]No take in the cut is flagged.[/green] "
-            "[dim]Run `narrate verify` first, or name chunks with --chunk.[/dim]"
+            f"[green]No take in the cut is {which}.[/green] "
+            "[dim]Run `narrate verify` first, or name chunks with --chunk"
+            + (", or pass --flagged to include takes to review" if which == "suspect" else "")
+            + ".[/dim]"
         )
         return
 
@@ -2539,8 +2597,28 @@ def regenerate_cmd(
                     "[yellow]  The chunk now holds the new words; the take in the cut still "
                     "has the old ones.[/yellow]"
                 )
+        if result.steady_takes:
+            console.print(
+                f"[dim]  {len(result.steady_takes)} of those made with the steadiest delivery "
+                f"(stability {regen.STEADY_STABILITY:.1f}), because plain tries kept coming back "
+                "flagged. Audio tags land more softly on it.[/dim]"
+            )
         if result.stopped:
             console.print(f"[yellow]  {escape(result.stopped)}[/yellow]")
+    still = _still_flagged(engine, script_id, [r.ordinal for r in results])
+    for result in results:
+        status = still.get(result.ordinal)
+        made = len(result.statuses)
+        # Only when every try made came back flagged is the text a suspect;
+        # a cut kept by choice (--keep-cut) says nothing about the words.
+        if status and made and all(s in ("suspect", "review") for s in result.statuses):
+            hint = "The same problem returning suggests the text provokes it: " if made > 1 else ""
+            console.print(
+                f"[yellow]Chunk {result.ordinal} is still {status} after {made} "
+                f"tr{'y' if made == 1 else 'ies'}.[/yellow] {hint}listen (`narrate takes "
+                f"{script_id} --chunk {result.ordinal}`), then try again, reword the line "
+                "(`--text`), or cut the moment in the edit."
+            )
     if resolve_provider(provider_name) == "mock":
         console.print(
             f"Recorded {fmt_usd(spent, 4)} against the mock provider — nothing was billed. "
@@ -2548,10 +2626,58 @@ def regenerate_cmd(
         )
     else:
         console.print(f"Spent {fmt_usd(spent, 4)}. Every earlier take is still on disk.")
-    if any(not r.new_takes for r in results):
+    with session_scope(engine) as session:
+        stale = not export_is_current(session, script_id)
+    if any(r.moved for r in results) or (rebuild and stale):
+        if rebuild:
+            _rebuild_episode(engine, script_id, settings)
+        else:
+            console.print(
+                f"The exported episode no longer matches the cut. Rebuild it with "
+                f"[bold]narrate export {script_id}[/bold] (or pass --export next time)."
+            )
+    skipped = [p.ordinal for p in plans if p.blocker and not accept_unknown]
+    if skipped:
+        console.print(
+            f"[yellow]Chunk(s) {', '.join(map(str, skipped))} were not regenerated[/yellow] — "
+            "a request's outcome is unknown (see above). Reconcile, then run this again."
+        )
+    if skipped or any(not r.new_takes for r in results):
         # A chunk that was asked for and got no new take: a script chaining this
         # into an export must not read it as done.
         raise typer.Exit(1)
+    if any(status == "suspect" for status in still.values()):
+        raise typer.Exit(EXIT_SUSPECT)
+
+
+def _still_flagged(engine: Engine, script_id: int, ordinals: list[int]) -> dict[int, str]:
+    """Chunks whose take in the cut is still suspect or to review."""
+    with session_scope(engine) as session:
+        rows = session.execute(
+            select(Chunk.ordinal, Take.verify_status)
+            .join(Cut, Cut.chunk_id == Chunk.id)
+            .join(Take, Take.id == Cut.take_id)
+            .where(Chunk.script_id == script_id, Chunk.ordinal.in_(ordinals))
+            .order_by(Chunk.ordinal)
+        ).all()
+    return {ordinal: status for ordinal, status in rows if status in ("suspect", "review")}
+
+
+def _rebuild_episode(engine: Engine, script_id: int, settings: Settings) -> None:
+    """Export the episode again, with the export command's defaults."""
+    try:
+        result = export_script(engine, script_id, settings)
+    except Exception as exc:
+        # The regeneration above is done and paid for; only the rebuild failed.
+        console.print(
+            f"[red]The episode was not rebuilt:[/red] {escape(str(exc))} "
+            f"Run `narrate export {script_id}` once that is fixed."
+        )
+        raise typer.Exit(1) from exc
+    minutes, seconds = divmod(int(result.duration_s), 60)
+    console.print(
+        f"[green]Episode rebuilt[/green] — {minutes}m {seconds:02d}s, in {result.out_dir}"
+    )
 
 
 async def _regenerate(

@@ -386,7 +386,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 769 Python + 93 frontend tests
+just check                        # 785 Python + 97 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -439,7 +439,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                769 Python tests
+tests/                785 Python tests
 assets/               generated audio (gitignored)
 ```
 

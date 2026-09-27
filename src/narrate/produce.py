@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import Engine
 
@@ -132,8 +133,13 @@ async def produce(
     concurrency: int | None = None,
     override_cap: bool = False,
     on_event: Callable[[str], None] | None = None,
+    voice_overrides: dict[int, dict[str, Any]] | None = None,
 ) -> ProductionReport:
-    """Generate the speech, then the accepted effect cues, as one operation."""
+    """Generate the speech, then the accepted effect cues, as one operation.
+
+    `voice_overrides` is passed to the runner: per-chunk voice settings for this
+    run only (see `runner.build_jobs`). They never change the price.
+    """
 
     def note(message: str) -> None:
         if on_event:
@@ -167,6 +173,7 @@ async def produce(
         override_cap=override_cap,
         extra_projected_micros=projection.effect_micros,
         on_event=on_event,
+        voice_overrides=voice_overrides,
     )
     report.speech = speech
 

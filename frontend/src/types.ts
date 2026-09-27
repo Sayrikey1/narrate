@@ -110,6 +110,8 @@ export interface ScriptSummary {
   title: string;
   chunks: number;
   chars: number;
+  /** The script's own model if it has one, else its project's. */
+  model_id: string | null;
 }
 
 export interface Take {
@@ -174,6 +176,10 @@ export interface RegenerateBody {
   move?: CutMove;
   max_spend_usd?: number;
   accept_unknown?: boolean;
+  /** Rebuild the episode afterwards, if the cut changed or the export is stale. */
+  export?: boolean;
+  /** The masters to rebuild — the formats chosen on the page. */
+  export_formats?: string[];
   confirm?: boolean;
 }
 

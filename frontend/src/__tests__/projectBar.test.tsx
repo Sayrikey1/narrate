@@ -83,3 +83,19 @@ describe("the project profile form", () => {
     );
   });
 });
+
+describe("changing a project's model", () => {
+  it("warns that generated scripts would be billed again", async () => {
+    await act(async () => root.render(bar(1)));
+    const open = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Voice & delivery"));
+    await act(async () => (open as HTMLButtonElement).click());
+    expect(host.textContent).not.toContain("billed again");
+
+    const select = host.querySelector("select") as HTMLSelectElement;
+    await act(async () => {
+      select.value = "eleven_v3";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(host.textContent).toContain("billed again");
+  });
+});

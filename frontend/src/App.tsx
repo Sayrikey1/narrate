@@ -39,7 +39,8 @@ function Shell() {
   }, [script, projects, projectId]);
 
   const project = projects.find((p) => p.id === projectId) ?? null;
-  const model = models.find((m) => m.model_id === project?.model_id);
+  // The script's own model where it has one — not always the project's.
+  const model = models.find((m) => m.model_id === (script?.model_id ?? project?.model_id));
 
   const state = useScript(scriptId);
   const { timeline, chunks, slots, cost, plan } = state;

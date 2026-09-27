@@ -47,7 +47,7 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
-from narrate import audio
+from narrate import audio, ledger
 from narrate import produce as produce_mod
 from narrate.db.models import Chunk, Cut, Project, Script, Take
 from narrate.db.session import session_scope
@@ -72,6 +72,18 @@ MOVE_NEVER = "never"
 
 # Verdicts that mean a take was actually checked.
 _CHECKED = frozenset({"clear", "review", "suspect"})
+
+# Verdicts worth another try. "review" counts: it is usually a real slip — a
+# swapped word — and the point of regenerating is a take with nothing to hear.
+_RETRY = frozenset({"suspect", "review"})
+
+# The steadiest delivery the v3 family offers. ElevenLabs documents its lowest
+# stability ("Creative") as "prone to hallucinations" and its highest
+# ("Robust") as "highly stable … consistent", at the cost of responding less
+# to audio tags. So when rolling the dice again has already failed, the next
+# try is made steadier rather than identical. 1.0 is the top of the documented
+# range; the numbers behind the three named settings are not published.
+STEADY_STABILITY = 1.0
 
 
 class RegenerateRefused(RuntimeError):
@@ -113,6 +125,9 @@ class ChunkResult:
     # Requests sent but never answered. Each may have been billed, and blocks
     # the next regeneration of the chunk until it is reconciled.
     unknown_takes: list[int] = field(default_factory=list)
+    # New takes made with the steadiest delivery, because plain tries had
+    # already come back flagged.
+    steady_takes: list[int] = field(default_factory=list)
     # Why the cut ended where it did, when that was not this module's choice.
     cut_note: str | None = None
 
@@ -138,13 +153,15 @@ def plan(
     *,
     chunks: list[int] | None = None,
     suspect_only: bool = False,
+    flagged_only: bool = False,
     texts: dict[int, str] | None = None,
     settings: Settings | None = None,
 ) -> list[ChunkPlan]:
     """Price and check each chunk to be regenerated. Spends nothing.
 
-    `chunks` of `None` means "every chunk" (or every flagged one, with
-    `suspect_only`); an empty list is refused rather than read as "all", because
+    `chunks` of `None` means "every chunk" — or every chunk whose take in the
+    cut is suspect (`suspect_only`), or suspect or to review (`flagged_only`).
+    An empty list is refused rather than read as "all", because
     an empty selection reaching this far is a caller's mistake, and the mistake
     would be expensive.
 
@@ -185,6 +202,8 @@ def plan(
             cut_take = session.get(Take, cut[chunk.id]) if chunk.id in cut else None
             status = cut_take.verify_status if cut_take else "none"
             if suspect_only and not chunks and status != "suspect":
+                continue
+            if flagged_only and not chunks and status not in _RETRY:
                 continue
             spec = _spec_for(chunk, script, project, registry)
             if texts and chunk.ordinal in texts:
@@ -423,7 +442,10 @@ async def regenerate(
     remaining = quoted if max_spend_micros is None else min(max_spend_micros, quoted)
     results: list[ChunkResult] = []
 
-    for chunk_plan in plans:
+    for index, chunk_plan in enumerate(plans):
+        # Retries on one chunk must not spend what the chunks after it need
+        # for their first try.
+        reserve = sum(p.price_micros for p in plans[index + 1 :] if p in runnable)
         result = ChunkResult(ordinal=chunk_plan.ordinal)
         results.append(result)
         if chunk_plan.blocker and not accept_unknown:
@@ -459,6 +481,7 @@ async def regenerate(
                 transcriber,
                 attempts,
                 remaining,
+                reserve,
                 on_event,
             )
         finally:
@@ -496,9 +519,15 @@ async def _attempt(
     transcriber: Transcriber | None,
     attempts: int,
     remaining: int,
+    reserve: int,
     on_event: Callable[[str], None] | None,
 ) -> None:
-    """Generate and check one chunk, trying again while the new take is suspect.
+    """Generate and check one chunk, trying again while the new take is flagged.
+
+    A plain retry first. If a plain try has already come back flagged — in this
+    run, or twice before it — the next is made with the steadiest delivery
+    (`STEADY_STABILITY`), on a model that honours stability: the same defect
+    returning is a sign the delivery, not luck, is producing it.
 
     Everything it learns goes on `result`, so the caller can still settle the
     words and the cut if this is interrupted part-way.
@@ -508,10 +537,32 @@ async def _attempt(
         if on_event:
             on_event(message)
 
+    can_steady, steady_now = _steadying(engine, chunk_plan.chunk_id, registry)
     for attempt in range(1, attempts + 1):
         if remaining < chunk_plan.price_micros:
             result.stopped = "the spending limit for this regeneration was reached"
             return
+        if attempt > 1:
+            # Measured against both budgets: this run's limit, and what the
+            # project's monthly cap still allows.
+            room = remaining
+            headroom = _cap_headroom(engine, script_id)
+            if headroom is not None:
+                room = min(room, headroom)
+            if room - reserve < chunk_plan.price_micros:
+                result.stopped = (
+                    "no further try: what is left is kept for the other chunks' first tries"
+                    if reserve
+                    else "the spending limit for this regeneration was reached"
+                )
+                return
+        steady = can_steady and (steady_now or attempt > 1)
+        if steady:
+            note(
+                f"chunk {chunk_plan.ordinal}: the problem keeps coming back — trying the "
+                f"steadiest delivery (stability {STEADY_STABILITY:.1f}: fewer invented words, "
+                "audio tags land more softly)"
+            )
         note(f"chunk {chunk_plan.ordinal}: generating (attempt {attempt} of {attempts})")
         report = await produce_mod.produce(
             engine,
@@ -527,6 +578,9 @@ async def _attempt(
             max_spend_micros=remaining,
             override_cap=False,
             on_event=on_event,
+            voice_overrides=(
+                {chunk_plan.ordinal: {"stability": STEADY_STABILITY}} if steady else None
+            ),
         )
         if report.blocked:
             result.stopped = (
@@ -550,13 +604,81 @@ async def _attempt(
         take_id = new[-1].take_id
         assert take_id is not None  # filtered above
         result.new_takes.append(take_id)
+        if steady:
+            result.steady_takes.append(take_id)
         # Off the event loop: transcription is seconds of CPU, and in the web
         # server it would otherwise freeze every other request meanwhile.
         status = await asyncio.to_thread(_check, engine, script_id, take_id, transcriber, registry)
         result.statuses.append(status)
         note(f"chunk {chunk_plan.ordinal}: new take checked — {status}")
-        if status != "suspect":
+        # Another try only for what another try can fix: words the transcript
+        # found wrong. A waveform-only verdict can never earn the cut, and a
+        # burst on its own may be the voice itself.
+        if status not in _RETRY or not _wrong_words(engine, take_id):
             break
+
+
+def _cap_headroom(engine: Engine, script_id: int) -> int | None:
+    """What the project's monthly cap still allows, or None with no cap."""
+    with session_scope(engine) as session:
+        script = session.get(Script, script_id)
+        if script is None:
+            return None
+        return ledger.project_budget(session, script.project_id).remaining_micros
+
+
+def _steadying(engine: Engine, chunk_id: int, registry: Registry) -> tuple[bool, bool]:
+    """Whether a steadier try is possible, and whether to start with one.
+
+    Possible when the chunk's model honours stability and the chunk is not
+    already at the steadiest. Started with when two or more earlier takes were
+    flagged by speech-to-text: plain retries have already been tried.
+    """
+    with session_scope(engine) as session:
+        chunk = session.get(Chunk, chunk_id)
+        if chunk is None:
+            return False, False
+        script = session.get(Script, chunk.script_id)
+        project = session.get(Project, script.project_id) if script else None
+        if script is None or project is None:
+            return False, False
+        try:
+            model_id, _, voice, _ = resolve_chunk_config(chunk, script, project)
+            spec = registry.get(model_id)
+        except (ValueError, UnknownModel):
+            return False, False
+        current = voice.get("stability")
+        possible = "stability" in spec.settings_honoured and (
+            current is None or float(current) < STEADY_STABILITY
+        )
+        # Only takes of these exact words count: after a rewording there is no
+        # history yet, and the first try must be plain — a take made with the
+        # chunk's own settings is what the next ordinary run looks for.
+        prefix = resolve_chunk_config(chunk, script, project)[3]
+        words = f"{prefix} {chunk.text}".strip() if prefix else chunk.text
+        flagged_before = sum(
+            1 for take in chunk.takes if take.submitted_text == words and _flagged_for_words(take)
+        )
+        return possible, possible and flagged_before >= 2
+
+
+def _flagged_for_words(take: Take) -> bool:
+    """A take speech-to-text heard with a word wrong — not only a waveform burst."""
+    return (
+        take.status == "succeeded"
+        and take.verify_status in _RETRY
+        and verify_service.heard_by_transcript(take.verifier)
+        and any(
+            f.severity in (FAIL, REVIEW) and f.kind != "burst"
+            for f in verify_service.findings_of(take)
+        )
+    )
+
+
+def _wrong_words(engine: Engine, take_id: int) -> bool:
+    with session_scope(engine) as session:
+        take = session.get(Take, take_id)
+        return take is not None and _flagged_for_words(take)
 
 
 def _check(
@@ -612,7 +734,11 @@ def _settle_cut(engine: Engine, chunk_id: int, result: ChunkResult, move_cut: st
             ]
 
         if move_cut != MOVE_NEVER and candidates:
-            best = min(candidates, key=lambda t: (_take_rank(t), -t.id))
+            # On a tie, the plain take: it follows the script's audio tags.
+            best = min(
+                candidates,
+                key=lambda t: (_take_rank(t), t.id in result.steady_takes, -t.id),
+            )
             if current is None:
                 chosen: Take = best
             elif move_cut == MOVE_NEW:

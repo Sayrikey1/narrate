@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 67 CLI commands, 46 HTTP endpoints, 8 pages, and 769 Python plus 93
+memory — 67 CLI commands, 46 HTTP endpoints, 8 pages, and 785 Python plus 97
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -375,7 +375,7 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 769 Python + 93 frontend. None touches the network |
+| Tests | 785 Python + 97 frontend. None touches the network |
 | Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `retention`, `verify`, `formats`, `media`, `cost *`, `db *`, `publish write/show/set/title/titles/accept/briefs/choose`, `write beats/beat/sync`, and every voice audition |
 | Dry run is the default | Every command that spends — `generate`, `regenerate`, `effects generate`, `effects suggest`, `publish draft`, `publish brief`, `write outline`, `write expand` — does nothing without `--go`, and says what it would have cost |
 
@@ -440,9 +440,10 @@ guide in **[VERIFY.md](VERIFY.md)**.
 | The waveform as a witness | A short loud burst walled in by digital silence is how a word gets garbled on eleven_v3. On its own it is only worth a listen; with the transcript it confirms the fail |
 | Verdicts | *suspect*, *review*, *no issues found* — never a tick, because a word clipped but still recognisable passes every check |
 | Where it shows | `narrate takes`, `timeline`, a **Takes to check** section in plan.md, publish.md's summary, an export warning, and on each take in the web UI with ▶ to play the exact spot |
-| `narrate regenerate` / **Regenerate…** | Price first, nothing sent without confirmation. Every earlier take is kept |
+| `narrate regenerate` / **Regenerate…** / **Fix all flagged…** | Price first, nothing sent without confirmation. Every earlier take is kept. `--flagged` takes every suspect or to-review chunk; `--export` rebuilds the episode afterwards |
 | The cut moves only when earned | By default, only to a take that checks **strictly better**. A take you simply did not like stays until you have listened to both |
-| Retry until clean | `--attempts` up to 3, each a separate billed request, stopping at the first clean take |
+| Retry until clean | Up to 3 tries per chunk by default while the new take is still flagged, each a separate billed request, stopping at the first clean take |
+| A steadier try when retrying fails | After a plain try comes back flagged, the next uses stability 1.0 — ElevenLabs documents low stability as "prone to hallucinations". That take only; the chunk's settings are untouched |
 | Change the words first | Allowed on the v3 family only — on stitched models it would re-bill the neighbouring chunks, and it is refused with the price, before confirming |
 | Refuses a double charge | A chunk with a request whose outcome is unknown, or past the monthly cap, is not regenerated |
 | `generate --verify` | Checks new takes as they are made |

@@ -740,3 +740,306 @@ async def test_a_regeneration_the_monthly_cap_blocks_says_so_in_words(
     assert not result.new_takes
     assert result.stopped and "monthly cap" in result.stopped
     assert "--monthly-cap" in result.stopped
+
+
+# --------------------------------------------------------------------------
+# Regenerating until the chunk is clean
+# --------------------------------------------------------------------------
+
+
+def _chunk_settings(engine: Engine) -> str | None:
+    with session_scope(engine) as session:
+        return require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK))).settings_json
+
+
+def _take_stability(engine: Engine, take_id: int) -> object:
+    import json
+
+    with session_scope(engine) as session:
+        take = require(session.get(Take, take_id))
+        return json.loads(take.settings_json or "{}").get("stability")
+
+
+async def test_a_flagged_try_is_followed_by_a_steadier_one_until_clean(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """The first retry is plain. When it comes back flagged too, the next is made
+    with the steadiest delivery — and it stops at the first clean take."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen", SECOND: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.statuses == ["suspect", "clear"]
+    first_try, second_try = result.new_takes
+    assert _take_stability(engine, first_try) != regen.STEADY_STABILITY
+    assert result.steady_takes == [second_try]
+    assert _take_stability(engine, second_try) == regen.STEADY_STABILITY
+    assert result.moved and result.cut_after == second_try
+
+
+async def test_the_steadier_setting_is_never_saved_on_the_chunk(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """It is how one take was made, not a new setting for the chunk: the next
+    ordinary run finds the chunk's own takes and sends nothing."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen", SECOND: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+    before = _chunk_settings(engine)
+
+    await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert _chunk_settings(engine) == before
+    ordinary = produce_mod.project(
+        engine, script_id, registry, with_effects=False, settings=settings
+    )
+    assert ordinary.chunks == 0
+
+
+async def test_a_chunk_flagged_twice_already_starts_with_the_steadier_try(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Two plain takes with problems is the evidence; a third plain one would be
+    the same dice again."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen", SECOND: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+    plain = await _regenerate(engine, script_id, settings, registry, hears, attempts=1)
+    assert plain.statuses == ["suspect"] and not plain.steady_takes
+
+    again = await _regenerate(engine, script_id, settings, registry, hears, attempts=1)
+
+    assert again.steady_takes == again.new_takes
+
+
+async def test_a_take_to_review_is_worth_another_try(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """A "review" is usually a real slip; the aim is a take with nothing to hear."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen"}, extras={SECOND: ("truly", 0.3)})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.statuses == ["review", "clear"]
+
+
+async def test_a_chunk_already_at_the_steadiest_is_retried_plainly(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    _, script_id = project_and_script
+    with session_scope(engine) as session:
+        chunk = require(session.scalar(select(Chunk).where(Chunk.ordinal == CHUNK)))
+        chunk.settings_json = '{"stability": 1.0}'
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen", SECOND: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert not result.steady_takes
+
+
+async def test_flagged_selects_suspect_and_review_alike(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    _, script_id = project_and_script
+    await _episode(engine, script_id, settings, registry, HearsTheScript(engine))
+    with session_scope(engine) as session:
+        for chunk in session.scalars(select(Chunk)).all():
+            for take in chunk.takes:
+                take.verify_status = {1: "suspect", 2: "review"}.get(chunk.ordinal, "clear")
+    assert [p.ordinal for p in regen.plan(engine, script_id, registry, flagged_only=True)] == [
+        1,
+        2,
+    ]
+    assert [p.ordinal for p in regen.plan(engine, script_id, registry, suspect_only=True)] == [1]
+
+
+# --------------------------------------------------------------------------
+# Found in review: retries only where a retry can help
+# --------------------------------------------------------------------------
+
+
+async def test_rewording_starts_plain_so_the_chunk_keeps_a_take_of_its_own(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Earlier flagged takes were of the old words. If the new words were only
+    ever made steadied, no take would match the chunk's own request, and the
+    next ordinary run would bill the line again."""
+    _, script_id = project_and_script
+    _on_v3(engine)
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen", SECOND: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+    await _regenerate(engine, script_id, settings, registry, hears, attempts=1)
+
+    result = await _regenerate(
+        engine, script_id, settings, registry, hears, attempts=1, texts={CHUNK: "It was them."}
+    )
+
+    assert result.new_takes and not result.steady_takes
+    ordinary = produce_mod.project(
+        engine, script_id, registry, with_effects=False, settings=settings
+    )
+    assert ordinary.chunks == 0
+
+
+async def test_without_speech_to_text_a_flagged_take_is_not_retried(
+    engine: Engine,
+    project_and_script: tuple[int, int],
+    settings: Settings,
+    registry: Registry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A waveform-only verdict can never earn the cut, so more paid tries would
+    buy nothing."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    def waveform_review(
+        engine: Engine, script_id: int, take_id: int, transcriber: object, registry: Registry
+    ) -> str:
+        with session_scope(engine) as session:
+            take = require(session.get(Take, take_id))
+            take.verify_status = "review"
+            take.verifier = service.stamp(None)
+        return "review"
+
+    monkeypatch.setattr(regen, "_check", waveform_review)
+    [result] = await regen.regenerate(
+        engine,
+        script_id,
+        [CHUNK],
+        MockProvider(),
+        MockSFXProvider(),
+        registry,
+        settings,
+        attempts=3,
+    )
+
+    assert result.statuses == ["review"]
+
+
+async def test_a_burst_alone_is_not_retried(
+    engine: Engine,
+    project_and_script: tuple[int, int],
+    settings: Settings,
+    registry: Registry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A burst with every word heard may be the voice itself — a clipped "So."
+    — and would return on every try."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(engine, drops={FIRST: "halvorsen"})
+    await _episode(engine, script_id, settings, registry, hears)
+
+    def burst_only(
+        engine: Engine, script_id: int, take_id: int, transcriber: object, registry: Registry
+    ) -> str:
+        with session_scope(engine) as session:
+            take = require(session.get(Take, take_id))
+            take.verify_status = "review"
+            take.verifier = hears.identity + "|rules:2"
+            take.verify_findings_json = (
+                '[{"severity": "review", "kind": "burst", "start_s": 1.0}, {"info_count": 0}]'
+            )
+        return "review"
+
+    monkeypatch.setattr(regen, "_check", burst_only)
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=3)
+
+    assert result.statuses == ["review"]
+
+
+async def test_one_chunks_retries_leave_the_next_chunk_its_first_try(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    _, script_id = project_and_script
+    hears = HearsTheScript(
+        engine,
+        drops={
+            "chunk-001-take-01.mp3": "the",
+            "chunk-001-take-02.mp3": "the",
+            FIRST: "halvorsen",
+        },
+    )
+    await _episode(engine, script_id, settings, registry, hears)
+    plans = regen.plan(engine, script_id, registry, chunks=[1, CHUNK])
+    one_each = sum(p.price_micros for p in plans)
+
+    first, second = await regen.regenerate(
+        engine,
+        script_id,
+        [1, CHUNK],
+        MockProvider(),
+        MockSFXProvider(),
+        registry,
+        settings,
+        transcriber=hears,
+        attempts=3,
+        max_spend_micros=one_each,
+    )
+
+    assert len(first.new_takes) == 1 and first.stopped
+    assert len(second.new_takes) == 1
+
+
+async def test_on_a_tie_the_cut_takes_the_plain_try(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """It follows the script's audio tags; the steadied one plays them down."""
+    _, script_id = project_and_script
+    hears = HearsTheScript(
+        engine,
+        drops={FIRST: "halvorsen"},
+        extras={SECOND: ("truly", 0.3), THIRD: ("truly", 0.3)},
+    )
+    await _episode(engine, script_id, settings, registry, hears)
+
+    result = await _regenerate(engine, script_id, settings, registry, hears, attempts=2)
+
+    plain, steadied = result.new_takes
+    assert result.statuses == ["review", "review"]
+    assert result.steady_takes == [steadied]
+    assert result.cut_after == plain
+
+
+async def test_under_the_monthly_cap_the_next_chunk_still_gets_its_first_try(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    from narrate import ledger
+
+    _, script_id = project_and_script
+    hears = HearsTheScript(
+        engine,
+        drops={
+            "chunk-001-take-01.mp3": "the",
+            "chunk-001-take-02.mp3": "the",
+            FIRST: "halvorsen",
+        },
+    )
+    await _episode(engine, script_id, settings, registry, hears)
+    plans = regen.plan(engine, script_id, registry, chunks=[1, CHUNK])
+    with session_scope(engine) as session:
+        project = require(session.scalar(select(Project)))
+        spent = ledger.project_budget(session, project.id).spent_micros
+        # Room for one try of each chunk, and not a retry more.
+        project.monthly_cap_micros = spent + sum(p.price_micros for p in plans) + 1
+
+    first, second = await regen.regenerate(
+        engine,
+        script_id,
+        [1, CHUNK],
+        MockProvider(),
+        MockSFXProvider(),
+        registry,
+        settings,
+        transcriber=hears,
+        attempts=3,
+    )
+
+    assert len(first.new_takes) == 1 and first.stopped
+    assert len(second.new_takes) == 1

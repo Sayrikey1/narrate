@@ -140,7 +140,7 @@ export function ChunkList({
                 <td colSpan={4}>
                   <RegeneratePanel
                     scriptId={scriptId}
-                    chunk={chunk}
+                    chunks={[chunk]}
                     busy={busy}
                     onRun={onRegenerate}
                     onClose={() => close(chunk.ordinal)}

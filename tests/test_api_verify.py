@@ -307,3 +307,62 @@ def test_the_cost_report_survives_a_chunk_on_an_unknown_model(
         assert chunk is not None
         chunk.model_id = "eleven_gone"
     assert client.get(f"/api/scripts/{script_id}/cost").status_code == 200
+
+
+def test_fixing_rebuilds_the_episode_when_the_cut_changed(
+    client: TestClient, script_id: int, engine: Engine, hears: HearsTheScript
+) -> None:
+    """The point is audio with the fix in it, not one more take on disk."""
+    hears.drops[_take_file(engine, 2)] = "radio"
+    client.post(f"/api/scripts/{script_id}/verify", json={})
+    _drain(client, f"verify-{script_id}")
+
+    started = client.post(
+        f"/api/scripts/{script_id}/regenerate",
+        json={"chunks": [2], "confirm": True, "export": True},
+    ).json()
+    result = _drain(client, started["run_key"])
+
+    assert result["regenerated"][0]["moved"] is True
+    assert result["exported"]["chunks"] == 3
+
+
+def test_a_regeneration_is_quoted_for_three_tries_unless_told_otherwise(
+    client: TestClient, script_id: int
+) -> None:
+    one = client.post(
+        f"/api/scripts/{script_id}/regenerate", json={"chunks": [2], "attempts": 1}
+    ).json()
+    default = client.post(f"/api/scripts/{script_id}/regenerate", json={"chunks": [2]}).json()
+    assert default["attempts"] == 3
+    assert default["worst_micros"] == one["worst_micros"] * 3
+
+
+def test_a_script_listing_names_the_scripts_own_model(
+    client: TestClient, script_id: int, engine: Engine
+) -> None:
+    from narrate.db.models import Script
+
+    listed = {s["id"]: s for s in client.get("/api/scripts").json()}
+    assert listed[script_id]["model_id"] == "eleven_multilingual_v2"
+    with session_scope(engine) as session:
+        script = session.get(Script, script_id)
+        assert script is not None
+        script.model_id = "eleven_v3"
+    listed = {s["id"]: s for s in client.get("/api/scripts").json()}
+    assert listed[script_id]["model_id"] == "eleven_v3"
+
+
+def test_rebuilding_catches_up_an_export_an_earlier_run_left_stale(
+    client: TestClient, script_id: int
+) -> None:
+    """The cut moved in an earlier regeneration; this one moves nothing. The
+    audio people download must still be the current cut."""
+    started = client.post(
+        f"/api/scripts/{script_id}/regenerate",
+        json={"chunks": [2], "confirm": True, "export": True, "move": "never"},
+    ).json()
+    result = _drain(client, started["run_key"])
+
+    assert result["regenerated"][0]["moved"] is False
+    assert result["exported"]["chunks"] == 3

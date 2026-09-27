@@ -14,13 +14,14 @@ This page is how narrate finds those takes for you, and how you fix them.
 ```bash
 uv sync --extra verify                 # once — the optional speech-to-text
 narrate verify --download-model        # once — about 480 MB, free
-narrate verify 5                       # check the episode. Free, local, nothing sent
-narrate regenerate 5 --suspect         # price the fix. Sends nothing
-narrate regenerate 5 --suspect --go    # regenerate the flagged chunks
+narrate verify 5                                # check the episode. Free, local, nothing sent
+narrate regenerate 5 --flagged --export         # price the fix. Sends nothing
+narrate regenerate 5 --flagged --export --go    # fix every flagged chunk, rebuild the episode
 ```
 
-In the web UI: **Check takes** on the Script page, then **Regenerate…** on any
-chunk. The price is always shown before anything is sent.
+In the web UI: **Check takes** on the Script page, then **Fix all flagged…** —
+or **Regenerate…** on any one chunk. The price is always shown before anything
+is sent.
 
 ---
 
@@ -85,8 +86,8 @@ billed. A 21-minute episode takes about two minutes on an Apple M5 Pro.
 `narrate verify` reports the state of the whole episode every time, but only
 **re-checks** takes it has not seen with the current settings — so running it
 again after a regeneration costs only the new take's time. `--recheck` listens
-to everything again. It exits `3` when anything is suspect, so it can gate a
-script.
+to everything again. It exits `3` when a take in the cut is suspect, so it can
+gate a script.
 
 ### Why you can trust a "suspect"
 
@@ -130,10 +131,15 @@ That is why a clean take is shown as *no issues found* and never as a tick.
 ## 3️⃣ `narrate regenerate` — fixing them
 
 ```bash
-narrate regenerate 5 --chunk 5,8           # dry run: the price, nothing sent
-narrate regenerate 5 --chunk 5,8 --go      # regenerate, after confirming
-narrate regenerate 5 --suspect --go        # every flagged chunk
+narrate regenerate 5 --chunk 5,8                     # dry run: the price, nothing sent
+narrate regenerate 5 --chunk 5,8 --go                # regenerate, after confirming
+narrate regenerate 5 --flagged --export --go         # every flagged chunk, then the episode
 ```
+
+`--flagged` takes every chunk whose take in the cut is *suspect* or *to review*
+(`--suspect` takes the suspect ones only). `--export` rebuilds the episode at
+the end if the cut changed, so the audio you download is the fixed one; the web
+UI's **Rebuild the episode afterwards** does the same.
 
 ```text
 ┏━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━━┓
@@ -143,7 +149,8 @@ narrate regenerate 5 --suspect --go        # every flagged chunk
 │ 8     │ take 1     │ suspect │ 1,458 │ $0.0729       │
 └───────┴────────────┴─────────┴───────┴───────────────┘
 ╭──────────────── Regenerate (nothing sent) ─────────────────╮
-│ Would regenerate 2 chunk(s): up to $0.1829 at list price.  │
+│ Would regenerate 2 chunk(s): up to $0.5487 at list price   │
+│ (3 tries each at most).                                    │
 │ Every existing take is kept; each new take is checked.     │
 ╰────────────────────────────────────────────────────────────╯
 ```
@@ -169,15 +176,38 @@ the choice is yours. And if you regenerated a take you
 simply did not *like*, both takes check clean — the check cannot tell which
 delivery is better, so the choice stays with you.
 
-### Trying again
+### Until it is clean
 
-```bash
-narrate regenerate 5 --chunk 5 --attempts 2 --go
-```
+A regeneration keeps going while the new take is still flagged — *suspect* or
+*to review* — up to three tries per chunk, and stops at the first clean one.
+**Each try is a separate, billed request**; the price shown is for all of
+them, and `--attempts 1` or `--max-spend` bounds it lower.
 
-If the new take is still flagged, it tries again, up to three times at most.
-**Each try is a separate, billed request**, and it stops at the first clean
-take. `--max-spend` bounds the lot.
+The tries are not all the same. The first is a plain retry, since most defects
+are bad luck. Once a plain try has come back flagged — in this run, or twice
+before it — the next is made with the **steadiest delivery** (stability 1.0).
+ElevenLabs documents v3's most expressive setting as *"prone to
+hallucinations"* and its steadiest as *"highly stable … consistent"*, at the
+cost that it *"reduces responsiveness to directional prompts"*: invented words
+become less likely, and tags like `[urgent]` land more softly. It applies to
+that take only; the chunk's own settings are not changed.
+
+When a chunk is **still** flagged after its tries, the same problem returning
+is a sign the text itself provokes it. The report says so, and the fix is then
+one of yours: reword the line (below), or cut the moment in the edit — the
+finding gives its time.
+
+On the real episode, both stubborn defects sat at a **paragraph break right
+after a punchline**, under `[fast-paced][urgent]` — the model filled the pause
+with a reaction of its own:
+
+| Chunk | The break | What came back | What fixed it |
+|---|---|---|---|
+| 5 | *"…more seductive than it's ever been."* ¶ *"The modern S…"* | *"God,"* in two plain takes and one steady | the second steady take |
+| 3 | *"…selling you a course."* ¶ *"The problem isn't the job."* | *"Our"* for *"The"*, then *"work"*, *"great"*, *"great"* | joining the two paragraphs — the same words, one fewer break — clean on the first try |
+
+Joining paragraphs changes no word, so it is the first reword to try:
+`--text` with the chunk's own words and that one blank line removed.
 
 ### Changing the words first
 
