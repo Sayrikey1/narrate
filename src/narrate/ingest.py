@@ -9,6 +9,7 @@ in three copies is one that eventually holds in two.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,8 +17,8 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from narrate.chunking import MARKER_RE, chunk_script, sentence_starts
 from narrate.chunking import Chunk as ChunkObj
-from narrate.chunking import chunk_script
 from narrate.db.models import Chunk, Script, Take
 from narrate.effects import sync_slots_from_script
 from narrate.lint import lint_chunks
@@ -131,48 +132,11 @@ def ingest_script(
             session.delete(row)
         session.flush()
 
-    parsed = parse_script(script.source_text, cast)
-    result = IngestResult(warnings=list(parsed.warnings), parsed=parsed)
+    chunk_plan = plan_chunks(script.source_text, spec, prefix_tags, cast, dialogue)
+    parsed, planned = chunk_plan.parsed, chunk_plan.planned
+    result = IngestResult(warnings=list(chunk_plan.warnings), parsed=parsed)
     result.speakers = parsed.speakers
-
-    as_dialogue = dialogue and bool(parsed.turns)
-    if dialogue and not spec.dialogue:
-        result.warnings.append(
-            f"{spec.label} cannot generate dialogue — only models with a dialogue "
-            "endpoint can. Falling back to one chunk per speaker turn, which works "
-            "on every model."
-        )
-        as_dialogue = False
-    result.dialogue = as_dialogue
-
-    def oversize(size: int, ceiling: int) -> None:
-        result.warnings.append(
-            f"a marked segment of {size:,} chars exceeds the {ceiling:,} ceiling and was subdivided"
-        )
-
-    if as_dialogue:
-        planned = _dialogue_chunks(parsed, spec, prefix_tags, oversize)
-    else:
-        # Turn offsets reach the chunker as forced boundaries, which is what
-        # gives each turn a chunk of its own — a chunk is one request with one
-        # voice, so a turn sharing a chunk with the previous speaker could not
-        # be cast at all.
-        planned = [
-            _Planned(
-                chunk=c,
-                voice_id=parsed.voice_at(c.start_offset)
-                if parsed.turns and c.start_offset is not None
-                else None,
-            )
-            for c in chunk_script(
-                parsed.text,
-                spec,
-                prefix_tags,
-                on_oversize=oversize,
-                boundaries=parsed.boundaries,
-            )
-        ]
-
+    result.dialogue = chunk_plan.dialogue
     result.chunks = [p.chunk for p in planned]
 
     offsets: dict[int, int] = {}
@@ -214,6 +178,145 @@ def ingest_script(
 
 
 @dataclass
+class ChunkPlan:
+    """A script's chunks as they would be written, before anything is."""
+
+    parsed: ParsedScript
+    planned: list[_Planned]
+    dialogue: bool
+    warnings: list[str]
+
+
+def plan_chunks(
+    source_text: str,
+    spec: ModelSpec,
+    prefix_tags: str = "",
+    cast: dict[str, str] | None = None,
+    dialogue: bool = False,
+    keep: list[str] | None = None,
+) -> ChunkPlan:
+    """Parse and chunk a script without writing anything.
+
+    The half of ingest a replacement needs on its own: the new chunks have to be
+    known before any old one is touched, so the ones that did not change can
+    keep their takes.
+
+    `keep` is the old chunks' text. Where one still appears in the new script,
+    its edges become cuts, so the chunker cannot re-pack it with its
+    neighbours: without that, cutting one paragraph from an unmarked script
+    shifts every later chunk's contents, and every one of them is paid for
+    again. A script with `[CHUNK n]` markers needs none of this — the writer's
+    cuts do not move when a neighbour is edited — and gets none, so a kept edge
+    can never override one.
+    """
+    parsed = parse_script(source_text, cast)
+    warnings = list(parsed.warnings)
+    edges: set[int] = set()
+    if keep and not MARKER_RE.search(parsed.text):
+        for span in locate_chunks(keep, parsed.text):
+            if span is not None:
+                edges.update(span)
+
+    as_dialogue = dialogue and bool(parsed.turns)
+    if dialogue and not spec.dialogue:
+        warnings.append(
+            f"{spec.label} cannot generate dialogue — only models with a dialogue "
+            "endpoint can. Falling back to one chunk per speaker turn, which works "
+            "on every model."
+        )
+        as_dialogue = False
+
+    def oversize(size: int, ceiling: int) -> None:
+        warnings.append(
+            f"a marked segment of {size:,} chars exceeds the {ceiling:,} ceiling and was subdivided"
+        )
+
+    if as_dialogue:
+        planned = _dialogue_chunks(parsed, spec, prefix_tags, oversize, starts=edges)
+    else:
+        # Turn offsets reach the chunker as cuts, which is what gives each turn
+        # a chunk of its own — a chunk is one request with one voice, so a turn
+        # sharing a chunk with the previous speaker could not be cast at all.
+        # Exact cuts, not snapped ones: a turn begins where its words do, and
+        # the nearest sentence start can lie back inside the previous line —
+        # one ending "—" or "…", or followed by a `[CHUNK]` marker — which gave
+        # the next speaker's words to the previous speaker's voice.
+        #
+        # A chunk after the first of a subdivided part has no offset of its
+        # own, but it is the same turn continuing, so it keeps the voice its
+        # part began with — not the narrator's, which is what None would mean.
+        turns = {t.offset for t in parsed.turns}
+        planned = []
+        voice: str | None = None
+        for c in chunk_script(
+            parsed.text,
+            spec,
+            prefix_tags,
+            on_oversize=oversize,
+            boundaries=[o for o in parsed.boundaries if o not in turns],
+            exact=sorted(edges | turns),
+        ):
+            if parsed.turns and c.start_offset is not None:
+                voice = parsed.voice_at(c.start_offset)
+            planned.append(_Planned(chunk=c, voice_id=voice))
+    return ChunkPlan(parsed=parsed, planned=planned, dialogue=as_dialogue, warnings=warnings)
+
+
+def locate_chunks(texts: list[str], text: str) -> list[tuple[int, int] | None]:
+    """Where each chunk sits in a script's text, as (start, start of what follows).
+
+    By its words, whitespace aside: the chunker tidies the spacing it stores,
+    and regeneration can join a paragraph break, so a chunk is not always a
+    byte-exact slice of its script. In order, each search starting where the
+    last match ended, so two chunks with the same words find their own places;
+    a chunk found only earlier than that — a paragraph moved up — is taken
+    there, provided nothing else already claimed the spot.
+
+    A match counts only where a chunk could have begun and ended: at a line
+    break or a sentence start on both sides. The same words inside a longer
+    paragraph are not that chunk, and cutting there would split a paragraph
+    the writer did not break. None for a chunk not found.
+    """
+    starts = set(sentence_starts(text))
+
+    def edge(start: int, end: int) -> tuple[int, int] | None:
+        before = text[:start].rstrip(" \t")
+        if not (before == "" or before.endswith("\n") or start in starts):
+            return None
+        after = end + (len(text[end:]) - len(text[end:].lstrip()))
+        if not (after == len(text) or "\n" in text[end:after] or after in starts):
+            return None
+        return start, after
+
+    claimed: list[tuple[int, int]] = []
+
+    def find(pattern: re.Pattern[str], position: int) -> tuple[int, int] | None:
+        for found in pattern.finditer(text, position):
+            span = edge(found.start(), found.end())
+            if span and not any(a < span[1] and span[0] < b for a, b in claimed):
+                return span
+        return None
+
+    out: list[tuple[int, int] | None] = []
+    position = 0
+    for chunk in texts:
+        words = chunk.split()
+        if not words:
+            out.append(None)
+            continue
+        pattern = re.compile(r"\s+".join(map(re.escape, words)))
+        span = find(pattern, position)
+        if span is not None:
+            position = span[1]
+        else:
+            span = find(pattern, 0)
+        if span is not None:
+            claimed.append(span)
+        out.append(span)
+    return out
+
+
+@dataclass
 class _Planned:
     """A chunk about to be written, with what it is going to be generated as."""
 
@@ -228,6 +331,7 @@ def _dialogue_chunks(
     spec: ModelSpec,
     prefix_tags: str,
     on_oversize: Callable[[int, int], None],
+    starts: set[int] | None = None,
 ) -> list[_Planned]:
     """Chunks for a dialogue run: one per group of turns that fits one request.
 
@@ -240,9 +344,11 @@ def _dialogue_chunks(
     3,506-character chunk aimed at a 2,000-character endpoint.
 
     The groups already fit by construction, so there is nothing left for
-    sentence packing to decide.
+    sentence packing to decide. `starts` are turns that must open a group — a
+    kept chunk's first turn, and the turn after its last — so cutting one line
+    does not regroup, and re-bill, every line after it.
     """
-    groups = _pack_dialogue(parsed, spec.dialogue_max_chars)
+    groups = _pack_dialogue(parsed, spec.dialogue_max_chars, starts or set())
     planned: list[_Planned] = []
     ordinal = 1
 
@@ -301,7 +407,9 @@ def _dialogue_chunks(
     return planned
 
 
-def _pack_dialogue(parsed: ParsedScript, ceiling: int) -> list[tuple[int, list[SpeakerTurn]]]:
+def _pack_dialogue(
+    parsed: ParsedScript, ceiling: int, starts: set[int] | None = None
+) -> list[tuple[int, list[SpeakerTurn]]]:
     """Group consecutive turns into requests that fit the dialogue ceiling.
 
     The endpoint takes at most 2,000 characters across all of its inputs, which
@@ -317,7 +425,7 @@ def _pack_dialogue(parsed: ParsedScript, ceiling: int) -> list[tuple[int, list[S
     for turn, length in _turn_spans(parsed):
         # A single turn longer than the ceiling still gets its own group; the
         # caller degrades it to ordinary speech rather than truncating it.
-        if current and size + length > ceiling:
+        if current and (size + length > ceiling or turn.offset in (starts or ())):
             groups.append((start, current))
             current, size = [], 0
         if not current:

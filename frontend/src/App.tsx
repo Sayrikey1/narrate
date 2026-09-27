@@ -33,9 +33,12 @@ function Shell() {
 
   // Opening a script implies its project, so the sidebar and the media page
   // follow along without the selection having to be made twice.
+  // A selection that no longer exists — a project just deleted — falls back to
+  // the first one, or "Add a script" would post to the deleted project while
+  // the picker showed another.
   useEffect(() => {
     if (script) setProjectId(script.project_id);
-    else if (projectId === null && projects.length) setProjectId(projects[0].id);
+    else if (!projects.some((p) => p.id === projectId)) setProjectId(projects[0]?.id ?? null);
   }, [script, projects, projectId]);
 
   const project = projects.find((p) => p.id === projectId) ?? null;
@@ -47,8 +50,10 @@ function Shell() {
 
   // Feed the transport whatever the current script's timeline holds, so
   // pressing play plays the episode rather than one clip.
+  // Only an episode that still exists: a deleted one's clips may be gone from
+  // disk, and it should not keep playing from the transport bar either way.
   useEffect(() => {
-    if (!timeline) {
+    if (!timeline || !scripts.some((s) => s.id === timeline.script_id)) {
       transport.load([]);
       return;
     }
@@ -63,7 +68,7 @@ function Shell() {
           lane: e.kind === "narration" ? ("narration" as const) : ("effect" as const),
         })),
     );
-  }, [timeline]);
+  }, [timeline, scripts]);
 
   const nav = useMemo(
     () => [
@@ -183,7 +188,7 @@ function Shell() {
           )}
 
           {route.pattern === "/costs" && (
-            <CostsPage projects={projects} scripts={scripts} />
+            <CostsPage projects={projects} scripts={scripts} onChanged={() => void refresh()} />
           )}
 
           {route.pattern === null && (

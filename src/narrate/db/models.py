@@ -54,6 +54,9 @@ class Project(Base):
 
     monthly_cap_micros: Mapped[int | None] = mapped_column(Integer, default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # Set when the project is deleted. The row stays — see the archive
+    # migration for why — hidden from lists and refused any new spend.
+    archived_at: Mapped[datetime | None] = mapped_column(default=None)
 
     scripts: Mapped[list[Script]] = relationship(back_populates="project")
 
@@ -88,6 +91,9 @@ class Script(Base):
     target_seconds: Mapped[float | None] = mapped_column(default=None)
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # Set when the episode is deleted. The row, its takes and its cut stay, so
+    # its spend keeps its name and its id is never handed to another episode.
+    archived_at: Mapped[datetime | None] = mapped_column(default=None)
 
     project: Mapped[Project] = relationship(back_populates="scripts")
     chunks: Mapped[list[Chunk]] = relationship(

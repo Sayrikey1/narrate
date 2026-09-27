@@ -471,3 +471,70 @@ export interface Retention {
   great_hold_s: number;
   extrapolated: boolean;
 }
+
+/** What deleting an episode or a project would do — or, once `done`, did. */
+export interface DeletePlan {
+  kind: "episode" | "project";
+  id: number;
+  name: string;
+  episodes: number[];
+  takes: number;
+  /** What it cost — stays on the record and in every total. */
+  spend_micros: number;
+  spend_usd: string;
+  /** Audio and exports that "delete the files too" would remove. */
+  files: number;
+  file_bytes: number;
+  running: number[];
+  done: boolean;
+  files_deleted: number;
+}
+
+export interface DeleteBody {
+  confirm?: boolean;
+  delete_files?: boolean;
+  force?: boolean;
+}
+
+/** What replacing an episode's script would do: priced before anything changes. */
+export interface ReplacePlan {
+  script_id: number;
+  title: string;
+  unchanged: boolean;
+  kept: number;
+  kept_takes: number;
+  kept_regenerated: number;
+  new: number;
+  retired: number;
+  retired_takes: number;
+  retired_to: number | null;
+  beats_detached: number;
+  /** Hand-placed or suggested effect slots whose passage the new script drops. */
+  slots_dropped: number;
+  chunks_to_generate: number;
+  chars: number;
+  effects_to_generate: number;
+  quote_micros: number;
+  quote_usd: string;
+  warnings: string[];
+  done: boolean;
+}
+
+export interface Deleted {
+  projects: {
+    id: number;
+    name: string;
+    spend_micros: number;
+    wasted_micros: number;
+    deleted_at: string | null;
+  }[];
+  scripts: {
+    id: number;
+    title: string;
+    project_id: number;
+    spend_micros: number;
+    deleted_at: string | null;
+    /** Deleted along with its project — restored with it, not alone. */
+    with_project: boolean;
+  }[];
+}

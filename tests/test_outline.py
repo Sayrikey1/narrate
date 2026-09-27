@@ -17,6 +17,7 @@ shipped templates, and it caught a real bug there on its first run.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -262,3 +263,42 @@ async def test_the_word_target_follows_the_measured_pace(settings: Settings) -> 
 
     assert "120 words" in sent[0]
     assert "240 words" in sent[1]
+
+
+def test_an_outline_for_a_deleted_project_is_refused_before_groq_is_called(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused after the call, the tokens were spent and — the command dying
+    before the ledger write — recorded nowhere."""
+    from typer.testing import CliRunner
+
+    from narrate import cli
+    from narrate.settings import get_settings
+
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("NARRATE_DB_PATH", str(db))
+    monkeypatch.setenv("NARRATE_DATABASE_URL", f"sqlite:///{db}")
+    monkeypatch.setenv("NARRATE_ASSETS_DIR", str(tmp_path / "assets"))
+    monkeypatch.setenv("NARRATE_PROVIDER", "mock")
+    monkeypatch.setenv("GROQ_API_KEY", "not-a-real-key")
+    calls: list[str] = []
+
+    async def spy(brief: str, *args: Any, **kwargs: Any) -> Any:
+        calls.append(brief)
+        raise AssertionError("Groq must not be called for a deleted project")
+
+    monkeypatch.setattr(outline, "propose_outline", spy)
+    get_settings.cache_clear()
+    try:
+        runner = CliRunner()
+        runner.invoke(cli.app, ["project", "new", "Show", "--voice", "v1"])
+        runner.invoke(cli.app, ["project", "delete", "Show", "--yes"])
+        result = runner.invoke(
+            cli.app,
+            ["write", "outline", "-p", "1", "--title", "Ep", "--brief", "A lighthouse.", "--go"],
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert result.exit_code == 1 and "deleted" in result.output
+    assert calls == []

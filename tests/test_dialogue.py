@@ -87,6 +87,58 @@ def test_each_turn_becomes_its_own_chunk_with_its_own_voice(
     assert not any(c.text.startswith(("Morag:", "Keeper:")) for c in rows)
 
 
+def test_a_turn_after_a_chunk_marker_keeps_its_own_voice(
+    engine: Engine, registry: Registry
+) -> None:
+    """A turn's cut is exact. Snapped to the nearest sentence start it landed
+    on the marker line, still inside Morag's turn, and Keeper's words went to
+    her voice."""
+    text = SCRIPT.replace("\n\nKeeper: I hoped", "\n\n## [CHUNK]\n\nKeeper: I hoped")
+    _setup(engine, registry, model="eleven_multilingual_v2", text=text)
+    with session_scope(engine) as session:
+        rows = list(session.scalars(select(Chunk).order_by(Chunk.ordinal)).all())
+
+    assert [c.voice_id for c in rows] == [
+        "voice_morag",
+        "voice_keeper",
+        "voice_morag",
+        "voice_keeper",
+    ]
+
+
+def test_a_turn_ending_in_a_dash_does_not_take_the_next_speakers_words(
+    engine: Engine, registry: Registry
+) -> None:
+    text = SCRIPT.replace("nobody said it aloud.", "nobody said it —")
+    _setup(engine, registry, model="eleven_multilingual_v2", text=text)
+    with session_scope(engine) as session:
+        rows = list(session.scalars(select(Chunk).order_by(Chunk.ordinal)).all())
+
+    assert rows[0].text.endswith("nobody said it —")
+    assert rows[1].text.startswith("I hoped not.") and rows[1].voice_id == "voice_keeper"
+
+
+def test_every_piece_of_a_long_turn_is_in_its_speakers_voice(
+    engine: Engine, registry: Registry
+) -> None:
+    """Only the first piece of a subdivided turn has an offset; the rest used
+    to fall back to the narrator."""
+    long_turn = "\n\n".join(
+        f"Paragraph {i} of a long speech. " + "The light turned and turned, all night. " * 20
+        for i in range(12)
+    )
+    text = (
+        f"[CAST] Morag = voice_morag · Keeper = voice_keeper\n\nMorag: {long_turn}\n\nKeeper: Yes."
+    )
+    _setup(engine, registry, model="eleven_multilingual_v2", text=text)
+    with session_scope(engine) as session:
+        rows = list(session.scalars(select(Chunk).order_by(Chunk.ordinal)).all())
+
+    assert len(rows) >= 3
+    assert {c.voice_id for c in rows[:-1]} == {"voice_morag"}
+    assert rows[-1].voice_id == "voice_keeper"
+
+
 def test_a_chunk_voice_beats_the_script_and_the_project(engine: Engine, registry: Registry) -> None:
     """The reason this mode needed no new generation code: `chunk.voice_id` was
     already the highest-priority term in `resolve_chunk_config`."""

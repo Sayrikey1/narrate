@@ -36,6 +36,7 @@ from typing import Any
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
+from narrate.archive import ensure_live
 from narrate.audio import FFmpegFailed, FFmpegMissing, duration_seconds
 from narrate.db.models import Chunk, Cut, Project, Run, Script, Take, utcnow
 from narrate.db.session import session_scope
@@ -363,6 +364,23 @@ def _asset_path(
     )
 
 
+def _free_path(path: Path) -> Path:
+    """`path`, or the first free variant of it — never a file that exists.
+
+    A take's name is its chunk's position and its number, and positions move:
+    an episode replaced by a new upload renumbers its chunks, and a chunk moved
+    aside keeps its files. Writing over an existing name would replace paid
+    audio another take still points at.
+    """
+    if not path.exists():
+        return path
+    for n in range(2, 1000):
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No free name for {path}")
+
+
 async def generate(
     engine: Engine,
     script_id: int,
@@ -400,6 +418,8 @@ async def generate(
         project = session.get(Project, script.project_id)
         if project is None:
             raise ValueError(f"Script {script_id} has no project.")
+        if not dry_run:
+            ensure_live(session, script)
         jobs = build_jobs(session, script, project, registry, settings, only, voice_overrides)
 
         # Resume: anything already generated with an identical request is done.
@@ -507,7 +527,9 @@ async def generate(
                     billed = job.request.char_count
                     source = "estimated"
 
-                path = _asset_path(settings, project_name, script_id, job.ordinal, take_no)
+                path = _free_path(
+                    _asset_path(settings, project_name, script_id, job.ordinal, take_no)
+                )
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(result.audio)
 

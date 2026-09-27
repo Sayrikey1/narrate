@@ -1,9 +1,10 @@
-import { useState } from "react";
-import { usd } from "../api";
+import { useRef, useState } from "react";
+import { api, usd } from "../api";
 import { Card } from "../ui/layout";
 import { Badge } from "../ui/feedback";
 import { DataTable, type Column } from "../ui/Table";
 import { PlusIcon } from "./Icon";
+import { DeletePanel } from "./DeletePanel";
 import { ProjectForm } from "./ProjectForm";
 import type { Model, Project } from "../types";
 
@@ -32,7 +33,10 @@ export function ProjectBar({
 }) {
   // `#new-project` opens the form directly, which is also what makes the voice
   // picker reachable without a click for a screenshot or a bookmark.
-  const [open, setOpen] = useState<"none" | "new" | "profile">(() =>
+  // Where focus goes back to when the delete panel is cancelled, rather than
+  // dropping to the page and making a keyboard user find their place again.
+  const deleteTrigger = useRef<HTMLButtonElement | null>(null);
+  const [open, setOpen] = useState<"none" | "new" | "profile" | "delete">(() =>
     window.location.hash === "#new-project" ? "new" : "none",
   );
 
@@ -131,12 +135,39 @@ export function ProjectBar({
               {open === "profile" ? "Done" : `Voice & delivery — ${current.name}`}
             </button>
           )}
+          {current && (
+            <button
+              ref={deleteTrigger}
+              className="ghost danger"
+              onClick={() => setOpen((v) => (v === "delete" ? "none" : "delete"))}
+              aria-expanded={open === "delete"}
+            >
+              {open === "delete" ? "Cancel" : `Delete project — ${current.name}…`}
+            </button>
+          )}
         </div>
       )}
 
       {open === "new" && (
         <ProjectForm
           models={models}
+          onDone={() => {
+            setOpen("none");
+            onChanged();
+          }}
+        />
+      )}
+
+      {open === "delete" && current && (
+        <DeletePanel
+          // Keyed by project, so a preview is never for the one selected before.
+          key={current.id}
+          what="project"
+          run={(body) => api.deleteProject(current.id, body)}
+          onClose={() => {
+            setOpen("none");
+            deleteTrigger.current?.focus();
+          }}
           onDone={() => {
             setOpen("none");
             onChanged();

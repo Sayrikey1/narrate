@@ -4,7 +4,7 @@ import { Link, scriptPath } from "../router";
 import { Badge, Loadable, Notice, Stat } from "../ui/feedback";
 import { Card, PageHeader, Split } from "../ui/layout";
 import { DataTable, type Column } from "../ui/Table";
-import type { Cost, KindTotal, Project, ScriptSummary } from "../types";
+import type { Cost, Deleted, KindTotal, Project, ScriptSummary } from "../types";
 
 const KIND_LABEL: Record<string, string> = {
   generation: "narration",
@@ -24,10 +24,36 @@ const KIND_LABEL: Record<string, string> = {
 export function CostsPage({
   projects,
   scripts,
+  onChanged,
 }: {
   projects: Project[];
   scripts: ScriptSummary[];
+  /** After a restore, so the rest of the app sees it again. */
+  onChanged?: () => void;
 }) {
+  // Deleted projects and episodes: hidden everywhere else, but what they cost
+  // is still spend, and a total that dropped it would be wrong.
+  const [deleted, setDeleted] = useState<Deleted | null>(null);
+  const loadDeleted = useCallback(() => {
+    api
+      .deleted()
+      .then(setDeleted)
+      .catch(() => setDeleted(null));
+  }, []);
+  useEffect(loadDeleted, [loadDeleted]);
+
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  async function restore(kind: "project" | "script", id: number) {
+    setRestoreError(null);
+    try {
+      await (kind === "project" ? api.restoreProject(id) : api.restoreScript(id));
+    } catch (e) {
+      setRestoreError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      loadDeleted();
+      onChanged?.();
+    }
+  }
   const [byScript, setByScript] = useState<Record<number, Cost>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,11 +79,13 @@ export function CostsPage({
 
   useEffect(load, [load]);
 
-  const total = projects.reduce((sum, p) => sum + p.spend_micros, 0);
-  const wasted = projects.reduce(
-    (sum, p) => sum + Math.round((p.spend_micros * p.waste_pct) / 100),
-    0,
-  );
+  const deletedSpend = (deleted?.projects ?? []).reduce((sum, p) => sum + p.spend_micros, 0);
+  const total = projects.reduce((sum, p) => sum + p.spend_micros, 0) + deletedSpend;
+  const deletedEpisodes = (deleted?.scripts ?? []).filter((s) => !s.with_project);
+  // The deleted projects' waste too, or "of that" would stop matching its total.
+  const wasted =
+    projects.reduce((sum, p) => sum + Math.round((p.spend_micros * p.waste_pct) / 100), 0) +
+    (deleted?.projects ?? []).reduce((sum, p) => sum + p.wasted_micros, 0);
 
   const projectColumns: readonly Column<Project>[] = [
     { header: "Project", cell: (p) => p.name },
@@ -119,6 +147,46 @@ export function CostsPage({
                 says whether the direction is working, not the voice.
               </Notice>
             </Card>
+
+            {/* Outside the card: when the row that failed was the last one — restored
+                meanwhile in another tab — the refresh removes the card, and the
+                message has to outlive it. */}
+            {restoreError && <Notice tone="error">{restoreError}</Notice>}
+            {deleted && (deleted.projects.length > 0 || deletedEpisodes.length > 0) && (
+              <Card title="Deleted">
+                <table className="compact">
+                  <caption className="sr-only">Deleted projects and episodes</caption>
+                  <tbody>
+                    {deleted.projects.map((p) => (
+                      <tr key={`p${p.id}`}>
+                        <td>Project · {p.name}</td>
+                        <td className="num mono">{usd(p.spend_micros)}</td>
+                        <td>
+                          <button className="small" onClick={() => void restore("project", p.id)}>
+                            Restore
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {deletedEpisodes.map((e) => (
+                      <tr key={`s${e.id}`}>
+                        <td>Episode · {e.title}</td>
+                        <td className="num mono">{usd(e.spend_micros)}</td>
+                        <td>
+                          <button className="small" onClick={() => void restore("script", e.id)}>
+                            Restore
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <Notice>
+                  Deleting hides a project or episode and stops it spending. What it cost stays
+                  counted — in the total above, and against its project's monthly cap.
+                </Notice>
+              </Card>
+            )}
 
             <Card title="By script and operation">
               <Loadable loading={loading} error={error} rows={4} onRetry={load}>

@@ -108,7 +108,11 @@ narrate generate 1 --go                 # narration + effect cues, asks first
 narrate takes 1                         # audition
 narrate cut set 1 7 --take 2            # promote a re-roll into the cut
 narrate timeline 1                      # what plays when
-narrate export 1 --format wav,m4a,mp3   # masters + named pieces + plan.md
+narrate export 1 --format wav,m4a,mp3   # masters (plain and _fx) + named pieces + plan.md
+
+narrate script replace 1 episode-14-v2.md   # price an edited script: keeps unchanged takes
+narrate script delete 1                 # hide it; what it cost stays on the record
+narrate script restore 1                # bring it back
 
 narrate cost report --script 1          # spend by operation, waste, cost/minute
 narrate cost reconcile                  # ledger vs the provider's own counter
@@ -386,7 +390,7 @@ Details and migration in **[docs/INSTALL.md](docs/INSTALL.md#-provisioning-the-d
 ```bash
 NARRATE_PROVIDER=mock just up     # the whole UI, offline
 just demo                         # the pipeline end to end
-just check                        # 794 Python + 97 frontend tests
+just check                        # 855 Python + 103 frontend tests
 ```
 
 The offline provider produces **real, playable** audio and reports a
@@ -439,7 +443,7 @@ frontend/src/
   ui/                   shared primitives (Card, DataTable, Markdown, …)
 docs/                 INSTALL, FEATURES, the PRD, and probe findings
 examples/             scripts to try it on
-tests/                794 Python tests
+tests/                855 Python tests
 assets/               generated audio (gitignored)
 ```
 

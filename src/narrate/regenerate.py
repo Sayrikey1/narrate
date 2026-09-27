@@ -50,6 +50,7 @@ from sqlalchemy.orm import Session
 
 from narrate import audio, ledger
 from narrate import produce as produce_mod
+from narrate.archive import Archived, ensure_live
 from narrate.db.models import Chunk, Cut, Project, Script, Take
 from narrate.db.session import session_scope
 from narrate.provider.base import SFXProvider, TTSProvider
@@ -191,6 +192,10 @@ def plan(
         project = session.get(Project, script.project_id)
         if project is None:
             raise ScriptNotFound(f"Script {script_id} has no project.")
+        try:
+            ensure_live(session, script)
+        except Archived as exc:
+            raise RegenerateRefused(str(exc)) from exc
         cut = {
             c.chunk_id: c.take_id
             for c in session.scalars(select(Cut).where(Cut.script_id == script_id)).all()

@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { api, usd } from "../api";
 import { ChunkList } from "../components/ChunkList";
+import { DeletePanel } from "../components/DeletePanel";
 import { RegeneratePanel } from "../components/RegeneratePanel";
+import { ReplacePanel } from "../components/ReplacePanel";
 import { CostPanel } from "../components/CostPanel";
 import { DownloadIcon, SparkIcon } from "../components/Icon";
 import { TimelineView } from "../components/Timeline";
 import { TrackView } from "../components/TrackView";
-import { Link, scriptPath } from "../router";
+import { Link, navigate, scriptPath } from "../router";
 import { Empty, Notice } from "../ui/feedback";
 import { Card, PageHeader, Split } from "../ui/layout";
 import type {
@@ -48,6 +50,10 @@ export function ScriptPage({
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportResult | null>(null);
+  const [episodePanel, setEpisodePanel] = useState<"none" | "replace" | "delete">("none");
+  // Cancelling a panel hands focus back to the button that opened it.
+  const replaceTrigger = useRef<HTMLButtonElement | null>(null);
+  const deleteTrigger = useRef<HTMLButtonElement | null>(null);
   const [detail, setDetail] = useState(false);
 
   // Suspect and to-review alike: the aim is an episode with nothing to hear.
@@ -266,9 +272,61 @@ export function ScriptPage({
             >
               <DownloadIcon /> Export
             </button>
+            <button
+              ref={replaceTrigger}
+              className="ghost"
+              disabled={busy}
+              aria-expanded={episodePanel === "replace"}
+              onClick={() => setEpisodePanel((v) => (v === "replace" ? "none" : "replace"))}
+            >
+              Replace script…
+            </button>
+            <button
+              ref={deleteTrigger}
+              className="ghost danger"
+              disabled={busy}
+              aria-expanded={episodePanel === "delete"}
+              onClick={() => setEpisodePanel((v) => (v === "delete" ? "none" : "delete"))}
+            >
+              Delete…
+            </button>
           </>
         }
       />
+
+      {episodePanel === "replace" && (
+        <ReplacePanel
+          scriptId={scriptId}
+          busy={busy}
+          onClose={() => {
+            setEpisodePanel("none");
+            replaceTrigger.current?.focus();
+          }}
+          onDone={(plan) => {
+            setEpisodePanel("none");
+            setLog([
+              `Script replaced: ${plan.kept} chunk(s) kept with their takes, ${plan.new} new` +
+                (plan.retired ? `, ${plan.retired} dropped` : "") +
+                `. Generate what changed — about ${plan.quote_usd}.`,
+            ]);
+            onRefresh();
+          }}
+        />
+      )}
+      {episodePanel === "delete" && (
+        <DeletePanel
+          what="episode"
+          run={(body) => api.deleteScript(scriptId, body)}
+          onClose={() => {
+            setEpisodePanel("none");
+            deleteTrigger.current?.focus();
+          }}
+          onDone={() => {
+            navigate("/", true);
+            onRefresh();
+          }}
+        />
+      )}
 
       {error && (
         <Notice tone="error" title="That run did not finish">

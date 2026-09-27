@@ -32,18 +32,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, func, select
 
-from narrate import audio, ledger, previews, templates
+from narrate import audio, episodes, ledger, previews, templates
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
 from narrate import regenerate as regen
 from narrate import voices as voices_mod
+from narrate.archive import Archived, ensure_live
 from narrate.db.models import (
     CastMember,
     Chunk,
     Cut,
     Effect,
     EffectSlot,
+    LedgerEntry,
     Project,
     Script,
     Take,
@@ -66,7 +68,7 @@ from narrate.publish import (
     render_publish_pack,
 )
 from narrate.registry import Registry, UnknownModel
-from narrate.settings import Settings, get_settings, resolve_provider
+from narrate.settings import MissingAPIKey, Settings, get_settings, resolve_provider
 from narrate.timeline import build_timeline, voices_used
 from narrate.verify import service as verify_service
 from narrate.verify import transcribe as stt
@@ -216,6 +218,23 @@ class SlotIn(BaseModel):
     description: str
     duration_s: float | None = None
     loop: bool = False
+
+
+class DeleteIn(BaseModel):
+    # False returns what would be deleted and kept, and changes nothing.
+    confirm: bool = False
+    # Also remove the audio and exports only these rows point at.
+    delete_files: bool = False
+    # Delete even though a generation is recorded as still running.
+    force: bool = False
+
+
+class ReplaceIn(BaseModel):
+    text: str
+    title: str | None = None
+    # False returns the price of what changed, and changes nothing.
+    confirm: bool = False
+    force: bool = False
 
 
 class ExportIn(BaseModel):
@@ -400,7 +419,8 @@ def create_app(
     def list_projects() -> list[dict[str, Any]]:
         with session_scope(db) as session:
             out = []
-            for project in session.scalars(select(Project).order_by(Project.id)).all():
+            live = select(Project).where(Project.archived_at.is_(None)).order_by(Project.id)
+            for project in session.scalars(live).all():
                 rollup = ledger.project_rollup(session, project.id)
                 budget = ledger.project_budget(session, project.id)
                 out.append(
@@ -506,7 +526,12 @@ def create_app(
     def list_scripts() -> list[dict[str, Any]]:
         with session_scope(db) as session:
             out = []
+            deleted_projects = set(
+                session.scalars(select(Project.id).where(Project.archived_at.is_not(None))).all()
+            )
             for script in session.scalars(select(Script).order_by(Script.id)).all():
+                if script.archived_at is not None or script.project_id in deleted_projects:
+                    continue
                 chunks = list(
                     session.scalars(select(Chunk).where(Chunk.script_id == script.id)).all()
                 )
@@ -537,6 +562,11 @@ def create_app(
             project = session.get(Project, project_id)
             if project is None:
                 raise HTTPException(404, "No such project")
+            if project.archived_at is not None:
+                raise HTTPException(
+                    409,
+                    f"Project {project.name!r} was deleted. Restore it before adding to it.",
+                )
             spec = registry.get(project.model_id)
             script = Script(
                 project_id=project.id,
@@ -656,6 +686,198 @@ def create_app(
 
         stem = Path(file.filename or "script").stem
         return _create_script(project_id, title or stem, text, dialogue)
+
+    # -- deleting and replacing ------------------------------------------------
+
+    def _refuse_if_deleted(script_id: int) -> None:
+        with session_scope(db) as session:
+            try:
+                ensure_live(session, _script(session, script_id))
+            except Archived as exc:
+                raise HTTPException(409, str(exc)) from exc
+
+    def _refuse_if_busy(script_ids: list[int]) -> None:
+        # The server's own runs; `episodes` also checks runs recorded as
+        # running, which a command-line run in another process leaves.
+        for script_id in script_ids:
+            if tracker.busy(f"script-{script_id}") or tracker.busy(f"verify-{script_id}"):
+                raise HTTPException(409, f"A run is in progress for episode {script_id}.")
+
+    def _delete_payload(plan: episodes.DeletePlan) -> dict[str, Any]:
+        return {
+            "kind": plan.kind,
+            "id": plan.target_id,
+            "name": plan.name,
+            "episodes": plan.episodes,
+            "takes": plan.takes,
+            "spend_micros": plan.spend_micros,
+            "spend_usd": fmt_usd(plan.spend_micros, 4),
+            "files": len(plan.files),
+            "file_bytes": plan.file_bytes,
+            "running": plan.running,
+            "done": plan.done,
+            "files_deleted": plan.files_deleted,
+        }
+
+    @app.post("/api/scripts/{script_id}/delete")
+    def delete_script(script_id: int, body: DeleteIn) -> dict[str, Any]:
+        """Delete an episode — or, without `confirm`, say what that would do."""
+        if body.confirm:
+            _refuse_if_busy([script_id])
+        try:
+            plan = episodes.delete_episode(
+                db,
+                script_id,
+                config,
+                confirm=body.confirm,
+                delete_files=body.delete_files,
+                force=body.force,
+            )
+        except episodes.EpisodeNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except episodes.EpisodeRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _delete_payload(plan)
+
+    @app.post("/api/projects/{project_id}/delete")
+    def delete_project(project_id: int, body: DeleteIn) -> dict[str, Any]:
+        """Delete a project and its episodes — or, without `confirm`, say what."""
+        if body.confirm:
+            with session_scope(db) as session:
+                ids = list(
+                    session.scalars(select(Script.id).where(Script.project_id == project_id)).all()
+                )
+            _refuse_if_busy(ids)
+        try:
+            plan = episodes.delete_project(
+                db,
+                project_id,
+                config,
+                confirm=body.confirm,
+                delete_files=body.delete_files,
+                force=body.force,
+            )
+        except episodes.EpisodeNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except episodes.EpisodeRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return _delete_payload(plan)
+
+    @app.post("/api/scripts/{script_id}/restore")
+    def restore_script(script_id: int) -> dict[str, Any]:
+        try:
+            row = episodes.restore_episode(db, script_id)
+        except episodes.EpisodeNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except episodes.EpisodeRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"id": row.id, "title": row.title, "project_id": row.project_id}
+
+    @app.post("/api/projects/{project_id}/restore")
+    def restore_project(project_id: int) -> dict[str, Any]:
+        try:
+            row = episodes.restore_project(db, project_id)
+        except episodes.EpisodeNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except episodes.EpisodeRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"id": row.id, "name": row.name}
+
+    @app.get("/api/deleted")
+    def list_deleted() -> dict[str, Any]:
+        """What was deleted, and what it cost — so every total still adds up."""
+        with session_scope(db) as session:
+
+            def spend(**where: int) -> int:
+                column = getattr(LedgerEntry, next(iter(where)))
+                value = next(iter(where.values()))
+                return int(
+                    session.scalar(
+                        select(func.coalesce(func.sum(LedgerEntry.cost_micros), 0)).where(
+                            column == value
+                        )
+                    )
+                    or 0
+                )
+
+            projects = [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "spend_micros": spend(project_id=p.id),
+                    # So the Costs page's "of that, wasted" still matches its total.
+                    "wasted_micros": ledger.project_rollup(session, p.id).wasted_micros,
+                    "deleted_at": p.archived_at.isoformat() if p.archived_at else None,
+                }
+                for p in session.scalars(
+                    select(Project).where(Project.archived_at.is_not(None)).order_by(Project.id)
+                ).all()
+            ]
+            gone = {p["id"] for p in projects}
+            scripts = [
+                {
+                    "id": s.id,
+                    "title": s.title,
+                    "project_id": s.project_id,
+                    "spend_micros": spend(script_id=s.id),
+                    "deleted_at": s.archived_at.isoformat() if s.archived_at else None,
+                    # Deleted with its project: restored with it, not alone.
+                    "with_project": s.project_id in gone,
+                }
+                for s in session.scalars(
+                    select(Script).where(Script.archived_at.is_not(None)).order_by(Script.id)
+                ).all()
+            ]
+        return {"projects": projects, "scripts": scripts}
+
+    def _replace(
+        script_id: int,
+        text: str,
+        title: str | None,
+        filename: str | None,
+        confirm: bool,
+        force: bool,
+    ) -> dict[str, Any]:
+        if confirm:
+            _refuse_if_busy([script_id])
+        try:
+            plan = episodes.replace_episode(
+                db,
+                script_id,
+                text,
+                registry,
+                config,
+                filename=filename,
+                title=title,
+                confirm=confirm,
+                force=force,
+            )
+        except episodes.EpisodeNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except episodes.EpisodeRefused as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {**asdict(plan), "quote_usd": fmt_usd(plan.quote_micros, 4)}
+
+    @app.post("/api/scripts/{script_id}/replace")
+    def replace_script(script_id: int, body: ReplaceIn) -> dict[str, Any]:
+        """Replace an episode's script, keeping every take whose words did not
+        change. Without `confirm`, the price of what changed and nothing more."""
+        return _replace(script_id, body.text, body.title, None, body.confirm, body.force)
+
+    @app.post("/api/scripts/{script_id}/replace/upload")
+    async def replace_script_upload(
+        script_id: int,
+        title: str | None = Form(None),
+        confirm: bool = Form(False),
+        force: bool = Form(False),
+        file: UploadFile = File(...),
+    ) -> dict[str, Any]:
+        raw = await file.read()
+        try:
+            text = decode_script(file.filename or "upload", raw)
+        except UnsupportedScript as exc:
+            raise HTTPException(415, str(exc)) from exc
+        return _replace(script_id, text, title, file.filename, confirm, force)
 
     @app.get("/api/scripts/{script_id}/download")
     def download_script(script_id: int, format: str = "md") -> Response:
@@ -910,6 +1132,7 @@ def create_app(
         channel, so the UI never blocks on a run.
         """
         run_key = f"script-{script_id}"
+        _refuse_if_deleted(script_id)
         # Priced before the run is marked started: a projection that cannot be
         # made (a chunk naming a model the rate card no longer has) must answer
         # with the reason, not leave the script marked busy until a restart.
@@ -1291,12 +1514,24 @@ def create_app(
 
     @app.post("/api/scripts/{script_id}/effects/generate")
     async def generate_effects(script_id: int, body: EffectsGenerateIn) -> dict[str, Any]:
-        provider = (
-            MockSFXProvider()
-            if resolve_provider() == "mock" or body.dry_run
-            else ElevenLabsProvider(config)
-        )
+        run_key = f"script-{script_id}"
+        if not body.dry_run:
+            _refuse_if_deleted(script_id)
+            # Held for the whole paid run, so a delete or a replace of this
+            # episode waits for it rather than racing it.
+            if tracker.busy(run_key):
+                raise HTTPException(409, "A run is already in progress for this script.")
+            tracker.start(run_key)
+        provider: SFXProvider | None = None
         try:
+            # Inside the try: a provider that cannot be built (no key, say) must
+            # still finish the run, or the episode stays "busy" — refusing every
+            # later run, delete and replace — until the server restarts.
+            provider = (
+                MockSFXProvider()
+                if resolve_provider() == "mock" or body.dry_run
+                else ElevenLabsProvider(config)
+            )
             outcomes = await effects_mod.generate_slots(
                 db,
                 script_id,
@@ -1305,8 +1540,13 @@ def create_app(
                 slot_ids=body.slot_ids,
                 dry_run=body.dry_run,
             )
+        except MissingAPIKey as exc:
+            raise HTTPException(400, str(exc)) from exc
         finally:
-            await provider.aclose()
+            if provider is not None:
+                await provider.aclose()
+            if not body.dry_run:
+                tracker.finish(run_key, {"effects": True})
         return {
             "outcomes": [asdict(o) for o in outcomes],
             "cost_micros": sum(o.cost_micros for o in outcomes),

@@ -111,11 +111,13 @@ def _adopt_pre_alembic(engine: Engine) -> None:
         "project": {
             "description_boilerplate": "TEXT NOT NULL DEFAULT ''",
             "default_tags": "TEXT NOT NULL DEFAULT ''",
+            "archived_at": "DATETIME",
         },
         "script": {
             "description": "TEXT NOT NULL DEFAULT ''",
             "tags": "TEXT NOT NULL DEFAULT ''",
             "target_seconds": "FLOAT",
+            "archived_at": "DATETIME",
         },
         "take": {
             "voices_json": "TEXT",

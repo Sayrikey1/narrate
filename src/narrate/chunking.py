@@ -288,6 +288,7 @@ def chunk_script(
     prefix_tags: str = "",
     on_oversize: Callable[[int, int], None] | None = None,
     boundaries: list[int] | None = None,
+    exact: list[int] | None = None,
 ) -> list[Chunk]:
     """Split `text` into chunks that fit `spec`, with `prefix_tags` accounted for.
 
@@ -301,6 +302,12 @@ def chunk_script(
     time is the sum of the preceding takes' measured durations rather than an
     interpolation. Each boundary snaps to the nearest sentence start so a
     marker dropped mid-sentence cannot cut the narration in half.
+
+    `exact` are cuts taken where they are, unsnapped — the edges of chunks a
+    replacement keeps. Those are already where a chunk began, so there is
+    nothing to snap to; and snapping one that sits after a line ending in "—"
+    or "…", which no sentence rule recognises, would pull it back inside the
+    chunk and split the very chunk it was there to keep.
     """
     prefix_len = len(apply_prefix("", prefix_tags))
     ceiling = spec.chunk_ceiling - prefix_len
@@ -315,7 +322,9 @@ def chunk_script(
 
     # Forced boundaries partition the script first; everything else then runs
     # independently inside each part.
-    cuts = _snapped_cuts(text, boundaries)
+    cuts = sorted(
+        set(_snapped_cuts(text, boundaries)) | {o for o in exact or [] if 0 < o < len(text)}
+    )
     parts = [(cuts[i], text[cuts[i] : cuts[i + 1]]) for i in range(len(cuts) - 1)]
 
     chunks: list[Chunk] = []
@@ -362,8 +371,11 @@ def _segment(
     on_oversize: Callable[[int, int], None] | None,
 ) -> list[_Segment]:
     """Chunk one part of a script: `[CHUNK n]` markers if present, else paragraphs."""
-    marked = find_markers(text)
-    if marked:
+    # Tested on the marker itself rather than on what it delimits: a part cut
+    # between two kept chunks can hold nothing but a `[CHUNK n]` line, and that
+    # line is not a paragraph to be read aloud.
+    if MARKER_RE.search(text):
+        marked = find_markers(text)
         segments: list[_Segment] = []
         for part in marked:
             if len(part) > ceiling:

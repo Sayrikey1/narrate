@@ -1,7 +1,7 @@
 # What narrate does
 
 Everything currently supported, generated from the code rather than from
-memory — 67 CLI commands, 46 HTTP endpoints, 8 pages, and 794 Python plus 97
+memory — 72 CLI commands, 53 HTTP endpoints, 8 pages, and 855 Python plus 103
 frontend tests.
 
 The organising idea: **every character is accounted for.** A 25–30 minute
@@ -62,6 +62,20 @@ every shipped template and fails if a single word of guidance reaches the
 narration. It caught the obvious trap on the first run — the opening comment
 described the comment syntax, and the closing delimiter inside it ended the
 comment early, exactly as HTML says it should.
+
+### Replacing an episode's script, and deleting
+
+| Feature | Detail |
+| --- | --- |
+| `narrate script replace <id> <file>` / **Replace script…** | Re-upload an edited script over an episode. Chunks whose words did not change keep their takes, cut and checks, so an edited script pays only for what changed. A paragraph that only moved keeps its take on the v3 family. Line endings, a byte-order mark and trailing spaces are not changes |
+| Priced first | The replacement is applied and rolled back to get the quote, so the figure is the runner's own, not an estimate of it. `--go` to replace |
+| Nothing paid for is destroyed | Old chunks the new script drops keep their paid takes in an archived copy of the episode ("… — replaced <date>") |
+| Models that carry context | On a stitched model, the chunks after an edit were made for different neighbours; their cut is cleared so the new takes, when made, go into it |
+| Speakers | A line moved to another speaker, or whose speaker label was removed, is generated again in the right voice. A voice set on a chunk by hand stays |
+| Effect slots | A marker's slot keeps its sound wherever the marker now sits. A slot placed by hand follows its passage when the passage is edited, and goes — counted in the quote — only when the passage is dropped. A title-only change touches nothing |
+| `narrate script delete` / `project delete` / **Delete…** | Hides the episode or project and refuses it any new spend. What it cost stays on the record, attributed to it — in cost reports, the Costs page total and the monthly cap. Files stay unless `--delete-files`, and then only files nothing else uses |
+| `restore` | `narrate script restore <id>` / `project restore <id>`, or **Restore** on the Costs page. A deleted project frees its name; restoring takes it back if it is still free |
+| Why archive, not erase | Ids are reused by SQLite, so an erased episode's spend would land on the next one created; its cut would turn into waste; and a delete mid-run would roll back a billed charge |
 
 ---
 
@@ -386,7 +400,7 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 794 Python + 97 frontend. None touches the network |
+| Tests | 855 Python + 103 frontend. None touches the network |
 | Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `retention`, `verify`, `formats`, `media`, `cost *`, `db *`, `publish write/show/set/title/titles/accept/briefs/choose`, `write beats/beat/sync`, and every voice audition |
 | Dry run is the default | Every command that spends — `generate`, `regenerate`, `effects generate`, `effects suggest`, `publish draft`, `publish brief`, `write outline`, `write expand` — does nothing without `--go`, and says what it would have cost |
 

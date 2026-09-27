@@ -299,7 +299,10 @@ def script_rollup(session: Session, script_id: int) -> Rollup:
     entries = list(
         session.scalars(select(LedgerEntry).where(LedgerEntry.script_id == script_id)).all()
     )
-    selected = _selected_take_ids(session, script_id)
+    # Every cut, not this script's: a take is only ever in its own chunk's cut,
+    # and after a replace a chunk the new script dropped lives in an archived
+    # copy — its spend is still this episode's, and it must not turn to waste.
+    selected = _selected_take_ids(session)
     return _summarise(label, entries, selected)
 
 
@@ -407,7 +410,14 @@ def unknown_takes(session: Session, script_id: int | None = None) -> list[Take]:
     """
     stmt = select(Take).where(Take.status == "unknown")
     if script_id is not None:
-        stmt = stmt.join(Chunk, Take.chunk_id == Chunk.id).where(Chunk.script_id == script_id)
+        # By where the charge was booked as well as where the chunk is now, so
+        # a replace that moved the chunk aside does not hide an open question.
+        billed_here = select(LedgerEntry.take_id).where(
+            LedgerEntry.script_id == script_id, LedgerEntry.take_id.is_not(None)
+        )
+        stmt = stmt.join(Chunk, Take.chunk_id == Chunk.id).where(
+            (Chunk.script_id == script_id) | Take.id.in_(billed_here)
+        )
     return list(session.scalars(stmt).all())
 
 

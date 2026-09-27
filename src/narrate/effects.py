@@ -27,6 +27,7 @@ from pathlib import Path
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
+from narrate.archive import Archived, ensure_live
 from narrate.db.models import Effect, EffectSlot, Project, Script
 from narrate.db.session import session_scope
 from narrate.ledger import SECONDS, record_generation_row
@@ -38,6 +39,7 @@ from narrate.provider.base import (
     effect_idempotency_key,
 )
 from narrate.registry import CONFIG_PATH
+from narrate.runner import _free_path
 from narrate.script_parse import ParsedScript
 from narrate.settings import Settings
 
@@ -206,6 +208,18 @@ def find_existing(session: Session, project_id: int, key: str) -> Effect | None:
     return None
 
 
+def _deleted_since(engine: Engine, script_id: int) -> bool:
+    with session_scope(engine) as session:
+        script = session.get(Script, script_id)
+        if script is None:
+            return True
+        try:
+            ensure_live(session, script)
+        except Archived:
+            return True
+    return False
+
+
 def effect_path(settings: Settings, project_name: str, slug: str) -> Path:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in project_name)[:40]
     return settings.assets_dir / safe / "effects" / f"{slug}.mp3"
@@ -249,6 +263,8 @@ async def generate_slots(
         project = session.get(Project, script.project_id)
         if project is None:
             raise ValueError(f"Script {script_id} has no project.")
+        if not dry_run:
+            ensure_live(session, script)
         project_id, project_name = project.id, project.name
 
         query = select(EffectSlot).where(EffectSlot.script_id == script_id)
@@ -309,6 +325,15 @@ async def generate_slots(
 
     for key, (request, members) in pending.items():
         description = members[0][1]
+        if not dry_run and _deleted_since(engine, script_id):
+            # Deleted while this run was going: no further paid request.
+            note("the episode was deleted — no further effects are generated")
+            for _, (_, rest) in list(pending.items())[list(pending).index(key) :]:
+                outcomes += [
+                    EffectOutcome(member_id, name, "failed", error="the episode was deleted")
+                    for member_id, name in rest
+                ]
+            break
         try:
             result = await provider.generate_effect(request)
         except ProviderError as exc:
@@ -321,7 +346,9 @@ async def generate_slots(
             continue
 
         slug = _slug(description, request.duration_s, request.loop)
-        path = effect_path(settings, project_name, slug)
+        # Never over another sound: two projects whose names sanitise alike —
+        # or a new project given a deleted one's name — share this folder.
+        path = _free_path(effect_path(settings, project_name, slug))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(result.audio)
 

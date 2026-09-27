@@ -26,13 +26,24 @@ from rich.table import Table
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from narrate import audio, copywrite, ledger, llm, outline, publish, retention, templates
+from narrate import (
+    audio,
+    copywrite,
+    episodes,
+    ledger,
+    llm,
+    outline,
+    publish,
+    retention,
+    templates,
+)
 from narrate import media as media_mod
 from narrate import probe as probe_mod
 from narrate import produce as produce_mod
 from narrate import reconcile as reconcile_mod
 from narrate import regenerate as regen
 from narrate import voices as voices_mod
+from narrate.archive import Archived, ensure_live
 from narrate.chunking import Chunk as ChunkObj
 from narrate.chunking import merge_chunks, split_chunk
 from narrate.db import locate
@@ -65,7 +76,7 @@ from narrate.export import (
     write_plan_only,
     write_publish_pack_only,
 )
-from narrate.ingest import ScriptHasTakes, ingest_script
+from narrate.ingest import ScriptHasTakes, UnsupportedScript, decode_script, ingest_script
 from narrate.lint import lint_chunks
 from narrate.money import fmt_usd
 from narrate.provider.base import ProviderError, SFXProvider, TTSProvider
@@ -434,14 +445,28 @@ def project_new(
 
 
 @project_app.command("list")
-def project_list() -> None:
+def project_list(
+    deleted: bool = typer.Option(False, "--deleted", help="List deleted projects instead."),
+) -> None:
     """List projects."""
     engine = _engine()
     table = Table("id", "name", "model", "voice", "tags", "scripts")
     with session_scope(engine) as session:
-        for project in session.scalars(select(Project).order_by(Project.id)).all():
+        query = select(Project).order_by(Project.id)
+        query = query.where(
+            Project.archived_at.is_not(None) if deleted else Project.archived_at.is_(None)
+        )
+        for project in session.scalars(query).all():
+            # A live project counts its live episodes; a deleted one, the
+            # episodes deleted with it.
             count = len(
-                list(session.scalars(select(Script).where(Script.project_id == project.id)).all())
+                [
+                    s
+                    for s in session.scalars(
+                        select(Script).where(Script.project_id == project.id)
+                    ).all()
+                    if s.archived_at == project.archived_at
+                ]
             )
             table.add_row(
                 str(project.id),
@@ -483,6 +508,95 @@ def _warn_rekeyed(session: Session, project: Project, model: str) -> None:
             f"billed — again on {model}. To try another model without that, add a new "
             "script with --model."
         )
+
+
+@project_app.command("delete")
+def project_delete(
+    project: str,
+    delete_files: bool = typer.Option(
+        False, "--delete-files", help="Also delete its audio and exports from disk."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    force: bool = typer.Option(
+        False, "--force", help="Delete even though a generation looks like it is running."
+    ),
+) -> None:
+    """Delete a project and its episodes. What they cost stays on the record."""
+    engine = _engine()
+    settings = get_settings()
+    with session_scope(engine) as session:
+        row = _lookup_project(session, project)
+        project_id = row.id
+    _delete(
+        lambda confirm: episodes.delete_project(
+            engine, project_id, settings, confirm=confirm, delete_files=delete_files, force=force
+        ),
+        delete_files,
+        yes,
+        force,
+    )
+
+
+@project_app.command("restore")
+def project_restore(project_id: int) -> None:
+    """Bring back a deleted project, with the episodes deleted along with it."""
+    try:
+        row = episodes.restore_project(_engine(), project_id)
+    except episodes.EpisodeRefused as exc:
+        _die(str(exc))
+    console.print(f"[green]Restored project {row.id}: {escape(row.name)}.[/green]")
+
+
+def _delete(
+    run: Callable[[bool], episodes.DeletePlan], delete_files: bool, yes: bool, force: bool
+) -> None:
+    """Show what a delete keeps and removes, confirm, then do it."""
+    try:
+        plan = run(False)
+    except episodes.EpisodeRefused as exc:
+        _die(str(exc))
+    what = f"{plan.kind} {plan.target_id}: {escape(plan.name)}"
+    lines = [
+        f"Deletes {what}"
+        + (f", with {len(plan.episodes)} episode(s)" if plan.kind == "project" else "")
+        + f" — {plan.takes} take(s).",
+        f"[bold]{fmt_usd(plan.spend_micros, 4)}[/bold] it cost stays on the record, "
+        "attributed to it, in every cost report.",
+    ]
+    if delete_files:
+        lines.append(
+            f"Removes {len(plan.files)} file(s) from disk ({plan.file_bytes / 1e6:.1f} MB) "
+            "— audio no surviving episode uses. This cannot be undone."
+        )
+    else:
+        lines.append(
+            f"Keeps its {len(plan.files)} file(s) on disk "
+            f"({plan.file_bytes / 1e6:.1f} MB); pass --delete-files to remove them."
+        )
+    lines.append(
+        "It can be restored"
+        + (" (its files could not)" if delete_files else "")
+        + f" with `narrate {'project' if plan.kind == 'project' else 'script'} restore "
+        f"{plan.target_id}`."
+    )
+    if plan.running:
+        lines.append(
+            f"[yellow]A generation looks like it is running for episode(s) "
+            f"{', '.join(map(str, plan.running))}.[/yellow]"
+            + ("" if force else " If it crashed and will never finish, add --force.")
+        )
+    console.print(Panel("\n".join(lines), title="Delete", expand=False))
+    if not yes and not typer.confirm("Delete it?"):
+        console.print("Nothing was deleted.")
+        raise typer.Exit(0)
+    try:
+        done = run(True)
+    except episodes.EpisodeRefused as exc:
+        _die(str(exc))
+    console.print(
+        f"[green]Deleted {what}.[/green]"
+        + (f" {done.files_deleted} file(s) removed." if delete_files else "")
+    )
 
 
 @project_app.command("set")
@@ -560,7 +674,25 @@ def project_set(
         console.print(f"[green]Updated project {row.name}.[/green]")
 
 
-def _lookup_project(session: Session, key: str) -> Project:
+def _require_live(script_id: int) -> None:
+    """Stop before any spend on a deleted episode, with the way back."""
+    with session_scope(_engine()) as session:
+        script = session.get(Script, script_id)
+        if script is None:
+            _die(f"No script {script_id}.")
+        try:
+            ensure_live(session, script)
+        except Archived as exc:
+            _die(str(exc))
+
+
+def _lookup_project(session: Session, key: str, allow_deleted: bool = False) -> Project:
+    """A project by id or name. A deleted one only where just reading about it.
+
+    Anything that would add to a project or spend on it must not reach a
+    deleted one: the lookup by id would otherwise find it, and an outline or a
+    new script would be paid for and filed under a project no list shows.
+    """
     row: Project | None = None
     if key.isdigit():
         row = session.get(Project, int(key))
@@ -568,6 +700,11 @@ def _lookup_project(session: Session, key: str) -> Project:
         row = session.scalar(select(Project).where(Project.name == key))
     if row is None:
         _die(f"No project matching {key!r}.")
+    if row.archived_at is not None and not allow_deleted:
+        _die(
+            f"Project {row.name!r} was deleted. Restore it with "
+            f"`narrate project restore {row.id}` first."
+        )
     return row
 
 
@@ -850,6 +987,11 @@ def voice_clone(
     both checked before anything is uploaded.
     """
     settings = get_settings()
+    if assign:
+        # Before the clone, not after: a deleted or mistyped project found only
+        # once the voice exists would leave a slot used and nothing cast.
+        with session_scope(_engine()) as session:
+            assign_id = _lookup_project(session, assign).id
     capability = _require_cloning(settings)
 
     missing = [p for p in samples if not p.is_file()]
@@ -921,7 +1063,12 @@ def voice_clone(
 
     if assign:
         with session_scope(_engine()) as session:
-            project = _lookup_project(session, assign)
+            project = session.get(Project, assign_id)
+            if project is None or project.archived_at is not None:
+                _die(
+                    f"Project {assign} was deleted meanwhile, so {voice_id} is not cast. "
+                    "Cast it on another with `narrate project set <project> --voice`."
+                )
             project.voice_id = voice_id
         console.print(f"[green]Cast on {assign}.[/green]")
     else:
@@ -1386,13 +1533,22 @@ def _cast_of(session: Session, project_id: int) -> dict[str, str]:
 
 
 @script_app.command("list")
-def script_list() -> None:
+def script_list(
+    deleted: bool = typer.Option(
+        False, "--deleted", help="List deleted episodes (and replaced copies) instead."
+    ),
+) -> None:
     """List scripts."""
     engine = _engine()
     table = Table("id", "title", "project", "chunks", "chars")
     with session_scope(engine) as session:
         for script in session.scalars(select(Script).order_by(Script.id)).all():
             project = session.get(Project, script.project_id)
+            gone = script.archived_at is not None or (
+                project is not None and project.archived_at is not None
+            )
+            if gone != deleted:
+                continue
             chunks = list(session.scalars(select(Chunk).where(Chunk.script_id == script.id)).all())
             table.add_row(
                 str(script.id),
@@ -1402,6 +1558,140 @@ def script_list() -> None:
                 f"{sum(len(c.text) for c in chunks):,}",
             )
     console.print(table)
+
+
+@script_app.command("delete")
+def script_delete(
+    script_id: int,
+    delete_files: bool = typer.Option(
+        False, "--delete-files", help="Also delete its audio and exports from disk."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    force: bool = typer.Option(
+        False, "--force", help="Delete even though a generation looks like it is running."
+    ),
+) -> None:
+    """Delete an episode. What it cost stays on the record, and it can be restored."""
+    engine = _engine()
+    settings = get_settings()
+    _delete(
+        lambda confirm: episodes.delete_episode(
+            engine, script_id, settings, confirm=confirm, delete_files=delete_files, force=force
+        ),
+        delete_files,
+        yes,
+        force,
+    )
+
+
+@script_app.command("restore")
+def script_restore(script_id: int) -> None:
+    """Bring back a deleted episode, takes and cut as they were."""
+    try:
+        row = episodes.restore_episode(_engine(), script_id)
+    except episodes.EpisodeRefused as exc:
+        _die(str(exc))
+    console.print(f"[green]Restored episode {row.id}: {escape(row.title)}.[/green]")
+
+
+@script_app.command("replace")
+def script_replace(
+    script_id: int,
+    path: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    title: str = typer.Option(None, "--title", help="A new title. Default: keep the old one."),
+    go: bool = typer.Option(False, "--go", help="Replace it. Without this it is a dry run."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+    force: bool = typer.Option(
+        False, "--force", help="Replace even though a generation looks like it is running."
+    ),
+) -> None:
+    """Replace an episode's script, keeping every take whose words did not change.
+
+    Chunks whose words match keep their takes, cut and checks — an edited script
+    pays only for what was edited. Chunks the new script drops keep their paid
+    takes in an archived copy of the episode. Shows the price first.
+    """
+    engine = _engine()
+    settings = get_settings()
+    registry = _registry()
+    try:
+        text = decode_script(path.name, path.read_bytes())
+    except UnsupportedScript as exc:
+        _die(str(exc))
+
+    def attempt(confirm: bool) -> episodes.ReplacePlan:
+        try:
+            return episodes.replace_episode(
+                engine,
+                script_id,
+                text,
+                registry,
+                settings,
+                filename=str(path),
+                title=title,
+                confirm=confirm,
+                force=force,
+            )
+        except episodes.StillRunning as exc:
+            _die(f"{exc} (--force)")
+        except episodes.EpisodeRefused as exc:
+            _die(str(exc))
+
+    plan = attempt(False)
+    if plan.unchanged:
+        console.print("[green]The script is unchanged — nothing to replace.[/green]")
+        return
+    lines = [
+        f"Keeps {plan.kept} chunk(s) as they are, with their {plan.kept_takes} take(s)"
+        + (
+            f" — {plan.kept_regenerated} of them are generated again: a neighbour changed, "
+            "and this model carries context between chunks"
+            if plan.kept_regenerated
+            else ""
+        )
+        + ".",
+        f"Adds {plan.new} new chunk(s).",
+    ]
+    if plan.retired:
+        lines.append(
+            f"Drops {plan.retired} chunk(s) the new script no longer has"
+            + (
+                f"; their {plan.retired_takes} paid take(s) stay in an archived copy"
+                if plan.retired_takes
+                else ""
+            )
+            + "."
+        )
+    if plan.slots_dropped:
+        lines.append(
+            f"Removes {plan.slots_dropped} effect slot(s) placed on passages the new script "
+            "drops; their sounds stay in the project's effects library."
+        )
+    if plan.beats_detached:
+        lines.append(
+            f"Detaches its outline ({plan.beats_detached} beat(s)): `write sync` would "
+            "otherwise overwrite the new script with the old one."
+        )
+    lines.append(
+        f"Then generating what changed: {plan.chunks_to_generate} chunk(s), "
+        f"{plan.chars:,} characters"
+        + (f", {plan.effects_to_generate} effect(s)" if plan.effects_to_generate else "")
+        + f" — about [bold]{fmt_usd(plan.quote_micros, 4)}[/bold]. Nothing is sent now."
+    )
+    for warning in plan.warnings:
+        lines.append(f"[yellow]{escape(warning)}[/yellow]")
+    console.print(Panel("\n".join(lines), title=f"Replace episode {script_id}", expand=False))
+    if not go:
+        console.print("[dim]Re-run with --go to replace it.[/dim]")
+        return
+    if not yes and not typer.confirm("Replace it?"):
+        console.print("Nothing was changed.")
+        raise typer.Exit(0)
+    attempt(True)
+    console.print(
+        f"[green]Replaced.[/green] Generate what changed with "
+        f"[bold]narrate generate {script_id} --go[/bold]."
+    )
 
 
 chunk_app = typer.Typer(
@@ -1793,6 +2083,7 @@ def generate(
     Dry-runs unless `--go`. One confirmation covers both phases, and the
     monthly cap is checked against the whole run rather than the speech alone.
     """
+    _require_live(script_id)
     settings = get_settings()
     registry = _registry()
     engine = _engine()
@@ -2939,7 +3230,7 @@ def media(
 
     with session_scope(engine) as session:
         projects = (
-            [_lookup_project(session, project)]
+            [_lookup_project(session, project, allow_deleted=True)]
             if project
             else list(session.scalars(select(Project).order_by(Project.id)).all())
         )
@@ -3105,6 +3396,11 @@ def write_outline(
             "`narrate script template single-voice`."
         )
 
+    # Before anything is sent: a deleted project is refused here, not after
+    # the paid call — where the refusal would also lose the call's cost.
+    with session_scope(engine) as session:
+        project_id = _lookup_project(session, project).id
+
     chosen_model = model or settings.groq_model
     tokens = llm.estimate_tokens([brief], outline.OUTLINE_PROMPT)
     rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
@@ -3128,50 +3424,59 @@ def write_outline(
     )
     for error in run.errors:
         console.print(f"[red]{error}[/red]")
-    if not run.beats:
+
+    script_id: int | None = None
+    with session_scope(engine) as session:
+        row = session.get(Project, project_id)
+        if row is not None and row.archived_at is None and run.beats:
+            script = Script(
+                project_id=row.id,
+                title=title,
+                source_text="",
+                source_sha256="",
+                target_seconds=minutes * 60,
+                model_id=None,
+            )
+            session.add(script)
+            session.flush()
+            script_id = script.id
+            for ordinal, beat in enumerate(run.beats, start=1):
+                session.add(
+                    ScriptBeat(
+                        script_id=script_id,
+                        ordinal=ordinal,
+                        heading=beat.heading,
+                        intent=beat.intent,
+                        target_seconds=beat.target_seconds,
+                        source="outline",
+                        model_id=run.model,
+                    )
+                )
+            session.flush()
+            _sync_beats(session, script_id)
+        # Paid for whether or not anything is kept, so recorded either way —
+        # and inside the session, since exiting from it would roll it back.
+        if script_id is not None or run.cost_micros or run.usage.total_tokens:
+            ledger.record_operation(
+                session,
+                kind="copy",
+                provider=ledger.GROQ,
+                units=float(run.usage.total_tokens),
+                unit_kind=ledger.TOKENS,
+                cost_micros=run.cost_micros,
+                model_id=run.model,
+                project_id=project_id if row is not None else None,
+                script_id=script_id,
+                cost_source="usage",
+                note=f"outline, {len(run.beats)} beat(s)"
+                if script_id is not None
+                else "outline, nothing kept",
+            )
+    if script_id is None:
+        if run.beats:
+            _die(f"Project {project} was deleted meanwhile; the outline was not kept.")
         console.print("[yellow]No outline came back.[/yellow]")
         raise typer.Exit(1)
-
-    with session_scope(engine) as session:
-        row = _lookup_project(session, project)
-        script = Script(
-            project_id=row.id,
-            title=title,
-            source_text="",
-            source_sha256="",
-            target_seconds=minutes * 60,
-            model_id=None,
-        )
-        session.add(script)
-        session.flush()
-        script_id = script.id
-        for ordinal, beat in enumerate(run.beats, start=1):
-            session.add(
-                ScriptBeat(
-                    script_id=script_id,
-                    ordinal=ordinal,
-                    heading=beat.heading,
-                    intent=beat.intent,
-                    target_seconds=beat.target_seconds,
-                    source="outline",
-                    model_id=run.model,
-                )
-            )
-        session.flush()
-        _sync_beats(session, script_id)
-        ledger.record_operation(
-            session,
-            kind="copy",
-            provider=ledger.GROQ,
-            units=float(run.usage.total_tokens),
-            unit_kind=ledger.TOKENS,
-            cost_micros=run.cost_micros,
-            model_id=run.model,
-            project_id=row.id,
-            script_id=script_id,
-            cost_source="usage",
-            note=f"outline, {len(run.beats)} beat(s)",
-        )
 
     console.print(f"[green]Created script {script_id}: {title}[/green]")
     _render_beats(script_id)
@@ -3283,6 +3588,7 @@ def write_expand(
     the sections that already worked. `--rewrite` re-does beats that have prose,
     matching what `--force` means for generation.
     """
+    _require_live(script_id)
     settings = get_settings()
     engine = _engine()
     if not settings.has_groq_key:
@@ -3613,6 +3919,7 @@ def publish_draft(
     say so. The description and tags are written straight in, because there is
     only one of each and nothing downstream acts on them.
     """
+    _require_live(script_id)
     settings = get_settings()
     engine = _engine()
     _copy_gate(
@@ -3718,6 +4025,7 @@ def publish_brief(
     text, the subject and the contrast. Hand it to a designer or paste it into
     any image tool.
     """
+    _require_live(script_id)
     settings = get_settings()
     engine = _engine()
     _copy_gate(settings, "the thumbnail brief", "`narrate publish briefs` to see the format")
@@ -3974,7 +4282,7 @@ def effects_library(project: str) -> None:
     engine = _engine()
     table = Table("slug", "length", "cost", "placements", "prompt")
     with session_scope(engine) as session:
-        row = _lookup_project(session, project)
+        row = _lookup_project(session, project, allow_deleted=True)
         for effect in library(session, row.id):
             used = placements(session, effect.id)
             table.add_row(
@@ -4000,6 +4308,7 @@ def effects_suggest(
     accept: bool = typer.Option(False, "--accept", help="Accept every suggestion immediately."),
 ) -> None:
     """Ask an LLM where effects might belong. Suggestions never generate on their own."""
+    _require_live(script_id)
     settings = get_settings()
     engine = _engine()
 
@@ -4156,6 +4465,7 @@ def effects_generate(
     yes: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Generate audio for the accepted effect slots, reusing whatever exists."""
+    _require_live(script_id)
     settings = get_settings()
     engine = _engine()
     rates = EffectRates.load()
@@ -4288,7 +4598,7 @@ def cost_report(
             budget = ledger.project_budget(session, script.project_id)
             todo = ledger.outstanding(session, script_id, _registry())
         elif project:
-            row = _lookup_project(session, project)
+            row = _lookup_project(session, project, allow_deleted=True)
             roll = ledger.project_totals(session, row.id, since=since)
             per_chunk, per_minute = [], None
             pending = ledger.unknown_takes(session)
@@ -4410,7 +4720,7 @@ def cost_log(
     """Every individual charge, newest first."""
     engine = _engine()
     with session_scope(engine) as session:
-        project_id = _lookup_project(session, project).id if project else None
+        project_id = _lookup_project(session, project, allow_deleted=True).id if project else None
         rows = ledger.cost_log(
             session,
             project_id=project_id,

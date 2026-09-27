@@ -3,6 +3,9 @@ import type {
   CastMember,
   ChunkRow,
   Cost,
+  DeleteBody,
+  Deleted,
+  DeletePlan,
   ExportResult,
   GenerateStarted,
   Model,
@@ -13,6 +16,7 @@ import type {
   Publish,
   RegenerateBody,
   RegenerateQuote,
+  ReplacePlan,
   ScriptCreated,
   ScriptSummary,
   ScriptTemplate,
@@ -88,6 +92,40 @@ export const api = {
     request(`/api/projects/${projectId}/cast/${memberId}`, { method: "DELETE" }),
 
   scripts: () => request<ScriptSummary[]>("/api/scripts"),
+  /** Without `confirm`, what would be deleted and kept; nothing changes. */
+  deleteScript: (id: number, body: DeleteBody) =>
+    post<DeletePlan>(`/api/scripts/${id}/delete`, body),
+  deleteProject: (id: number, body: DeleteBody) =>
+    post<DeletePlan>(`/api/projects/${id}/delete`, body),
+  restoreScript: (id: number) => post<{ id: number }>(`/api/scripts/${id}/restore`),
+  restoreProject: (id: number) => post<{ id: number }>(`/api/projects/${id}/restore`),
+  deleted: () => request<Deleted>("/api/deleted"),
+
+  /** Without `confirm`, the price of what changed; nothing changes. */
+  replaceScript: (
+    id: number,
+    body: { text: string; title?: string; confirm?: boolean; force?: boolean },
+  ) =>
+    post<ReplacePlan>(`/api/scripts/${id}/replace`, body),
+  replaceScriptUpload: async (id: number, file: File, confirm: boolean, force = false) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("confirm", confirm ? "true" : "false");
+    if (force) form.append("force", "true");
+    const response = await fetch(`/api/scripts/${id}/replace/upload`, { method: "POST", body: form });
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try {
+        const body = await response.json();
+        if (body?.detail) detail = body.detail;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail);
+    }
+    return (await response.json()) as ReplacePlan;
+  },
+
   createScript: (body: {
     project_id: number;
     title: string;
