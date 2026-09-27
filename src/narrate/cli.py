@@ -22,10 +22,10 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
-from narrate import audio, ledger, templates
+from narrate import audio, copywrite, ledger, llm, outline, publish, retention, templates
 from narrate import media as media_mod
 from narrate import probe as probe_mod
 from narrate import produce as produce_mod
@@ -42,7 +42,10 @@ from narrate.db.models import (
     EffectSlot,
     Project,
     Script,
+    ScriptBeat,
     Take,
+    ThumbnailBrief,
+    TitleCandidate,
 )
 from narrate.db.session import open_db, session_scope
 from narrate.effects import (
@@ -53,7 +56,12 @@ from narrate.effects import (
     library,
     placements,
 )
-from narrate.export import NothingToExport, export_script, write_plan_only
+from narrate.export import (
+    NothingToExport,
+    export_script,
+    write_plan_only,
+    write_publish_pack_only,
+)
 from narrate.ingest import ScriptHasTakes, ingest_script
 from narrate.money import fmt_usd
 from narrate.provider.base import ProviderError, SFXProvider, TTSProvider
@@ -108,6 +116,12 @@ def _die(message: str) -> NoReturn:
     """Print and exit. Typed `NoReturn` so callers narrow correctly after it."""
     console.print(f"[red]{message}[/red]")
     raise typer.Exit(1)
+
+
+def _clock(seconds: float) -> str:
+    """Seconds as `21m 40s` — for reading, not for filenames."""
+    minutes, whole = divmod(int(seconds), 60)
+    return f"{minutes}m {whole:02d}s"
 
 
 def _require_script(session: Session, script_id: int) -> Script:
@@ -425,6 +439,12 @@ def project_set(
     style: float = typer.Option(None, "--style"),
     speed: float = typer.Option(None, "--speed"),
     cap: float = typer.Option(None, "--monthly-cap"),
+    boilerplate: str = typer.Option(
+        None, "--description-boilerplate", help="Standing text appended to every description."
+    ),
+    default_tags: str = typer.Option(
+        None, "--default-tags", help="Tags every episode in this project carries."
+    ),
 ) -> None:
     """Update a project's customisation profile (F4)."""
     registry = _registry()
@@ -445,6 +465,11 @@ def project_set(
             if tags and not spec.audio_tags:
                 _die(f"{spec.label} does not support audio tags.")
             row.prefix_tags = tags
+
+        if boilerplate is not None:
+            row.description_boilerplate = boilerplate
+        if default_tags is not None:
+            row.default_tags = default_tags
 
         settings_dict: dict[str, Any] = json.loads(row.settings_json or "{}")
         for key, value in (
@@ -2170,6 +2195,871 @@ def timeline(script_id: int) -> None:
         console.print("[dim]Timings after the first ungenerated chunk are provisional.[/dim]")
 
 
+# ---------------------------------------------------------------------------
+# write — outline an episode, then fill it in a beat at a time
+# ---------------------------------------------------------------------------
+
+write_app = typer.Typer(no_args_is_help=True, help="Draft a script: outline first, then prose.")
+app.add_typer(write_app, name="write")
+
+
+def _beats_of(session: Session, script_id: int) -> list[ScriptBeat]:
+    return list(
+        session.scalars(
+            select(ScriptBeat).where(ScriptBeat.script_id == script_id).order_by(ScriptBeat.ordinal)
+        ).all()
+    )
+
+
+def _sync_beats(session: Session, script_id: int) -> int:
+    """Re-render the script from its beats and re-chunk it.
+
+    Everything downstream reads `Script.source_text`, so this is what makes a
+    beat sheet into an actual script. Re-chunking is refused once any chunk has
+    audio — `ScriptHasTakes` protects the ledger — so the practical rule is to
+    finish drafting before generating, and the caller says so.
+    """
+    script = _require_script(session, script_id)
+    beats = _beats_of(session, script_id)
+    if not beats:
+        return 0
+    body = outline.render_script(beats, script.title)
+    script.source_text = body
+    script.source_sha256 = hashlib.sha256(body.encode()).hexdigest()
+
+    project = session.get(Project, script.project_id)
+    registry = _registry()
+    model_id = script.model_id or (project.model_id if project else "")
+    _rechunk(
+        session,
+        script,
+        registry.get(model_id),
+        project.prefix_tags if project else "",
+        cast=_cast_of(session, script.project_id),
+    )
+    return len(beats)
+
+
+@write_app.command("outline")
+def write_outline(
+    project: str = typer.Option(..., "--project", "-p"),
+    title: str = typer.Option(..., "--title"),
+    brief: str = typer.Option(None, "--brief", help="What the episode is about."),
+    brief_file: Path = typer.Option(
+        None, "--brief-file", help="Read the brief from a file — a good one is a paragraph."
+    ),
+    minutes: float = typer.Option(15.0, "--minutes", help="Target runtime."),
+    beats: int = typer.Option(8, "--beats", help="Roughly how many sections."),
+    go: bool = typer.Option(False, "--go", help="Actually call Groq."),
+    model: str = typer.Option(None, "--model"),
+) -> None:
+    """Propose a beat sheet for a new episode, with a time budget per section.
+
+    Creates the script and its outline. No prose is written — that is
+    `narrate write expand`, one section at a time, so the structure can be
+    argued with before any of it is paid for.
+    """
+    settings = get_settings()
+    engine = _engine()
+    if brief and brief_file:
+        _die("Pass --brief or --brief-file, not both.")
+    if brief_file is not None:
+        if not brief_file.is_file():
+            _die(f"No such file: {brief_file}")
+        brief = brief_file.read_text(encoding="utf-8")
+    if not brief:
+        _die("Say what the episode is about with --brief or --brief-file.")
+    if not settings.has_groq_key:
+        _die(
+            "No Groq key found. Set GROQ_API_KEY in .env, or start from a template: "
+            "`narrate script template single-voice`."
+        )
+
+    chosen_model = model or settings.groq_model
+    tokens = llm.estimate_tokens([brief], outline.OUTLINE_PROMPT)
+    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+
+    if not go:
+        console.print(
+            Panel(
+                f"Would ask {chosen_model} for about {beats} beats over {minutes:g} "
+                f"minutes — roughly {tokens:,} input tokens, {fmt_usd(rough, 4)}.\n\n"
+                "Only the outline. **No prose and no audio**, so nothing is written "
+                "that costs characters.\n\n"
+                "[bold]Re-run with --go.[/bold]",
+                title="Outline (nothing sent)",
+                expand=False,
+            )
+        )
+        return
+
+    run = asyncio.run(
+        outline.propose_outline(brief, settings, minutes=minutes, beats=beats, model=model)
+    )
+    for error in run.errors:
+        console.print(f"[red]{error}[/red]")
+    if not run.beats:
+        console.print("[yellow]No outline came back.[/yellow]")
+        raise typer.Exit(1)
+
+    with session_scope(engine) as session:
+        row = _lookup_project(session, project)
+        script = Script(
+            project_id=row.id,
+            title=title,
+            source_text="",
+            source_sha256="",
+            target_seconds=minutes * 60,
+            model_id=None,
+        )
+        session.add(script)
+        session.flush()
+        script_id = script.id
+        for ordinal, beat in enumerate(run.beats, start=1):
+            session.add(
+                ScriptBeat(
+                    script_id=script_id,
+                    ordinal=ordinal,
+                    heading=beat.heading,
+                    intent=beat.intent,
+                    target_seconds=beat.target_seconds,
+                    source="outline",
+                    model_id=run.model,
+                )
+            )
+        session.flush()
+        _sync_beats(session, script_id)
+        ledger.record_operation(
+            session,
+            kind="copy",
+            provider=ledger.GROQ,
+            units=float(run.usage.total_tokens),
+            unit_kind=ledger.TOKENS,
+            cost_micros=run.cost_micros,
+            model_id=run.model,
+            project_id=row.id,
+            script_id=script_id,
+            cost_source="usage",
+            note=f"outline, {len(run.beats)} beat(s)",
+        )
+
+    console.print(f"[green]Created script {script_id}: {title}[/green]")
+    _render_beats(script_id)
+    console.print(
+        f"[dim]Used {run.usage.total_tokens:,} tokens ({fmt_usd(run.cost_micros, 4)}). "
+        f"Edit with `narrate write beat {script_id} <n>`, then "
+        f"`narrate write expand {script_id} --go`.[/dim]"
+    )
+
+
+def _render_beats(script_id: int) -> None:
+    engine = _engine()
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        beats = _beats_of(session, script_id)
+        rows = [
+            (b.ordinal, b.heading, b.target_seconds, len(b.body.split()), b.intent) for b in beats
+        ]
+
+    if not rows:
+        console.print("[dim]No beats yet.[/dim]")
+        return
+
+    table = Table("#", "section", "budget", "words", "what it has to do")
+    for ordinal, heading, seconds, words, intent in rows:
+        table.add_row(
+            str(ordinal),
+            heading,
+            _clock(seconds),
+            f"[green]{words:,}[/green]" if words else "[yellow]—[/yellow]",
+            intent[:52],
+        )
+    console.print(table)
+    total = sum(r[2] for r in rows)
+    written = sum(1 for r in rows if r[3])
+    console.print(f"[dim]{len(rows)} beat(s), {_clock(total)} budgeted, {written} written.[/dim]")
+
+
+@write_app.command("beats")
+def write_beats(script_id: int) -> None:
+    """The beat sheet, with its time budget and what is written. Costs nothing."""
+    _render_beats(script_id)
+
+
+@write_app.command("beat")
+def write_beat(
+    script_id: int,
+    ordinal: int,
+    heading: str = typer.Option(None, "--heading"),
+    intent: str = typer.Option(None, "--intent"),
+    minutes: float = typer.Option(None, "--minutes", help="Budget for this section."),
+    seconds: float = typer.Option(None, "--seconds"),
+) -> None:
+    """Edit one beat — the review step. Costs nothing."""
+    engine = _engine()
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        row = session.scalars(
+            select(ScriptBeat).where(
+                ScriptBeat.script_id == script_id, ScriptBeat.ordinal == ordinal
+            )
+        ).one_or_none()
+        if row is None:
+            _die(f"No beat {ordinal} on script {script_id}.")
+        if heading is not None:
+            row.heading = heading
+        if intent is not None:
+            row.intent = intent
+        if minutes is not None:
+            row.target_seconds = minutes * 60
+        if seconds is not None:
+            row.target_seconds = seconds
+        _sync_beats(session, script_id)
+    _render_beats(script_id)
+
+
+@write_app.command("sync")
+def write_sync(script_id: int) -> None:
+    """Re-render the script from its beats and re-chunk. Costs nothing.
+
+    Run after editing beats by hand. Refused once anything has been generated,
+    because re-chunking would orphan the takes and their cost records.
+    """
+    engine = _engine()
+    with session_scope(engine) as session:
+        try:
+            count = _sync_beats(session, script_id)
+        except ScriptHasTakes as exc:
+            _die(f"{exc} Expand everything before you generate.")
+    if not count:
+        _die(f"Script {script_id} has no beats. `narrate write outline` creates them.")
+    console.print(f"[green]Re-rendered from {count} beat(s).[/green]")
+    _render_chunks(script_id)
+
+
+@write_app.command("expand")
+def write_expand(
+    script_id: int,
+    only: str = typer.Option(None, "--only", help="Beat numbers, e.g. 3,4."),
+    rewrite: bool = typer.Option(
+        False, "--rewrite", help="Re-write beats that already have prose."
+    ),
+    go: bool = typer.Option(False, "--go", help="Actually call Groq."),
+    model: str = typer.Option(None, "--model"),
+) -> None:
+    """Write the prose for each empty beat, one request per section.
+
+    Only empty beats by default, so re-running after a failure costs nothing for
+    the sections that already worked. `--rewrite` re-does beats that have prose,
+    matching what `--force` means for generation.
+    """
+    settings = get_settings()
+    engine = _engine()
+    if not settings.has_groq_key:
+        _die("No Groq key found. Set GROQ_API_KEY in .env, or write the prose by hand.")
+
+    wanted = {int(n) for n in only.split(",") if n.strip()} if only else None
+    with session_scope(engine) as session:
+        script = _require_script(session, script_id)
+        title = script.title
+        project_id = script.project_id
+        rate = outline.words_per_second(session, project_id)
+        beats = [
+            b
+            for b in _beats_of(session, script_id)
+            if (wanted is None or b.ordinal in wanted) and (rewrite or not b.body.strip())
+        ]
+        pending = [(b.ordinal, b.heading, b.intent, b.target_seconds) for b in beats]
+
+    if not pending:
+        console.print(
+            "[green]Every beat already has prose.[/green] "
+            "[dim]Use --rewrite to do them again.[/dim]"
+        )
+        return
+
+    chosen_model = model or settings.groq_model
+    words = sum(outline.words_for(seconds or 30.0, rate) for _, _, _, seconds in pending)
+    tokens = llm.estimate_tokens(
+        [f"{h} {i}" for _, h, i, _ in pending], outline.EXPAND_PROMPT
+    ) + int(words / llm.CHARS_PER_TOKEN * 6)
+    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+
+    if not go:
+        console.print(
+            Panel(
+                f"Would write {len(pending)} section(s) with {chosen_model} — about "
+                f"{words:,} words, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"At this project's measured pace of {rate:.2f} words/second, that is "
+                f"about {_clock(words / rate)} of narration.\n\n"
+                "**No audio is generated.** Prose costs tokens; narration costs "
+                "characters, and that is still `narrate generate`.\n\n"
+                "[bold]Re-run with --go.[/bold]",
+                title="Expand (nothing sent)",
+                expand=False,
+            )
+        )
+        return
+
+    with session_scope(engine) as session:
+        rows = _beats_of(session, script_id)
+        chosen = [b for b in rows if b.ordinal in {o for o, _, _, _ in pending}]
+        run = asyncio.run(
+            outline.expand_beats(chosen, settings, title=title, rate=rate, model=model)
+        )
+        for ordinal, prose in run.written.items():
+            for beat in rows:
+                if beat.ordinal == ordinal:
+                    beat.body = prose
+                    beat.model_id = run.model
+        if run.usage.spent:
+            ledger.record_operation(
+                session,
+                kind="copy",
+                provider=ledger.GROQ,
+                units=float(run.usage.total_tokens),
+                unit_kind=ledger.TOKENS,
+                cost_micros=run.cost_micros,
+                model_id=run.model,
+                project_id=project_id,
+                script_id=script_id,
+                cost_source="usage",
+                note=f"expanded {len(run.written)} beat(s)",
+            )
+        try:
+            _sync_beats(session, script_id)
+        except ScriptHasTakes as exc:
+            console.print(f"[yellow]{exc}[/yellow]")
+            console.print("[yellow]The prose is saved; the chunks were not rebuilt.[/yellow]")
+
+    for error in run.errors:
+        console.print(f"[red]{error}[/red]")
+    console.print(
+        f"[green]Wrote {len(run.written)} section(s).[/green] "
+        f"[dim]{run.usage.total_tokens:,} tokens ({fmt_usd(run.cost_micros, 4)}).[/dim]"
+    )
+    _render_beats(script_id)
+
+
+# ---------------------------------------------------------------------------
+# publish — the pack that goes with the finished audio
+# ---------------------------------------------------------------------------
+
+publish_app = typer.Typer(no_args_is_help=True, help="Titles, chapters, tags and the pack.")
+app.add_typer(publish_app, name="publish")
+
+
+@publish_app.command("write")
+def publish_write(
+    script_id: int,
+    out: Path = typer.Option(None, "--out", help="Where to write publish.md."),
+) -> None:
+    """Write publish.md — chapters, title, description, tags, thumbnail brief.
+
+    Costs nothing and needs no key. Chapters and the retention target are
+    computed from the audio; the written fields are whatever has been set or
+    generated so far, and the document names the command that fills each blank.
+    """
+    settings = get_settings()
+    path = write_publish_pack_only(_engine(), script_id, settings, out)
+    console.print(f"[green]Wrote {path}[/green]")
+
+
+@publish_app.command("show")
+def publish_show(script_id: int) -> None:
+    """The chapter list and retention target, in the terminal. Costs nothing."""
+    settings = get_settings()
+    engine = _engine()
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        tl = build_timeline(session, script_id, gap_seconds=settings.gap_seconds)
+        ctx = publish.gather_publish(session, script_id)
+
+    chosen = ctx.chosen_title
+    console.print(f"[bold]{chosen.text if chosen else ctx.title}[/bold]")
+    if chosen and chosen.over_length:
+        console.print(
+            f"[yellow]{len(chosen.text)} characters — YouTube cuts a title off around "
+            f"{publish.TITLE_COMFORTABLE_CHARS} where it is read.[/yellow]"
+        )
+
+    chapters = publish.chapters_of(tl)
+    if chapters.chapters:
+        table = Table("at", "chapter", "chunk", title="Chapters")
+        for chapter in chapters.chapters:
+            table.add_row(chapter.stamp, chapter.title, str(chapter.chunk_ordinal or "—"))
+        console.print(table)
+    for problem in chapters.problems:
+        console.print(f"[yellow]{problem}[/yellow]")
+
+    if ctx.all_tags:
+        console.print(f"[dim]Tags: {', '.join(ctx.all_tags)}[/dim]")
+    brief = ctx.chosen_brief
+    if brief is not None:
+        console.print(
+            f'[dim]Thumbnail: {brief.archetype} — "{brief.overlay_text}" '
+            f"({brief.word_count} words)[/dim]"
+        )
+
+
+@publish_app.command("set")
+def publish_set(
+    script_id: int,
+    description: str = typer.Option(None, "--description"),
+    description_file: Path = typer.Option(
+        None, "--description-file", help="Read the description from a file instead."
+    ),
+    tags: str = typer.Option(None, "--tags", help="Comma-separated."),
+    target_minutes: float = typer.Option(
+        None, "--target-minutes", help="The length this episode was written for."
+    ),
+) -> None:
+    """Set the description, tags, or intended length by hand. Costs nothing."""
+    if description and description_file:
+        _die("Pass --description or --description-file, not both.")
+    if description_file is not None:
+        if not description_file.is_file():
+            _die(f"No such file: {description_file}")
+        description = description_file.read_text(encoding="utf-8")
+
+    engine = _engine()
+    with session_scope(engine) as session:
+        script = _require_script(session, script_id)
+        if description is not None:
+            script.description = description
+        if tags is not None:
+            script.tags = tags
+        if target_minutes is not None:
+            script.target_seconds = target_minutes * 60
+    console.print("[green]Updated.[/green]")
+
+
+@publish_app.command("title")
+def publish_title(
+    script_id: int,
+    text: str,
+    formula: str = typer.Option("", "--formula", help="Which title formula this follows."),
+    rationale: str = typer.Option("", "--why", help="Why it earns the click."),
+) -> None:
+    """Add a title by hand, and choose it. Costs nothing."""
+    engine = _engine()
+    with session_scope(engine) as session:
+        script = _require_script(session, script_id)
+        try:
+            candidate = publish.add_title(
+                session, script_id, text, formula=formula, rationale=rationale, accepted=True
+            )
+        except publish.DuplicateTitle as exc:
+            _die(str(exc))
+        script.title = candidate.text
+    console.print(f"[green]Title set:[/green] {text}")
+
+
+@publish_app.command("titles")
+def publish_titles(script_id: int) -> None:
+    """Every title considered for this episode. Costs nothing."""
+    engine = _engine()
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        ctx = publish.gather_publish(session, script_id)
+
+    if not ctx.titles:
+        console.print(
+            "[dim]No candidates. Add one with `narrate publish title`, or generate "
+            "a set with `narrate publish draft <id> --go`.[/dim]"
+        )
+        return
+
+    table = Table("#", "chosen", "formula", "chars", "title", "why")
+    for option in ctx.titles:
+        chars = str(len(option.text))
+        table.add_row(
+            str(option.id),
+            "[green]yes[/green]" if option.accepted else "",
+            option.formula or "—",
+            f"[yellow]{chars}[/yellow]" if option.over_length else chars,
+            option.text,
+            (option.rationale or "")[:44],
+        )
+    console.print(table)
+    console.print("[dim]Choose one with `narrate publish accept <#>`.[/dim]")
+
+
+@publish_app.command("accept")
+def publish_accept(
+    candidate_ids: list[int],
+    reject: bool = typer.Option(False, "--reject", help="Mark them unchosen instead."),
+) -> None:
+    """Choose a title. The chosen one becomes the script's title.
+
+    Choosing one unchooses the others: an episode has one title, and leaving two
+    marked would make the pack's headline depend on row order.
+    """
+    engine = _engine()
+    with session_scope(engine) as session:
+        for candidate_id in candidate_ids:
+            row = session.get(TitleCandidate, candidate_id)
+            if row is None:
+                console.print(f"[red]No title candidate {candidate_id}.[/red]")
+                continue
+            if reject:
+                row.accepted = False
+                continue
+            publish.choose_title(session, row)
+            console.print(f"[green]Title set:[/green] {row.text}")
+    if reject:
+        console.print(f"[yellow]{len(candidate_ids)} rejected.[/yellow]")
+
+
+def _copy_brief(session: Session, script_id: int) -> str:
+    """What the model is told about the episode.
+
+    Deliberately not the whole script. The free tier allows 8,000 tokens per
+    minute and a 20,000-character episode exceeds that on its own — but a title
+    does not need every word, it needs the shape. The chapter names *are* that
+    shape when they exist, which is why they go first.
+    """
+    script = _require_script(session, script_id)
+    chunks = list(
+        session.scalars(
+            select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
+        ).all()
+    )
+    chapters = [c.chapter_title for c in chunks if c.chapter_title]
+
+    parts = [f"Working title: {script.title}"]
+    if chapters:
+        parts.append("Sections:\n" + "\n".join(f"- {c}" for c in chapters))
+    if chunks:
+        parts.append("How it opens:\n" + chunks[0].text[:1600])
+    if len(chunks) > 1:
+        parts.append("How it ends:\n" + chunks[-1].text[-600:])
+    return "\n\n".join(parts)
+
+
+def _record_copy(engine: Engine, script_id: int, run: copywrite.CopyRun, note: str) -> None:
+    """Charge the ledger for tokens spent, before the results are looked at.
+
+    Spent is spent. Writing the row first means a run whose output is then
+    discarded is still accounted for, which is the only way the monthly figure
+    stays true.
+    """
+    if not run.usage.spent:
+        return
+    with session_scope(engine) as session:
+        script = _require_script(session, script_id)
+        ledger.record_operation(
+            session,
+            kind="copy",
+            provider=ledger.GROQ,
+            units=float(run.usage.total_tokens),
+            unit_kind=ledger.TOKENS,
+            cost_micros=run.cost_micros,
+            model_id=run.model,
+            project_id=script.project_id,
+            script_id=script_id,
+            cost_source="usage",
+            note=(f"{note} ({run.usage.prompt_tokens} in, {run.usage.completion_tokens} out)"),
+        )
+
+
+def _copy_gate(settings: Settings, what: str, manual: str) -> None:
+    """Refuse before the database is touched when there is no key."""
+    if not settings.has_groq_key:
+        _die(f"No Groq key found. Set GROQ_API_KEY in .env, or write {what} by hand: {manual}")
+
+
+@publish_app.command("draft")
+def publish_draft(
+    script_id: int,
+    go: bool = typer.Option(False, "--go", help="Actually call Groq. Costs a fraction of a cent."),
+    model: str = typer.Option(None, "--model", help="openai/gpt-oss-120b | openai/gpt-oss-20b"),
+    count: int = typer.Option(6, "--titles", help="How many title candidates to propose."),
+    no_package: bool = typer.Option(False, "--titles-only", help="Skip the description and tags."),
+) -> None:
+    """Propose titles, a description and tags. Nothing is chosen for you.
+
+    Every title lands unchosen, so the pack's headline does not change until you
+    say so. The description and tags are written straight in, because there is
+    only one of each and nothing downstream acts on them.
+    """
+    settings = get_settings()
+    engine = _engine()
+    _copy_gate(
+        settings,
+        "the title and description",
+        "`narrate publish title` and `narrate publish set`",
+    )
+
+    with session_scope(engine) as session:
+        brief = _copy_brief(session, script_id)
+
+    chosen_model = model or settings.groq_model
+    requests = 1 if no_package else 2
+    tokens = llm.estimate_tokens([brief] * requests, copywrite.TITLE_PROMPT, per_text=False)
+    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+
+    if not go:
+        console.print(
+            Panel(
+                f"Would send {requests} request(s) to {chosen_model} — about {tokens:,} "
+                f"input tokens, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"Titles are stored **unchosen**, so the pack's headline does not change "
+                "until you accept one.\n\n"
+                "[bold]Re-run with --go.[/bold]",
+                title="Draft (nothing sent)",
+                expand=False,
+            )
+        )
+        return
+
+    run = asyncio.run(
+        copywrite.propose_copy(
+            brief,
+            settings,
+            model=model,
+            titles=count,
+            want_package=not no_package,
+        )
+    )
+    _record_copy(engine, script_id, run, f"{len(run.titles)} title(s)")
+
+    for error in run.errors:
+        console.print(f"[red]{error}[/red]")
+
+    stored = 0
+    with session_scope(engine) as session:
+        for idea in run.titles:
+            try:
+                publish.add_title(
+                    session,
+                    script_id,
+                    idea.text,
+                    formula=idea.formula,
+                    rationale=idea.reason,
+                    source="proposed",
+                    accepted=False,
+                    model_id=run.model,
+                )
+            except publish.DuplicateTitle:
+                continue
+            stored += 1
+        script = _require_script(session, script_id)
+        if run.description:
+            script.description = run.description
+        if run.tags:
+            script.tags = ", ".join(run.tags)
+
+    usage = (
+        f"Used {run.usage.prompt_tokens:,} + {run.usage.completion_tokens:,} tokens "
+        f"({fmt_usd(run.cost_micros, 4)}) on {run.model}."
+    )
+    if not stored and not run.description:
+        console.print("[yellow]Nothing came back.[/yellow]")
+        console.print(f"[dim]{usage}[/dim]")
+        return
+
+    if stored:
+        table = Table("formula", "chars", "title", "why")
+        for idea in run.titles:
+            table.add_row(
+                idea.formula,
+                str(len(idea.text)),
+                idea.text,
+                idea.reason[:48],
+            )
+        console.print(table)
+    if run.description:
+        console.print(f"[green]Description and {len(run.tags)} tag(s) written.[/green]")
+    console.print(f"[dim]{usage}[/dim]")
+    console.print("[dim]Titles stored unchosen — choose with `narrate publish accept <#>`.[/dim]")
+
+
+@publish_app.command("brief")
+def publish_brief(
+    script_id: int,
+    go: bool = typer.Option(False, "--go", help="Actually call Groq. Costs a fraction of a cent."),
+    model: str = typer.Option(None, "--model"),
+    count: int = typer.Option(3, "--count", help="How many concepts to propose."),
+) -> None:
+    """Propose thumbnail briefs. No image is generated.
+
+    The brief is the deliverable: a composition, at most five words of overlay
+    text, the subject and the contrast. Hand it to a designer or paste it into
+    any image tool.
+    """
+    settings = get_settings()
+    engine = _engine()
+    _copy_gate(settings, "the thumbnail brief", "`narrate publish briefs` to see the format")
+
+    with session_scope(engine) as session:
+        brief = _copy_brief(session, script_id)
+
+    chosen_model = model or settings.groq_model
+    tokens = llm.estimate_tokens([brief], copywrite.THUMBNAIL_PROMPT)
+    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+
+    if not go:
+        console.print(
+            Panel(
+                f"Would send 1 request to {chosen_model} — about {tokens:,} input "
+                f"tokens, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"{count} concept(s), each a written brief. **No image is generated** "
+                "and no second provider is involved.\n\n"
+                "[bold]Re-run with --go.[/bold]",
+                title="Thumbnail briefs (nothing sent)",
+                expand=False,
+            )
+        )
+        return
+
+    run = asyncio.run(copywrite.propose_thumbnails(brief, settings, model=model, count=count))
+    _record_copy(engine, script_id, run, f"{len(run.briefs)} thumbnail brief(s)")
+
+    for error in run.errors:
+        console.print(f"[red]{error}[/red]")
+
+    usage = (
+        f"Used {run.usage.prompt_tokens:,} + {run.usage.completion_tokens:,} tokens "
+        f"({fmt_usd(run.cost_micros, 4)}) on {run.model}."
+    )
+    if not run.briefs:
+        console.print("[yellow]Nothing came back.[/yellow]")
+        console.print(f"[dim]{usage}[/dim]")
+        return
+
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        highest = session.scalar(
+            select(func.max(ThumbnailBrief.ordinal)).where(ThumbnailBrief.script_id == script_id)
+        )
+        for offset, idea in enumerate(run.briefs, start=(highest or 0) + 1):
+            session.add(
+                ThumbnailBrief(
+                    script_id=script_id,
+                    ordinal=offset,
+                    archetype=idea.archetype,
+                    overlay_text=idea.overlay_text,
+                    subject=idea.subject,
+                    contrast=idea.contrast,
+                    rationale=idea.reason,
+                    principles=idea.principles,
+                    source="proposed",
+                    accepted=False,
+                    model_id=run.model,
+                )
+            )
+
+    table = Table("composition", "words", "text on image", "subject")
+    for idea in run.briefs:
+        table.add_row(
+            idea.archetype,
+            str(len(idea.overlay_text.split())),
+            idea.overlay_text,
+            idea.subject[:46],
+        )
+    console.print(table)
+    console.print(f"[dim]{usage}[/dim]")
+    console.print(
+        "[dim]Stored unchosen — pick one with `narrate publish choose <#>`, and see "
+        "them all with `narrate publish briefs`.[/dim]"
+    )
+
+
+@publish_app.command("briefs")
+def publish_briefs(script_id: int) -> None:
+    """Every thumbnail brief on record. Costs nothing."""
+    engine = _engine()
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        ctx = publish.gather_publish(session, script_id)
+
+    if not ctx.briefs:
+        console.print("[dim]No briefs. Generate some with `narrate publish brief <id> --go`.[/dim]")
+        return
+
+    table = Table("#", "chosen", "composition", "words", "text on image", "subject")
+    for brief in ctx.briefs:
+        table.add_row(
+            str(brief.id),
+            "[green]yes[/green]" if brief.accepted else "",
+            brief.archetype or "—",
+            str(brief.word_count),
+            brief.overlay_text,
+            (brief.subject or "")[:40],
+        )
+    console.print(table)
+    console.print("[dim]Choose one with `narrate publish choose <#>`.[/dim]")
+
+
+@publish_app.command("choose")
+def publish_choose(brief_id: int) -> None:
+    """Choose which thumbnail brief this episode ships. Costs nothing."""
+    engine = _engine()
+    with session_scope(engine) as session:
+        row = session.get(ThumbnailBrief, brief_id)
+        if row is None:
+            _die(f"No thumbnail brief {brief_id}.")
+        publish.choose_brief(session, row)
+        console.print(f'[green]Chosen:[/green] {row.archetype} — "{row.overlay_text}"')
+
+
+@app.command("retention")
+def retention_check(
+    script_id: int,
+    minutes: float = typer.Option(
+        None, "--minutes", help="Judge against an intended length instead of the measured one."
+    ),
+) -> None:
+    """Audience-retention targets for this episode's length. Costs nothing.
+
+    The published targets fall as a video gets longer, so they cannot be known
+    from the script alone — they depend on the runtime, which is only exact once
+    the audio exists. Before then, pass `--minutes` to plan against an intended
+    length.
+    """
+    settings = get_settings()
+    engine = _engine()
+    with session_scope(engine) as session:
+        tl = build_timeline(session, script_id, gap_seconds=settings.gap_seconds)
+
+    measured = tl.runtime_s
+    runtime_s = minutes * 60 if minutes else measured
+    if runtime_s <= 0:
+        _die(
+            "Nothing generated yet, so there is no runtime to judge. "
+            "Pass --minutes to plan against an intended length."
+        )
+
+    target = retention.targets(runtime_s)
+    source = "  [dim](from --minutes)[/dim]" if minutes else ""
+    rows = [
+        f"Runtime        {_clock(runtime_s)}{source}",
+        f"Target AVD     {target.good_pct}% good / {target.great_pct}% great",
+        f'Hold for       {_clock(target.good_hold_s)} to reach "good"',
+        f'               {_clock(target.great_hold_s)} to reach "great"',
+    ]
+    console.print(Panel("\n".join(rows), title=f"[green]{tl.script_title}[/green]", expand=False))
+    console.print("[dim]Each doubling of length costs five points of average view.[/dim]")
+
+    if target.extrapolated:
+        console.print(
+            "[yellow]Outside the published 8 to 120 minute range, so these are "
+            "extrapolated rather than quoted.[/yellow]"
+        )
+
+    landing = retention.hold_lands_in(tl, target.good_hold_s)
+    if landing is not None:
+        console.print(
+            f"At {target.good_pct}% the average viewer leaves during chunk "
+            f"[bold]{landing.chunk_ordinal}[/bold] ({_clock(landing.start_s)}) — "
+            f"[dim]{landing.label}[/dim]"
+        )
+
+    for note in retention.pacing_notes(tl):
+        console.print(f"[dim]· {note}[/dim]")
+
+
 @app.command("plan")
 def write_plan(
     script_id: int,
@@ -2541,6 +3431,7 @@ KIND_LABEL = {
     "generation": "narration",
     "effect": "effects",
     "suggestion": "suggestions",
+    "copy": "copywriting",
     "probe": "probes",
     "correction": "corrections",
 }
@@ -2680,7 +3571,9 @@ def _account_report(session: Session, since: datetime | None) -> None:
 def cost_log(
     project: str = typer.Option(None, "--project", "-p"),
     script_id: int = typer.Option(None, "--script", "-s"),
-    kind: str = typer.Option(None, "--kind", help="generation | effect | suggestion | probe"),
+    kind: str = typer.Option(
+        None, "--kind", help="generation | effect | suggestion | copy | probe"
+    ),
     unattributed: bool = typer.Option(False, "--unattributed", help="Only account-level spend."),
     limit: int = typer.Option(40, "--limit", "-n"),
 ) -> None:

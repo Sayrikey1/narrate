@@ -9,6 +9,7 @@ import { CostsPage } from "./pages/Costs";
 import { EffectsPage } from "./pages/Effects";
 import { MediaPage } from "./pages/Media";
 import { PlanPage } from "./pages/Plan";
+import { PublishPage } from "./pages/Publish";
 import { ProjectsPage } from "./pages/Projects";
 import { ScriptPage } from "./pages/Script";
 import { Link, RouterProvider, scriptPath, useRoute } from "./router";
@@ -77,6 +78,7 @@ function Shell() {
             },
             { to: scriptPath(scriptId, "/media"), label: "Media", icon: null },
             { to: scriptPath(scriptId, "/plan"), label: "Plan", icon: null },
+            { to: scriptPath(scriptId, "/publish"), label: "Publish", icon: null },
           ]
         : []),
       { to: "/costs", label: "Costs", icon: null },
@@ -165,6 +167,9 @@ function Shell() {
 
           {route.pattern === "/script/:id/plan" && scriptId !== null && (
             <PlanPage scriptId={scriptId} script={script} plan={plan} />
+          )}
+          {route.pattern === "/script/:id/publish" && scriptId !== null && (
+            <PublishPage scriptId={scriptId} script={script} />
           )}
 
           {route.pattern === "/cast" && (

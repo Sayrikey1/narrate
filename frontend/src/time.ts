@@ -8,3 +8,18 @@ export function formatClock(seconds: number): string {
   const h = Math.floor(whole / 3600);
   return h ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
 }
+
+/** A timecode cell back to seconds, or `null` if it is not one.
+ *
+ *  Two shapes, told apart by how many parts there are rather than by guessing:
+ *  `h:mm:ss` from the plan (which always writes all three), and `m:ss` from a
+ *  chapter stamp (which drops the hour below an hour, because YouTube will not
+ *  accept `00:04:31` where it accepts `4:31`). Shared so a clickable row seeks
+ *  the same way on either page. */
+export function parseStamp(text: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?$/.exec(text.trim());
+  if (!match) return null;
+  const [, first, second, third] = match;
+  if (third === undefined) return Number(first) * 60 + Number(second);
+  return Number(first) * 3600 + Number(second) * 60 + Number(third);
+}

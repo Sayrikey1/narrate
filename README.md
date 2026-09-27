@@ -410,6 +410,7 @@ second, rounded up** — not the 40 credits/second the subscription docs quote.
 | 🛠️ **[docs/INSTALL.md](docs/INSTALL.md)** | Setup for macOS, Linux and Windows; database provisioning; troubleshooting |
 | 📋 **[docs/FEATURES.md](docs/FEATURES.md)** | Everything supported, read from the code — and a plain list of what is not |
 | 🎭 **[docs/VOICES.md](docs/VOICES.md)** | Clones, registering a voice, slot limits, and two versions of one episode |
+| 📦 **[docs/PUBLISHING.md](docs/PUBLISHING.md)** | Chapters, the nine title formulas, the twelve thumbnail compositions, retention targets, and outline-first drafting |
 | 🔬 **[docs/probe-results.md](docs/probe-results.md)** | What live probing settled about billing |
 | 📐 **[docs/PRD.md](docs/PRD.md)** | The original brief, kept for the reasoning behind the design |
 

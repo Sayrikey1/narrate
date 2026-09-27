@@ -6,6 +6,7 @@ import pytest
 
 from narrate.script_parse import (
     format_time,
+    format_youtube_time,
     parse_script,
     parse_time,
     strip_markers,
@@ -461,3 +462,54 @@ def test_comments_do_not_disturb_the_offsets_around_them() -> None:
     assert parsed.text == "The light turned.\n\nThe sea answered."
     assert parsed.text[parsed.slots[0].offset :].startswith("The light turned.")
     assert parsed.text[parsed.slots[1].offset :].startswith("The sea answered.")
+
+
+# --------------------------------------------------------------------------
+# YouTube chapter stamps
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("seconds", "stamp"),
+    [
+        (0, "0:00"),
+        (5, "0:05"),
+        (60, "1:00"),
+        (271, "4:31"),
+        (599, "9:59"),
+        (600, "10:00"),
+        (3599, "59:59"),
+        (3600, "1:00:00"),
+        (3723, "1:02:03"),
+        (7384, "2:03:04"),
+    ],
+)
+def test_a_chapter_stamp_drops_the_hour_field_until_it_is_needed(
+    seconds: float, stamp: str
+) -> None:
+    """`00:04:31` is not accepted as a chapter where `4:31` is."""
+    assert format_youtube_time(seconds) == stamp
+
+
+@pytest.mark.parametrize(("seconds", "stamp"), [(59.6, "0:59"), (59.999, "0:59"), (119.5, "1:59")])
+def test_a_chapter_stamp_truncates_rather_than_rounds(seconds: float, stamp: str) -> None:
+    """`format_time` rounds; this must not.
+
+    Rounding 59.6s up to `1:00` would place it past a chapter that genuinely
+    starts at 60s, and YouTube discards a chapter list whose stamps are not
+    strictly increasing. Losing part of a second is much the cheaper error.
+    """
+    assert format_youtube_time(seconds) == stamp
+
+
+def test_where_the_two_formatters_disagree_is_the_reason_for_the_second_one() -> None:
+    """`format_time` rounds its milliseconds, and that rounding can carry into
+    the next whole second — which for a chapter stamp means claiming 1:00 for a
+    chapter that starts before 60s, and landing on top of the chapter that
+    really does start there."""
+    assert format_time(59.9996) == "00:01:00.000"
+    assert format_youtube_time(59.9996) == "0:59"
+
+
+def test_a_negative_stamp_is_clamped_rather_than_rendered() -> None:
+    assert format_youtube_time(-5) == "0:00"

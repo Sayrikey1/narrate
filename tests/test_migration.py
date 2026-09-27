@@ -113,6 +113,14 @@ def _build_previous_release(path: Path) -> None:
         conn.execute(text("DROP TABLE IF EXISTS cast_member"))
         conn.execute(text("ALTER TABLE chunk DROP COLUMN turns_json"))
         conn.execute(text("ALTER TABLE take DROP COLUMN voices_json"))
+        conn.execute(text("DROP TABLE IF EXISTS script_beat"))
+        conn.execute(text("DROP TABLE IF EXISTS title_candidate"))
+        conn.execute(text("DROP TABLE IF EXISTS thumbnail_brief"))
+        conn.execute(text("ALTER TABLE chunk DROP COLUMN chapter_title"))
+        for column in ("description", "tags", "target_seconds"):
+            conn.execute(text(f"ALTER TABLE script DROP COLUMN {column}"))
+        for column in ("description_boilerplate", "default_tags"):
+            conn.execute(text(f"ALTER TABLE project DROP COLUMN {column}"))
         conn.execute(
             text(
                 "INSERT INTO ledger_entry "

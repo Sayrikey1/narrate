@@ -7,7 +7,7 @@ import { Badge, Empty, Notice, Stat } from "../ui/feedback";
 import { Card, PageHeader, Split } from "../ui/layout";
 import { DataTable } from "../ui/Table";
 import { TabPanel, Tabs } from "../ui/Tabs";
-import { formatClock } from "../time";
+import { formatClock, parseStamp } from "../time";
 import type { Plan, PlanEntry, ScriptSummary } from "../types";
 
 /** The editing plan, as a document you can interrogate.
@@ -107,10 +107,9 @@ function Head({ scriptId, script }: { scriptId: number; script: ScriptSummary | 
  *  first time a column is inserted. */
 function seekTo(cells: string[]): void {
   for (const cell of cells) {
-    const match = /^(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)$/.exec(cell.trim());
-    if (!match) continue;
-    const [, h, m, s] = match;
-    transport.seek(Number(h) * 3600 + Number(m) * 60 + Number(s));
+    const seconds = parseStamp(cell);
+    if (seconds === null) continue;
+    transport.seek(seconds);
     return;
   }
 }

@@ -964,3 +964,43 @@ button.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--acc
   font-size: var(--t-sm);
 }
 .templates .faint { font-size: var(--t-xs); line-height: 1.45; }
+
+/* The publish pack's thumbnail brief and its alternatives.
+ *
+ * `detail` is a two-column description list: a brief is a set of labelled
+ * instructions, and a table would imply the rows are comparable to each other
+ * rather than parts of one thing. */
+.detail {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.35rem 0.9rem;
+  margin: 0;
+}
+
+.detail dt {
+  color: light-dark(#52525b, #a1a1aa);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.detail dd {
+  margin: 0;
+}
+
+.brief-list {
+  list-style: none;
+  margin: 0.9rem 0 0;
+  padding: 0;
+  display: grid;
+  gap: 0.45rem;
+}
+
+.brief-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid light-dark(#e4e4e7, #27272a);
+  font-size: 0.9rem;
+}

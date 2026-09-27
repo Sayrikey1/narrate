@@ -11,9 +11,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine
 
 from narrate.api import create_app
+from narrate.db.models import Script
+from narrate.db.session import session_scope
+from narrate.publish import add_title
 from narrate.settings import Settings
 
-from .conftest import needs_ffmpeg
+from .conftest import needs_ffmpeg, require
 
 SCRIPT = """First paragraph of the episode, which runs for a sentence or two.
 
@@ -112,9 +115,52 @@ def test_plan_endpoint_returns_markdown(client: TestClient, script: dict[str, in
     assert "Running order" in body
 
 
+def test_publish_endpoint_serves_the_document_and_its_data(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    """Both forms, so the page never re-parses the prose it just rendered."""
+    payload = client.get(f"/api/scripts/{script['script_id']}/publish").json()
+    assert payload["markdown"].startswith("# Episode")
+    assert "## Chapters" in payload["markdown"]
+    data = payload["data"]
+    assert "usable" in data["chapters"]
+    assert "good_pct" in data["retention"]
+    assert data["thumbnail"] is None
+
+
+def test_choosing_a_title_over_http_renames_the_script(
+    client: TestClient, engine: Engine, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    with session_scope(engine) as session:
+        first = add_title(session, script_id, "First Title")
+        add_title(session, script_id, "Second Title", accepted=False)
+        first_id = first.id
+
+    body = client.post(f"/api/scripts/{script_id}/titles/{first_id}/accept").json()
+    assert body["text"] == "First Title"
+
+    with session_scope(engine) as session:
+        assert require(session.get(Script, script_id)).title == "First Title"
+
+
+def test_a_title_belonging_to_another_script_is_a_404(
+    client: TestClient, engine: Engine, script: dict[str, int]
+) -> None:
+    """Scoped by script, not just by id — otherwise one episode could rename
+    another."""
+    script_id = script["script_id"]
+    with session_scope(engine) as session:
+        row = add_title(session, script_id, "Only Title")
+        row_id = row.id
+
+    assert client.post(f"/api/scripts/{script_id + 500}/titles/{row_id}/accept").status_code == 404
+
+
 def test_unknown_script_is_a_404(client: TestClient) -> None:
     assert client.get("/api/scripts/999/timeline").status_code == 404
     assert client.get("/api/scripts/999/plan").status_code == 404
+    assert client.get("/api/scripts/999/publish").status_code == 404
 
 
 # -- generation -------------------------------------------------------------
@@ -240,6 +286,9 @@ def test_export_returns_the_timeline_named_files(
 
     payload = client.post(f"/api/scripts/{script_id}/export").json()
     assert payload["plan"] == "plan.md"
+    # The pack ships with every export, beside the plan.
+    assert (Path(payload["out_dir"]) / "publish.md").exists()
+    assert (Path(payload["out_dir"]) / "publish.json").exists()
     assert payload["chunks"] == 3
     for name in payload["names"].values():
         assert (Path(payload["out_dir"]) / name).exists()

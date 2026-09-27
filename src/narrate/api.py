@@ -44,6 +44,8 @@ from narrate.db.models import (
     Project,
     Script,
     Take,
+    ThumbnailBrief,
+    TitleCandidate,
 )
 from narrate.db.session import open_db, session_scope
 from narrate.export import NothingToExport, export_script
@@ -52,6 +54,13 @@ from narrate.money import fmt_usd
 from narrate.plan import gather_context, render_plan, render_timeline_json
 from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
+from narrate.publish import (
+    choose_brief,
+    choose_title,
+    gather_publish,
+    render_publish_json,
+    render_publish_pack,
+)
 from narrate.registry import Registry
 from narrate.settings import Settings, get_settings, resolve_provider
 from narrate.timeline import build_timeline, voices_used
@@ -640,6 +649,46 @@ def create_app(engine: Engine | None = None, settings: Settings | None = None) -
                 "markdown": render_plan(tl, session, None, context),
                 "data": json.loads(render_timeline_json(tl, None, context)),
             }
+
+    @app.get("/api/scripts/{script_id}/publish")
+    def script_publish(script_id: int) -> dict[str, Any]:
+        """The publish pack, as the document *and* as data.
+
+        Same pairing as the plan, and for the same reason: the page renders the
+        markdown somebody reads, and answers questions about it — which chapter
+        rules are broken, how long a viewer has to stay — from the JSON twin
+        rather than by parsing the prose back apart.
+        """
+        with session_scope(db) as session:
+            _script(session, script_id)
+            tl = build_timeline(session, script_id, gap_seconds=config.gap_seconds)
+            context = gather_publish(session, script_id)
+            return {
+                "markdown": render_publish_pack(tl, context),
+                "data": json.loads(render_publish_json(tl, context)),
+            }
+
+    @app.post("/api/scripts/{script_id}/titles/{candidate_id}/accept")
+    def accept_title(script_id: int, candidate_id: int) -> dict[str, Any]:
+        """Choose a title. Writes through to the script, unchooses the rest."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            row = session.get(TitleCandidate, candidate_id)
+            if row is None or row.script_id != script_id:
+                raise HTTPException(status_code=404, detail=f"No title candidate {candidate_id}.")
+            choose_title(session, row)
+            return {"id": row.id, "text": row.text, "accepted": True}
+
+    @app.post("/api/scripts/{script_id}/briefs/{brief_id}/choose")
+    def choose_thumbnail(script_id: int, brief_id: int) -> dict[str, Any]:
+        """Choose which thumbnail brief this episode ships."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            row = session.get(ThumbnailBrief, brief_id)
+            if row is None or row.script_id != script_id:
+                raise HTTPException(status_code=404, detail=f"No thumbnail brief {brief_id}.")
+            choose_brief(session, row)
+            return {"id": row.id, "archetype": row.archetype, "accepted": True}
 
     @app.get("/api/scripts/{script_id}/variants")
     def script_variants(script_id: int) -> list[dict[str, Any]]:

@@ -48,12 +48,26 @@ MAX_EFFECT_SECONDS = 30.0
 
 _MARKER_RE = re.compile(
     r"\[[ \t]*(?:"
+    # An anchor may carry a name: `[@ 03:00 The Employee Trap]`. Naming one
+    # makes it a chapter as well as a target, which is worth having because a
+    # writer who marks where a section begins has already done the work.
     r"@[ \t]*(?P<time>\d{1,2}:\d{2}(?::\d{2})?(?:\.\d{1,3})?)"
+    r"(?:[ \t]+(?P<label>[^\]]+?))?"
     r"|(?:SFX|FX)[ \t]*:[ \t]*(?P<sfx>[^\]]+?)"
     r"|(?:VOICE|SPEAKER)[ \t]*:[ \t]*(?P<voice>[^\]]+?)"
+    r"|(?:CHAPTER|CH)[ \t]*:[ \t]*(?P<chapter>[^\]]+?)"
     r")[ \t]*\]",
     re.IGNORECASE,
 )
+
+# A chapter name is a label in a list, not a sentence. Long enough for a real
+# heading, short enough that a paragraph pasted by mistake is obviously wrong.
+MAX_CHAPTER_TITLE = 100
+
+# Which heading levels become chapters. `#` is the episode's own title — a
+# chapter named after the episode is noise — and `####` and deeper are
+# sub-notes, where a forty-entry chapter list is worse than none.
+CHAPTER_HEADING_LEVELS = (2, 3)
 
 # `[CAST] Ada = voice_id · Bo = other_id`, or one pair per line beneath it.
 # Consumed before the marker pass so the names are known when the speaker
@@ -103,6 +117,43 @@ _ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>~|])")
 _STASH_RE = re.compile(r"\x00(\d+)\x00")
 
 
+def _promote_heading(words: str, level: int) -> tuple[str, str]:
+    """What a heading line becomes: a marker, a chapter, or nothing.
+
+    Three cases, ordered by how literally the writer asked for something.
+
+    * **A bracketed body** — `## [CHUNK 2]`, `## [SFX: rain]`, `## [@ 02:15]` —
+      is emitted verbatim, because the brackets are a marker the writer wrote and
+      the heading round them is presentation. This is also a bug fix: the
+      `## [CHUNK n]` form is documented in `PRD §F1` and advertised by the
+      chunker, but it was swallowed here as a heading and never reached the
+      chunker at all, so it silently did nothing.
+    * **A plain heading at a chapter level** becomes a `[CHAPTER: ...]` marker,
+      so the pass that follows records its position using machinery that already
+      works — rather than carrying an offset through four passes that each delete
+      text out from under it.
+    * **Anything else** is dropped and reported, as every heading used to be.
+
+    A body containing `]` is never promoted: it would truncate the marker and
+    silently rename the chapter. Rewriting a writer's words to fit a regex is the
+    one thing this module refuses to do anywhere else, and it will not start
+    here.
+    """
+    if not words:
+        return "", "empty"
+    if words.startswith("[") and words.endswith("]") and "]" not in words[1:-1]:
+        return words, "marker"
+    if level in CHAPTER_HEADING_LEVELS and "]" not in words:
+        return f"[CHAPTER: {words[:MAX_CHAPTER_TITLE]}]", "chapter"
+    return "", "dropped"
+
+
+def _name_some(titles: list[str], limit: int = 3) -> str:
+    shown = ", ".join(f"{t!r}" for t in titles[:limit])
+    more = f" and {len(titles) - limit} more" if len(titles) > limit else ""
+    return f"{shown}{more}"
+
+
 def strip_formatting(text: str) -> tuple[str, list[str]]:
     """Remove Markdown syntax, returning the prose and what was dropped.
 
@@ -113,7 +164,8 @@ def strip_formatting(text: str) -> tuple[str, list[str]]:
     dropped is named in a warning, so nothing disappears quietly.
     """
     notes: list[str] = []
-    headings: list[str] = []
+    dropped: list[str] = []
+    promoted: list[str] = []
 
     # Comments go first, before anything else looks at the text. A script
     # written from the downloadable template is mostly guidance in comments,
@@ -139,9 +191,12 @@ def strip_formatting(text: str) -> tuple[str, list[str]]:
         heading = _HEADING_RE.match(line)
         if heading:
             words = _inline(heading.group(2)).strip()
-            if words:
-                headings.append(words)
-            out.append("")
+            emitted, outcome = _promote_heading(words, len(heading.group(1)))
+            if outcome == "chapter":
+                promoted.append(words)
+            elif outcome == "dropped":
+                dropped.append(words)
+            out.append(emitted)
             continue
 
         if _RULE_RE.match(line) or (_SETEXT_RE.match(line) and out and out[-1].strip()):
@@ -152,12 +207,17 @@ def strip_formatting(text: str) -> tuple[str, list[str]]:
         line = _BULLET_RE.sub(r"\1", line)
         out.append(_inline(line))
 
-    if headings:
-        shown = ", ".join(f"{h!r}" for h in headings[:3])
-        more = f" and {len(headings) - 3} more" if len(headings) > 3 else ""
+    if promoted:
         notes.append(
-            f"Dropped {len(headings)} Markdown heading(s) from the narration "
-            f"({shown}{more}) — a heading is a label, not something to read aloud."
+            f"{len(promoted)} heading(s) became chapter markers "
+            f"({_name_some(promoted)}) — named in the publish pack, still not narrated."
+        )
+    if dropped:
+        levels = "-".join(str(n) for n in CHAPTER_HEADING_LEVELS)
+        notes.append(
+            f"Dropped {len(dropped)} Markdown heading(s) from the narration "
+            f"({_name_some(dropped)}) — a heading is a label, not something to read "
+            f"aloud. Use a level {levels} heading to make one a chapter instead."
         )
 
     clean = "\n".join(out)
@@ -216,10 +276,31 @@ def _inline(line: str) -> str:
 
 @dataclass(frozen=True)
 class Anchor:
-    """A `[@ MM:SS]` target start time for whatever follows it."""
+    """A `[@ MM:SS]` target start time for whatever follows it.
+
+    `label` is the optional name in `[@ 03:00 The Employee Trap]`. An anchor and
+    a chapter mark the same thing from two directions — where a section begins —
+    so naming an anchor produces a chapter too, rather than asking for the
+    position to be written twice.
+    """
 
     offset: int
     target_s: float
+    raw: str
+    label: str = ""
+
+
+@dataclass(frozen=True)
+class ParsedChapter:
+    """A named division of the episode, for a YouTube chapter list.
+
+    Sibling to `ParsedSlot`: an offset plus what belongs there. The *time* is
+    deliberately absent — a chapter's timestamp is whatever the audio turns out
+    to be, read off the measured timeline, never what the script hoped for.
+    """
+
+    offset: int
+    title: str
     raw: str
 
 
@@ -266,6 +347,7 @@ class ParsedScript:
     anchors: list[Anchor] = field(default_factory=list)
     slots: list[ParsedSlot] = field(default_factory=list)
     turns: list[SpeakerTurn] = field(default_factory=list)
+    chapters: list[ParsedChapter] = field(default_factory=list)
     # Names declared by a `[CAST]` block, mapped to voice ids.
     cast: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
@@ -281,14 +363,19 @@ class ParsedScript:
         Speaker changes join them for the same reason turned inside out: a turn
         that shares a chunk with the previous speaker cannot be given its own
         voice, because a chunk is one request with one voice.
+
+        A chapter joins them for the third version of the same reason: a
+        chapter's timestamp is the start of its first chunk, and a chapter
+        beginning mid-chunk could only be timed by interpolating within a take.
         """
         marks = {s.offset for s in self.slots}
         marks |= {t.offset for t in self.turns}
+        marks |= {c.offset for c in self.chapters}
         return sorted(o for o in marks if 0 < o < len(self.text))
 
     @property
     def has_markers(self) -> bool:
-        return bool(self.anchors or self.slots or self.turns)
+        return bool(self.anchors or self.slots or self.turns or self.chapters)
 
     @property
     def speakers(self) -> list[str]:
@@ -337,6 +424,28 @@ def format_time(seconds: float) -> str:
         whole += 1
         millis = 0
     return f"{whole // 3600:02d}:{whole % 3600 // 60:02d}:{whole % 60:02d}.{millis:03d}"
+
+
+def format_youtube_time(seconds: float) -> str:
+    """Seconds as a YouTube chapter stamp: `0:00`, `4:31`, `1:02:03`.
+
+    Three differences from `format_time`, each one required rather than
+    cosmetic. No milliseconds, because a chapter line is parsed as whole
+    seconds. No hour field under an hour, and no zero-padding on the leading
+    unit, because `00:04:31` is not accepted where `4:31` is.
+
+    And it **truncates** where `format_time` rounds. A chapter at 59.6s must
+    render `0:59`: rounding it to `1:00` would move it past a chapter that
+    genuinely starts at 60s, and YouTube discards a chapter list whose stamps
+    are not strictly increasing. Losing up to a second of precision is the
+    cheaper error by far.
+    """
+    whole = max(0, int(seconds))
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def _parse_sfx_body(body: str) -> tuple[str, float | None, bool]:
@@ -524,6 +633,7 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
     """
     anchors: list[Anchor] = []
     slots: list[ParsedSlot] = []
+    chapters: list[ParsedChapter] = []
 
     # Formatting first: marker offsets are recorded against the cleaned text
     # and handed to the chunker, so they have to be measured against the same
@@ -571,7 +681,23 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
 
         if match.group("time") is not None:
             raw = match.group("time")
-            anchors.append(Anchor(offset=offset, target_s=parse_time(raw), raw=match.group(0)))
+            label = (match.group("label") or "").strip()[:MAX_CHAPTER_TITLE]
+            anchors.append(
+                Anchor(offset=offset, target_s=parse_time(raw), raw=match.group(0), label=label)
+            )
+            # A named anchor marks a section start twice over — a time to aim at
+            # and a name for it — so it yields a chapter without the position
+            # having to be written again as a separate marker.
+            if label:
+                chapters.append(ParsedChapter(offset=offset, title=label, raw=match.group(0)))
+            continue
+
+        if match.group("chapter") is not None:
+            title = match.group("chapter").strip()[:MAX_CHAPTER_TITLE]
+            if not title:
+                warnings.append(f"Ignored a chapter marker with no title: {match.group(0)!r}")
+                continue
+            chapters.append(ParsedChapter(offset=offset, title=title, raw=match.group(0)))
             continue
 
         if match.group("voice") is not None:
@@ -639,6 +765,7 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
         anchors = [replace(a, offset=_shift(a.offset, blank_cuts)) for a in anchors]
         slots = [replace(s, offset=_shift(s.offset, blank_cuts)) for s in slots]
         turns = [replace(t, offset=_shift(t.offset, blank_cuts)) for t in turns]
+        chapters = [replace(c, offset=_shift(c.offset, blank_cuts)) for c in chapters]
 
     # Speaker prefixes come *after* the markers, deliberately. Both passes
     # delete text, and offsets recorded by one are meaningless to the other
@@ -651,6 +778,7 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
         anchors = [replace(a, offset=_shift(a.offset, cuts)) for a in anchors]
         slots = [replace(s, offset=_shift(s.offset, cuts)) for s in slots]
         turns = [replace(t, offset=_shift(t.offset, cuts)) for t in turns]
+        chapters = [replace(c, offset=_shift(c.offset, cuts)) for c in chapters]
     turns += prefix_turns
 
     lead = len(clean) - len(clean.lstrip())
@@ -659,6 +787,7 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
         anchors = [replace(a, offset=max(0, a.offset - lead)) for a in anchors]
         slots = [replace(s, offset=max(0, s.offset - lead)) for s in slots]
         turns = [replace(t, offset=max(0, t.offset - lead)) for t in turns]
+        chapters = [replace(c, offset=max(0, c.offset - lead)) for c in chapters]
 
     # A `[VOICE:]` marker and a `Name:` prefix are found by different passes,
     # so the combined list is only in document order once both have run.
@@ -669,6 +798,7 @@ def parse_script(text: str, cast: dict[str, str] | None = None) -> ParsedScript:
         anchors=anchors,
         slots=slots,
         turns=turns,
+        chapters=chapters,
         cast=roster,
         warnings=warnings,
     )

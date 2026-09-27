@@ -33,6 +33,7 @@ from narrate.audio import AudioFormat, concat, encode, make_silence, parse_forma
 from narrate.db.models import Chunk, Cut, Export, Take
 from narrate.db.session import session_scope
 from narrate.plan import PlanContext, gather_context, render_plan, render_timeline_json
+from narrate.publish import gather_publish, render_publish_json, render_publish_pack
 from narrate.settings import Settings
 from narrate.timeline import (
     EFFECT,
@@ -55,6 +56,7 @@ class ExportResult:
     mp3: Path | None
     plan: Path
     timeline_json: Path
+    publish_pack: Path
     out_dir: Path
     duration_s: float
     chunks: int
@@ -265,9 +267,16 @@ def export_script(
 
     plan_path = target / "plan.md"
     json_path = target / "timeline.json"
+    pack_path = target / "publish.md"
+    pack_json_path = target / "publish.json"
     with session_scope(engine) as session:
         plan_path.write_text(render_plan(timeline, session, names, context), encoding="utf-8")
+        # Written here rather than on demand because the chapter timestamps are
+        # only correct once the audio they describe exists — which is now.
+        pack = gather_publish(session, script_id)
     json_path.write_text(render_timeline_json(timeline, names, context), encoding="utf-8")
+    pack_path.write_text(render_publish_pack(timeline, pack), encoding="utf-8")
+    pack_json_path.write_text(render_publish_json(timeline, pack), encoding="utf-8")
 
     fingerprint = cut_fingerprint([t for t in take_ids])
 
@@ -290,6 +299,7 @@ def export_script(
         mp3=mp3_path,
         plan=plan_path,
         timeline_json=json_path,
+        publish_pack=pack_path,
         out_dir=target,
         duration_s=result.duration_s,
         chunks=len(sources),
@@ -317,6 +327,29 @@ def write_plan_only(
     path = out or (settings.assets_dir / "exports" / f"script-{script_id}" / "plan.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
+    return path
+
+
+def write_publish_pack_only(
+    engine: Engine, script_id: int, settings: Settings, out: Path | None = None
+) -> Path:
+    """Write `publish.md` without exporting audio.
+
+    Mirrors `write_plan_only`, including the caveat it does not have: the chapter
+    timestamps come from measured take durations, so a pack written before
+    everything is generated says so in the document rather than being refused.
+    Somebody planning an upload wants to see the shape of it early.
+    """
+    with session_scope(engine) as session:
+        timeline = build_timeline(session, script_id, gap_seconds=settings.gap_seconds)
+        context = gather_publish(session, script_id)
+        body = render_publish_pack(timeline, context)
+        data = render_publish_json(timeline, context)
+
+    path = out or (settings.assets_dir / "exports" / f"script-{script_id}" / "publish.md")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body, encoding="utf-8")
+    path.with_suffix(".json").write_text(data, encoding="utf-8")
     return path
 
 

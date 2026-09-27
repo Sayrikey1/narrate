@@ -85,6 +85,7 @@ class IngestResult:
     # True when the chunks were packed as dialogue groups rather than one
     # chunk per turn.
     dialogue: bool = False
+    chapters_named: int = 0
 
 
 def ingest_script(
@@ -204,6 +205,7 @@ def ingest_script(
 
     result.turns_assigned = assigned
     _attach_anchors(session, script.id, parsed, offsets)
+    result.chapters_named = _attach_chapters(session, script.id, parsed, offsets, result.warnings)
     result.slots_created = len(sync_slots_from_script(session, script.id, parsed, offsets))
     return result
 
@@ -373,3 +375,45 @@ def _attach_anchors(
         row = rows.get(ordinal)
         if row is not None and row.target_start_s is None:
             row.target_start_s = anchor.target_s
+
+
+def _attach_chapters(
+    session: Session,
+    script_id: int,
+    parsed: ParsedScript,
+    offsets: dict[int, int],
+    warnings: list[str],
+) -> int:
+    """Name the chunk each chapter begins, and say so when two collide.
+
+    Nearest start, exactly as `_attach_anchors` matches: a chapter offset is a
+    forced boundary, so it normally *is* a chunk start, but the chunker snaps to
+    the nearest sentence and a subdivided segment can move it a little.
+
+    Two chapters landing on one chunk is reported rather than silently resolved.
+    They would share a timestamp, and YouTube discards a chapter list whose
+    stamps are not strictly increasing — so the writer needs to know that one of
+    them will not appear, and which.
+    """
+    if not parsed.chapters or not offsets:
+        return 0
+    rows = {
+        c.ordinal: c
+        for c in session.scalars(select(Chunk).where(Chunk.script_id == script_id)).all()
+    }
+    named = 0
+    for chapter in parsed.chapters:
+        ordinal = min(offsets.items(), key=lambda pair: (abs(pair[1] - chapter.offset), pair[0]))[0]
+        row = rows.get(ordinal)
+        if row is None:
+            continue
+        if row.chapter_title is not None:
+            warnings.append(
+                f"Chapter {chapter.title!r} lands on the same chunk as "
+                f"{row.chapter_title!r}, so only the first will appear. Move one, or "
+                "add words between them."
+            )
+            continue
+        row.chapter_title = chapter.title
+        named += 1
+    return named

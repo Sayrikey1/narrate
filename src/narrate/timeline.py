@@ -52,6 +52,11 @@ class TimelineEntry:
     target_s: float | None = None
     generated: bool = True
 
+    # The chapter this entry begins, if it begins one. Carried here so a chapter
+    # list is a read of the timeline rather than a second query — the timestamp
+    # a chapter needs is `start_s`, which only exists here.
+    chapter_title: str | None = None
+
     @property
     def duration_s(self) -> float:
         return max(0.0, self.end_s - self.start_s)
@@ -97,6 +102,16 @@ class Timeline:
     @property
     def planned(self) -> list[TimelineEntry]:
         return [e for e in self.entries if e.kind == PLANNED]
+
+    @property
+    def chapter_starts(self) -> list[TimelineEntry]:
+        """Narration entries that begin a named chapter, in order.
+
+        Narration only, deliberately. An effect slot at chunk 1 also starts at
+        0.0, so iterating every entry would offer two things at `0:00` and a
+        chapter list with a repeated timestamp is discarded whole.
+        """
+        return [e for e in self.narration if e.chapter_title]
 
     @property
     def drifts(self) -> list[TimelineEntry]:
@@ -245,6 +260,7 @@ def build_timeline(
                 source_path=Path(take.asset_path) if take and take.asset_path else None,
                 target_s=chunk.target_start_s,
                 generated=bool(take and take.asset_path and take.duration_s),
+                chapter_title=chunk.chapter_title,
             )
         )
         index += 1

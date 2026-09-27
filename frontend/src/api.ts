@@ -4,12 +4,13 @@ import type {
   ChunkRow,
   Cost,
   ExportResult,
+  GenerateStarted,
   Model,
   Plan,
   Project,
   ProjectDetail,
   ProjectMedia,
-  GenerateStarted,
+  Publish,
   ScriptCreated,
   ScriptSummary,
   ScriptTemplate,
@@ -119,6 +120,17 @@ export const api = {
   chunks: (id: number) => request<ChunkRow[]>(`/api/scripts/${id}/chunks`),
   timeline: (id: number) => request<Timeline>(`/api/scripts/${id}/timeline`),
   plan: (id: number) => request<Plan>(`/api/scripts/${id}/plan`),
+  publish: (id: number) => request<Publish>(`/api/scripts/${id}/publish`),
+  acceptTitle: (scriptId: number, candidateId: number) =>
+    request<{ id: number; text: string }>(
+      `/api/scripts/${scriptId}/titles/${candidateId}/accept`,
+      { method: "POST" },
+    ),
+  chooseBrief: (scriptId: number, briefId: number) =>
+    request<{ id: number; archetype: string }>(
+      `/api/scripts/${scriptId}/briefs/${briefId}/choose`,
+      { method: "POST" },
+    ),
   cost: (id: number) => request<Cost>(`/api/scripts/${id}/cost`),
   variants: (id: number) => request<Variant[]>(`/api/scripts/${id}/variants`),
 

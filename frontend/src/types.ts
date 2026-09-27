@@ -316,3 +316,81 @@ export interface GenerateStarted {
     effect_seconds: number;
   };
 }
+
+/** The publish pack: the upload side of what `plan.md` is for the edit. */
+export interface Publish {
+  markdown: string;
+  data: PublishData;
+}
+
+export interface PublishData {
+  script_id: number;
+  script_title: string;
+  project: string;
+  runtime_s: number;
+  complete: boolean;
+  title: PublishTitle;
+  description: string;
+  boilerplate: string;
+  tags: string[];
+  chapters: PublishChapters;
+  thumbnail: ThumbnailBrief | null;
+  briefs: BriefSummary[];
+  retention: Retention;
+}
+
+export interface PublishTitle {
+  chosen: string;
+  over_length: boolean;
+  candidates: TitleCandidate[];
+}
+
+export interface TitleCandidate {
+  id: number;
+  text: string;
+  formula: string;
+  rationale: string;
+  accepted: boolean;
+  proposed: boolean;
+  over_length: boolean;
+}
+
+export interface PublishChapters {
+  usable: boolean;
+  problems: string[];
+  text: string;
+  entries: ChapterEntry[];
+}
+
+export interface ChapterEntry {
+  stamp: string;
+  start_s: number;
+  title: string;
+  chunk_ordinal: number | null;
+}
+
+export interface ThumbnailBrief {
+  id: number;
+  archetype: string;
+  overlay_text: string;
+  word_count: number;
+  subject: string;
+  contrast: string;
+  rationale: string;
+  principles: string;
+}
+
+export interface BriefSummary {
+  id: number;
+  archetype: string;
+  overlay_text: string;
+  accepted: boolean;
+}
+
+export interface Retention {
+  good_pct: number;
+  great_pct: number;
+  good_hold_s: number;
+  great_hold_s: number;
+  extrapolated: boolean;
+}

@@ -45,6 +45,13 @@ class Project(Base):
     # Prepended to every chunk (F4). Billable characters — the estimate counts them.
     prefix_tags: Mapped[str] = mapped_column(Text, default="")
 
+    # Channel-level packaging, merged into every episode's description and tags.
+    # Standing outro links and a subniche's recurring tags belong to the channel,
+    # not to one video, and regenerating them per episode would pay an LLM to
+    # retype what never changes.
+    description_boilerplate: Mapped[str] = mapped_column(Text, default="")
+    default_tags: Mapped[str] = mapped_column(Text, default="")
+
     monthly_cap_micros: Mapped[int | None] = mapped_column(Integer, default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
@@ -67,6 +74,19 @@ class Script(Base):
 
     model_id: Mapped[str | None] = mapped_column(String(64), default=None)
     voice_id: Mapped[str | None] = mapped_column(String(64), default=None)
+
+    # What gets pasted under the video. Columns rather than a table: there is one
+    # of each per episode, neither causes any spend, and `Project.prefix_tags`
+    # already establishes that a per-row config string lives on the row.
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags: Mapped[str] = mapped_column(Text, default="")
+
+    # The length this episode was written for, if it was written for one. The
+    # retention targets fall as a video gets longer, so they can be reported
+    # before any audio exists — but only against an intention, and only if the
+    # intention is recorded somewhere.
+    target_seconds: Mapped[float | None] = mapped_column(default=None)
+
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
     project: Mapped[Project] = relationship(back_populates="scripts")
@@ -98,6 +118,14 @@ class Chunk(Base):
     # A target, never enforced — TTS duration cannot be dialled to a mark, so
     # the plan reports drift instead of pretending to hit it.
     target_start_s: Mapped[float | None] = mapped_column(default=None)
+
+    # The name of the chapter this chunk begins, from a `##` heading, a
+    # `[CHAPTER: ...]` marker, or a named `[@ MM:SS]` anchor.
+    #
+    # Only the *name* is stored. The timestamp a chapter list needs is read off
+    # the timeline, which sums measured take durations — so it says where the
+    # chapter actually is rather than where the script hoped it would be.
+    chapter_title: Mapped[str | None] = mapped_column(String(120), default=None)
 
     # Per-chunk overrides (F4: "some sections want different direction").
     prefix_tags: Mapped[str | None] = mapped_column(Text, default=None)
@@ -246,8 +274,12 @@ class LedgerEntry(Base):
     take_id: Mapped[int | None] = mapped_column(Integer, default=None)
     run_id: Mapped[int | None] = mapped_column(Integer, default=None)
 
-    # generation | effect | suggestion | probe | correction |
+    # generation | effect | suggestion | copy | probe | correction |
     # reconciliation_adjustment
+    #
+    # `copy` is LLM work on the packaging — titles, description, tags, thumbnail
+    # briefs. Like `suggestion` it is Groq tokens, so it counts toward the
+    # monthly cap but stays out of both the waste ratio and reconciliation.
     kind: Mapped[str] = mapped_column(String(32), default="generation")
 
     # Which service was billed. Without this, Groq tokens would pool with
@@ -469,5 +501,131 @@ class EffectSlot(Base):
     effect_id: Mapped[int | None] = mapped_column(
         ForeignKey("effect.id", ondelete="SET NULL"), default=None
     )
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class TitleCandidate(Base):
+    """One possible title for an episode, and which formula it came from.
+
+    Shaped after `Take` and `Cut`: many candidates, one chosen. The difference is
+    that the chosen one needs no table, because `Script.title` already is one —
+    accepting a candidate writes through to it, and the rows stay as a record of
+    what was considered and why.
+    """
+
+    __tablename__ = "title_candidate"
+    __table_args__ = (
+        UniqueConstraint("script_id", "text", name="uq_title_candidate_text"),
+        Index("ix_title_candidate_script", "script_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    script_id: Mapped[int] = mapped_column(ForeignKey("script.id", ondelete="CASCADE"))
+    ordinal: Mapped[int] = mapped_column(Integer, default=1)
+
+    text: Mapped[str] = mapped_column(String(200))
+
+    # Which of the published title formulas this is an instance of, or "" for one
+    # written by hand. Recorded so a channel can see it has published nine
+    # superlatives in a row.
+    formula: Mapped[str] = mapped_column(String(32), default="")
+    rationale: Mapped[str] = mapped_column(Text, default="")
+
+    # manual | proposed
+    #
+    # The same pair `EffectSlot` carries, and for the same reason: `accepted`
+    # defaults to True so a title written by hand is chosen by construction, and
+    # the LLM path has to pass False explicitly to stay out of the way.
+    source: Mapped[str] = mapped_column(String(16), default="manual")
+    accepted: Mapped[bool] = mapped_column(default=True)
+
+    model_id: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class ThumbnailBrief(Base):
+    """What the thumbnail should show, as an instruction rather than an image.
+
+    No image is generated. This is the brief a designer or an image model works
+    from, which is also exactly the payload an image provider would need if one
+    were ever added — so the expensive half can be deferred without the cheap
+    half being wasted.
+
+    Unlike a title there is no existing column that means "the chosen one", so
+    `accepted` carries the choice here. It still defaults to True, matching
+    `EffectSlot` and `TitleCandidate` — a brief written by hand is the one you
+    want, and the LLM path passes False explicitly. Choosing one clears its
+    siblings, so "accepted" means "the brief this episode ships" rather than
+    "a brief somebody approved of".
+    """
+
+    __tablename__ = "thumbnail_brief"
+    __table_args__ = (Index("ix_thumbnail_brief_script", "script_id"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    script_id: Mapped[int] = mapped_column(ForeignKey("script.id", ondelete="CASCADE"))
+    ordinal: Mapped[int] = mapped_column(Integer, default=1)
+
+    # One of the published composition archetypes — "Face First", "Two-panel".
+    archetype: Mapped[str] = mapped_column(String(32), default="")
+
+    # The words on the image, at most five of them. Short enough to read at
+    # thumbnail size is the whole constraint; the column is sized to make
+    # anything longer obviously wrong.
+    overlay_text: Mapped[str] = mapped_column(String(64), default="")
+
+    subject: Mapped[str] = mapped_column(Text, default="")
+    contrast: Mapped[str] = mapped_column(Text, default="")
+    rationale: Mapped[str] = mapped_column(Text, default="")
+
+    # Which of the published psychology principles it leans on, comma-separated.
+    principles: Mapped[str] = mapped_column(Text, default="")
+
+    source: Mapped[str] = mapped_column(String(16), default="manual")
+    accepted: Mapped[bool] = mapped_column(default=True)
+
+    model_id: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class ScriptBeat(Base):
+    """One section of a script: what it has to do, how long it has, and the prose.
+
+    The beat sheet is the script's *source*, not a note about it. `write sync`
+    renders these rows into `Script.source_text` and re-chunks, so the existing
+    pipeline — parse, chunk, estimate, generate, export — needs no knowledge of
+    beats at all.
+
+    Two things fall out of that. The heading becomes a `## Heading` in the
+    rendered script, which the parser already turns into a chapter, so outlining
+    and chaptering are one feature rather than two. And `intent` is rendered as
+    an HTML comment, which `strip_formatting` already removes before anything is
+    billed — so the writer's notes travel with the script and are never narrated.
+    """
+
+    __tablename__ = "script_beat"
+    __table_args__ = (
+        UniqueConstraint("script_id", "ordinal", name="uq_beat_order"),
+        Index("ix_script_beat_script", "script_id"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    script_id: Mapped[int] = mapped_column(ForeignKey("script.id", ondelete="CASCADE"))
+    ordinal: Mapped[int] = mapped_column(Integer)
+
+    heading: Mapped[str] = mapped_column(String(120))
+    intent: Mapped[str] = mapped_column(Text, default="")
+    target_seconds: Mapped[float] = mapped_column(default=0.0)
+
+    # The prose. Empty until the beat is expanded, which is what makes the
+    # outline reviewable before any of it is paid for.
+    body: Mapped[str] = mapped_column(Text, default="")
+
+    # outline | manual
+    source: Mapped[str] = mapped_column(String(16), default="outline")
+    accepted: Mapped[bool] = mapped_column(default=True)
+
+    model_id: Mapped[str] = mapped_column(String(64), default="")
     note: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)

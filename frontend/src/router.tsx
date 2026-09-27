@@ -24,6 +24,7 @@ const PATTERNS = [
   "/script/:id/effects",
   "/script/:id/media",
   "/script/:id/plan",
+  "/script/:id/publish",
   "/costs",
 ] as const;
 

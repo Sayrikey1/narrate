@@ -21,6 +21,8 @@ running total.
 | Chunk review | Per-chunk character count and cost **before** generating |
 | Manual control | `chunk merge`, `chunk split`, `chunk rechunk`, and per-chunk overrides of voice, model, delivery and tags |
 | One ingestion path | The CLI, the API and the tests all call `ingest_script`. Two paths that diverged would mean markers stripped on one and spoken — and billed — on the other |
+| Chapter names | A `## Heading`, a `[CHAPTER: ...]` marker, or a named anchor `[@ 03:00 The Employee Trap]` — all three become a YouTube chapter and a forced chunk boundary |
+| `## [CHUNK n]` | A bracketed heading body now passes through to the chunker. It is documented in `PRD §F1` and was silently swallowed as a heading, so the marker never arrived |
 
 ### Markers stripped before anything is billed
 
@@ -243,6 +245,7 @@ fetching and decoding every take up front — tens of megabytes before a
 | Formats | `wav`, `mp3`, `m4a` (AAC in MP4, what an NLE imports), `flac`, `opus` |
 | Timeline-named pieces | `Project_HH-MM-SS-mmm_HH-MM-SS-mmm.mp3`, applied at export so a re-roll never renames something already delivered |
 | Zip per export | One download for the whole delivery |
+| Publish pack | Every export also ships `publish.md` and `publish.json` — the upload side of the same facts |
 
 ### The editing plan
 
@@ -261,6 +264,28 @@ Every export ships `plan.md` — the document that guides the edit.
 Markdown is parsed by `marked` and **always** passed through DOMPurify. A script
 can arrive from anywhere, so `<img src=x onerror=…>` in a `.md` is a real input.
 
+### The publish pack
+
+`plan.md` guides the edit. `publish.md` guides the upload — `narrate publish
+write`, or automatically on every export.
+
+| Feature | Detail |
+| --- | --- |
+| YouTube chapters | Paste-ready, with times **measured off the audio**, never taken from the script's `[@ MM:SS]` targets |
+| Chapter rules checked | First at `0:00`, at least three, at least 10s apart — all reported together, because YouTube rejects the list whole |
+| Title candidates | Grouped by which of the nine published formulas they use, flagged when over 60 characters |
+| Assembled description | The episode's own words, the chapter block, then the channel's standing text |
+| Tags | Episode tags then the channel's defaults, without repeats |
+| Thumbnail brief | Composition, at most five words of overlay text, subject, contrast and why it earns the click |
+| Retention target | What this runtime should hold, and the absolute watch time that implies |
+| Data twin | `publish.json`, so the UI never re-parses the prose |
+| No key needed | Chapters and retention cost nothing. The written fields say which command fills them |
+
+On a real 21-minute episode the script's own anchors were up to **224 seconds**
+out by the end, which is why the timestamps come from measured take durations and
+not from the writer's intent. Full reference in
+**[PUBLISHING.md](PUBLISHING.md)**.
+
 ---
 
 ## 8. Cost accounting
@@ -271,7 +296,8 @@ The differentiating requirement, not a reporting afterthought.
 | --- | --- |
 | Append-only ledger | Enforced by SQLite `RAISE(ABORT)` triggers, not by convention — a rule that lives only in a code review is not a rule |
 | Integer micro-USD | Never floats. A ledger summing thousands of sub-cent amounts cannot afford binary drift |
-| Per operation | Every generation, effect, suggestion and probe, with its rate, request id and unit kind |
+| Per operation | Every generation, effect, suggestion, copywriting call and probe, with its rate, request id and unit kind |
+| LLM spend is separated | `kind="copy"` is `provider=groq` / `unit_kind=tokens`, so it counts toward the monthly cap, stays **out** of the re-roll waste ratio (which measures speech only), and is excluded from reconciliation against a character count — no migration needed, because the ledger has recorded units and their kind since the second revision |
 | Provider's own figure | `character-cost` from the response header, not `len(text)` — 12 submitted characters billed as 3 |
 | Self-calibrating estimates | A `billing_ratio` learned from observed headers |
 | Rate card versioning | Historical takes retain the rate in force when generated |
@@ -307,16 +333,16 @@ builds the WAL index and creates files.
 
 ## 10. Surfaces
 
-**CLI** — 49 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
-`effects`, `cost`, `db`, plus `doctor`, `models`, `voices`, `estimate`,
-`generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`, `serve`
-and `probe`.
+**CLI** — 65 commands across `project`, `script`, `chunk`, `cast`, `cut`, `voice`,
+`effects`, `cost`, `db`, `publish`, `write`, plus `doctor`, `models`, `voices`,
+`estimate`, `generate`, `takes`, `export`, `formats`, `media`, `timeline`, `plan`,
+`retention`, `serve` and `probe`.
 
-**HTTP** — 39 endpoints. Deliberately thin: every one calls the same functions
+**HTTP** — 40 endpoints. Deliberately thin: every one calls the same functions
 the CLI does. Two entry points that disagreed about what a re-roll costs would
 be worse than having one.
 
-**Web** — 7 pages, all real URLs that survive a reload:
+**Web** — 8 pages, all real URLs that survive a reload:
 
 | Path | Page |
 | --- | --- |
@@ -326,6 +352,7 @@ be worse than having one.
 | `/script/:id/effects` | cue slots, the library, suggestions |
 | `/script/:id/media` | every artifact, with playback, reading and download |
 | `/script/:id/plan` | the editing plan, as a document and as analysis |
+| `/script/:id/publish` | chapters, title candidates, the thumbnail brief, the retention target |
 | `/costs` | spend across every project |
 
 Dark and light, following the OS unless overridden; `?theme=light` pins it in a
@@ -343,14 +370,54 @@ overflow down to 700px.
 | `just demo` | The whole pipeline end to end against a scratch database |
 | `just demo-dialogue` | Two speakers, both modes, including cue reuse |
 | `NARRATE_PROVIDER=mock` | Anywhere, including the web UI |
-| Tests | 496 Python + 67 frontend. None touches the network |
-| Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `formats`, `media`, `cost *`, `db *`, and every voice audition |
+| Tests | 603 Python + 75 frontend. None touches the network |
+| Zero-cost commands | `models`, `voices`, `estimate`, `chunk review`, `timeline`, `plan`, `retention`, `formats`, `media`, `cost *`, `db *`, `publish write/show/set/title/titles/accept/briefs/choose`, `write beats/beat/sync`, and every voice audition |
+| Dry run is the default | Every command that spends — `generate`, `effects generate`, `effects suggest`, `publish draft`, `publish brief`, `write outline`, `write expand` — does nothing without `--go`, and says what it would have cost |
 
 `narrate probe --live` is the only command that spends without being asked
 twice, and it costs about two cents. What it settled is written down in
 [probe-results.md](probe-results.md) and [probe-effects.md](probe-effects.md) —
 including that `eleven_v3` rejects `previous_text` outright, which would have
 failed every chunk after the first.
+
+---
+
+## 12. Writing the script
+
+Outline first, then expand section by section. `narrate write`.
+
+| Feature | Detail |
+| --- | --- |
+| Beat sheet | A heading, what the section has to accomplish, and a share of the runtime — reviewed and edited **before** a word of prose is paid for |
+| Budget that adds up | The model returns shares; the seconds are computed here and normalised against what actually came back |
+| The beat sheet *is* the script | `write sync` renders it into `source_text` and re-chunks, so the whole existing pipeline needs no knowledge of beats |
+| Chapters for free | Each heading renders as `## Heading`, which the parser already turns into a chapter. Outlining and chaptering turn out to be one feature |
+| Notes that are never narrated | Each `intent` renders as an HTML comment, stripped before anything is billed |
+| Measured reading pace | `words_per_second` reads the project's own takes — 150 to 184 wpm on real projects here — falling back to a documented 2.5 words/second with no history |
+| One request per section | A failing section costs one section. Re-running does only the **empty** beats, so it fills gaps and charges for what it writes |
+| Refused after generating | Re-chunking would orphan the takes and their cost records, so finish drafting first. The message says so |
+
+The free tier allows 8,000 tokens per minute, which a six-beat expansion will
+often exceed. That is a rate limit, not a failure: the beat is skipped, recorded,
+and picked up on the next run.
+
+---
+
+## 13. Packaging and retention
+
+Full reference in **[PUBLISHING.md](PUBLISHING.md)**.
+
+| Feature | Detail |
+| --- | --- |
+| Nine title formulas | An `enum` in the schema, so an off-taxonomy answer is structurally impossible and the same formula gets the same name every run |
+| Spread, not clustered | The prompt asks for a range of formulas; titles are requested at a higher temperature than anything else, because nine formulas at the default produce six rephrasings of one idea |
+| Nothing chosen for you | Proposed titles land unchosen. Accepting one writes through to `Script.title` and unchooses the rest |
+| Twelve thumbnail compositions | Face First, Two Faces, Object First, Two-panel, Perspective and seven more |
+| Five words, enforced | `overlay_words` is an array with `maxItems: 5`, so a six-word answer is not a reply constrained decoding can produce |
+| Retention targets | `good% = 60 − 5·log₂(minutes)`, which reproduces all five published rows exactly and is continuous — so a 21-minute episode gets a real answer, not the nearest row's |
+| Marked when extrapolated | Outside 8 to 120 minutes the source says nothing, and the output says so rather than presenting a guess as a published figure |
+| Where the viewer leaves | Names the chunk playing at the target watch time. Only answerable because the timeline is built from measured durations |
+| Channel-level defaults | `project set --default-tags` and `--description-boilerplate`, so standing text is not regenerated per episode |
 
 ---
 
@@ -368,3 +435,10 @@ Stated plainly, because a gap you know about is cheaper than one you discover:
 - **Effects mixed into the master.** They are overlays with positions, by design
 - **`.docx` / `.pdf` scripts.** PDF in particular loses the paragraph breaks the chunker splits on
 - **Verified dialogue pricing.** Declared at the ordinary rate and flagged unverified until probed
+- **Image generation.** The thumbnail brief *is* the deliverable. If it is ever
+  added it attaches as a fourth provider Protocol with its own rate card and key
+  — and an accepted brief is already the request payload, which is why brief-only
+  was the right place to stop
+- **Niche research.** narrate can only see your own projects. It has no data
+  about other channels, their performance, or what a subniche is worth
+- **Uploading.** narrate produces the pack; you paste it

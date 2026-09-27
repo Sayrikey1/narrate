@@ -97,16 +97,33 @@ def _adopt_pre_alembic(engine: Engine) -> None:
 
     Base.metadata.create_all(engine)  # adds tables the old schema lacked
 
-    inspector = inspect(engine)
-    existing = {c["name"] for c in inspector.get_columns("chunk")}
-    additions = {
-        "start_offset": "INTEGER",
-        "target_start_s": "FLOAT",
+    # `create_all` above adds missing *tables* but never a missing column, so
+    # every column added since the pre-Alembic release has to be named here.
+    # Anything a later migration adds to an existing table has to be added to
+    # this map too, or adoption stamps head on a database that lacks it.
+    additions: dict[str, dict[str, str]] = {
+        "chunk": {
+            "start_offset": "INTEGER",
+            "target_start_s": "FLOAT",
+            "chapter_title": "VARCHAR(120)",
+        },
+        "project": {
+            "description_boilerplate": "TEXT NOT NULL DEFAULT ''",
+            "default_tags": "TEXT NOT NULL DEFAULT ''",
+        },
+        "script": {
+            "description": "TEXT NOT NULL DEFAULT ''",
+            "tags": "TEXT NOT NULL DEFAULT ''",
+            "target_seconds": "FLOAT",
+        },
     }
+    inspector = inspect(engine)
     with engine.begin() as conn:
-        for column, sql_type in additions.items():
-            if column not in existing:
-                conn.execute(text(f"ALTER TABLE chunk ADD COLUMN {column} {sql_type}"))
+        for table, columns in additions.items():
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            for column, sql_type in columns.items():
+                if column not in existing:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}"))
 
     command.stamp(_alembic_config(engine), "head")
 
