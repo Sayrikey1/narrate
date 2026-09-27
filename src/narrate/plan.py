@@ -57,8 +57,12 @@ def render_plan(
     session: Session,
     names: dict[int, str] | None = None,
     context: PlanContext | None = None,
+    fx_names: list[str] | None = None,
 ) -> str:
     """Render `plan.md` for a timeline.
+
+    `fx_names` are the masters the effects were mixed into, when an export made
+    them; without them the effects are described as overlays for an editor.
 
     `names` maps a timeline index to its exported filename. When absent — a
     plan asked for before exporting — the file column shows a dash rather than
@@ -73,8 +77,20 @@ def render_plan(
         "",
         _summary_line(timeline, ctx),
         "",
-        "Effects are **overlays**: they carry a timeline position but are not mixed",
-        "into the narration master. Drop them on their own track at the times below.",
+        *(
+            [
+                "Effects are mixed into "
+                + ", ".join(f"`{name}`" for name in fx_names)
+                + " at the times below —",
+                "a looped effect runs under its whole chunk. The plain masters are the",
+                "narration alone, and each effect has its own file for a track of its own.",
+            ]
+            if fx_names
+            else [
+                "Effects are **overlays**: they carry a timeline position but are not mixed",
+                "into the narration master. Drop them on their own track at the times below.",
+            ]
+        ),
         "",
         "## Running order",
         "",

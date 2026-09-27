@@ -343,6 +343,9 @@ export interface ExportResult {
   out_dir: string;
   master: string;
   masters: Record<string, string>;
+  /** The same masters with the effects mixed in — `<title>_fx.*`. */
+  fx_masters: Record<string, string>;
+  effects_mixed: number;
   mp3: string | null;
   plan: string;
   duration_s: number;

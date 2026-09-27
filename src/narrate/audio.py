@@ -8,6 +8,7 @@ diagnosis ("Invalid data found when processing input") into a guessing game.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -186,6 +187,131 @@ def concat(
     ]
     _run(command)
     return ConcatResult(path=output, duration_s=duration_seconds(output), inputs=len(inputs))
+
+
+@dataclass(frozen=True)
+class Overlay:
+    """One sound laid over a base track: an effect in the episode mix."""
+
+    path: Path
+    start_s: float
+    gain_db: float = 0.0
+    # Loop the sound to fill exactly this long — an ambience under a whole
+    # passage. None plays it once, at its own length.
+    length_s: float | None = None
+    fade_in_s: float = 0.0
+    fade_out_s: float = 0.0
+
+
+def mix(
+    base: Path,
+    overlays: list[Overlay],
+    output: Path,
+    sample_rate: int = 44100,
+    channels: int = 1,
+) -> Path:
+    """Lay sounds over a base track, each at its own time and level.
+
+    The base sets the length: an overlay running past its end is cut there.
+    Nothing is normalised on the way in — `amix` would otherwise divide every
+    input by the number of inputs and quietly turn the narration down — and a
+    limiter on the way out catches the rare peak where a sound meets a loud
+    word. Its auto-level is off, so the episode's loudness is the narration's.
+    """
+    if not base.exists():
+        raise FileNotFoundError(f"Missing audio: {base}")
+    missing = [o.path for o in overlays if not o.path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing audio: {', '.join(str(p) for p in missing)}")
+    ffmpeg = require_ffmpeg()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    command = [ffmpeg, "-y", "-loglevel", "error", "-i", str(base)]
+    for overlay in overlays:
+        if overlay.length_s is not None:
+            command += ["-stream_loop", "-1"]
+        command += ["-i", str(overlay.path)]
+
+    layout = "mono" if channels == 1 else "stereo"
+    fmt = f"aformat=sample_fmts=fltp:sample_rates={sample_rate}:channel_layouts={layout}"
+    stages = [f"[0:a]{fmt}[base]"]
+    for index, overlay in enumerate(overlays, start=1):
+        chain = [fmt]
+        if overlay.length_s is not None:
+            chain += [f"atrim=0:{overlay.length_s:.3f}", "asetpts=N/SR/TB"]
+        if overlay.fade_in_s:
+            chain.append(f"afade=t=in:st=0:d={overlay.fade_in_s:.3f}")
+        if overlay.fade_out_s and overlay.length_s is not None:
+            start = max(0.0, overlay.length_s - overlay.fade_out_s)
+            chain.append(f"afade=t=out:st={start:.3f}:d={overlay.fade_out_s:.3f}")
+        chain.append(f"volume={overlay.gain_db:.2f}dB")
+        chain.append(f"adelay=delays={round(overlay.start_s * 1000)}:all=1")
+        stages.append(f"[{index}:a]{','.join(chain)}[e{index}]")
+    labels = "[base]" + "".join(f"[e{i}]" for i in range(1, len(overlays) + 1))
+    stages.append(
+        f"{labels}amix=inputs={len(overlays) + 1}:duration=first:dropout_transition=0:"
+        "normalize=0,alimiter=limit=0.95:level=0:latency=1[out]"
+    )
+
+    command += [
+        "-filter_complex",
+        ";".join(stages),
+        "-map",
+        "[out]",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+        "-c:a",
+        "pcm_s16le",
+        str(output),
+    ]
+    _run(command)
+    return output
+
+
+# The integrated-loudness line of ebur128's closing summary.
+_INTEGRATED = re.compile(r"^\s*I:\s+(-?[\d.]+|-?inf)\s+LUFS", re.MULTILINE)
+
+
+def loudness_lufs(path: Path) -> float | None:
+    """Integrated loudness (EBU R128) as it will be heard in a mono mix.
+
+    Measured on the mono downmix `mix` makes, not the file as stored: a stereo
+    effect reads up to 8 LU louder than the same effect folded to mono, and a
+    level set from the stereo figure would land that far short. Padded to one
+    400 ms gating block, so a short click still has a loudness. `ebur128`, not
+    `loudnorm`: only the integrated figure is used, at a twentieth of the time.
+
+    None for silence, or for anything ffmpeg cannot read.
+    """
+    ffmpeg = require_ffmpeg()
+    try:
+        result = _run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-nostats",
+                "-i",
+                str(path),
+                "-af",
+                "aformat=channel_layouts=mono,apad=whole_dur=0.4,ebur128=framelog=quiet",
+                "-f",
+                "null",
+                "-",
+            ]
+        )
+    except FFmpegFailed:
+        return None
+    found = _INTEGRATED.findall(result.stderr)
+    if not found:
+        return None
+    try:
+        value = float(found[-1])
+    except ValueError:
+        return None
+    # Silence reads as -inf, or as ebur128's -70 floor, which means nothing.
+    return value if value > -70.0 else None
 
 
 @dataclass(frozen=True)

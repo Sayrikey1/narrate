@@ -102,6 +102,16 @@ class Settings(BaseSettings):
     # track, so the default is the widely-compatible one.
     piece_format: str = "mp3"
 
+    # Mix the generated effects into the master, so the finished episode is
+    # one file. The narration alone is still written beside it, and every
+    # effect still has its own file, so nothing an editor needs is lost.
+    mix_effects: bool = True
+    # Effect levels relative to the narration's measured loudness, in LU. A
+    # one-off sound (a chime) sits clearly under the voice; a looped ambience
+    # runs as a bed well beneath it.
+    effect_level_lu: float = -10.0
+    bed_level_lu: float = -22.0
+
     def require_api_key(self) -> str:
         if self.api_key is None:
             raise MissingAPIKey(

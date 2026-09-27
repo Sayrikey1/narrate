@@ -36,8 +36,9 @@ export function EffectsPage({
         <EffectPanel scriptId={scriptId} slots={slots} busy={false} onChange={onRefresh} />
         <Notice>
           A cue is generated once and placed as often as you like — repeats cost
-          nothing. Effects are overlays: they carry a timeline position but are
-          not mixed into the master, so an editor drops them on their own track.
+          nothing. The export mixes the effects into an <code>_fx</code> version of
+          each master, and keeps the plain master and each effect's own file for an
+          editor who wants them on a separate track.
         </Notice>
       </Card>
     </>

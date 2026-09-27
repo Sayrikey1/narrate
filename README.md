@@ -481,6 +481,5 @@ Stated plainly, because a gap you know about is cheaper than one you discover:
 voice *design* (generating a voice from a text description — cloning **is**
 supported), professional voice cloning (instant only),
 Postgres (the seam exists, no dialect but SQLite is tested), multi-user,
-loudness normalisation, effects mixed into the master (they are overlays by
-design), and `.docx`/`.pdf` scripts. Dialogue pricing is undocumented by the
+loudness normalisation, and `.docx`/`.pdf` scripts. Dialogue pricing is undocumented by the
 vendor and is declared at the ordinary rate, flagged unverified, until probed.

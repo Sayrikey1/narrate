@@ -2782,6 +2782,9 @@ def export(
         help="Refuse unless every take exported was checked with speech-to-text and none "
         "is suspect.",
     ),
+    no_mix: bool = typer.Option(
+        False, "--no-mix", help="Skip the _fx masters (the episode with its effects mixed in)."
+    ),
 ) -> None:
     """Stitch the cut, name every piece by timeline position, and write the plan.
 
@@ -2857,6 +2860,7 @@ def export(
             piece_format=piece_fmt,
             voice_id=voice or None,
             variant_label=label,
+            mix_effects=False if no_mix else None,
         )
     except audio.UnknownFormat as exc:
         _die(str(exc))
@@ -2867,16 +2871,24 @@ def export(
 
     minutes, seconds = divmod(int(result.duration_s), 60)
     masters = "  ".join(f"{key}: {path.name}" for key, path in result.masters.items())
+    with_fx = "  ".join(f"{key}: {path.name}" for key, path in result.fx_masters.items())
     body = [
         f"Folder    {result.out_dir}",
         f"Masters   {masters}",
+        *([f"With FX   {with_fx}"] if with_fx else []),
         f"Plan      {result.plan.name}",
         f"Runtime   {minutes}m {seconds:02d}s from {result.chunks} chunk(s), "
         f"{result.gap_seconds}s gaps",
         f"Pieces    {len(result.names)} timeline-named file(s)",
     ]
-    if result.effects:
-        body.append(f"Effects   {result.effects} placed on the timeline (not mixed in)")
+    if result.effects_mixed:
+        body.append(
+            f"Effects   {result.effects_mixed} mixed into the _fx masters, each also "
+            "as its own timeline-named file"
+        )
+    elif result.effects:
+        why = "--no-mix" if no_mix else "mix_effects is off, or no effect audio could be read"
+        body.append(f"Effects   {result.effects} placed on the timeline (not mixed: {why})")
     console.print(Panel("\n".join(body), title="[green]Exported[/green]", expand=False))
 
     if result.planned:

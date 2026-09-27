@@ -419,7 +419,10 @@ export function ScriptPage({
 
               {exported && (
                 <Notice tone="ok">
-                  Exported {Object.keys(exported.masters).join(", ")} —{" "}
+                  Exported {Object.keys(exported.masters).join(", ")}
+                  {exported.effects_mixed > 0 &&
+                    `, each also with its ${exported.effects_mixed} effect(s) mixed in (_fx)`}{" "}
+                  —{" "}
                   <Link to={scriptPath(scriptId, "/media")}>see the files →</Link>
                 </Notice>
               )}

@@ -8,9 +8,9 @@ the audio.
 Two things follow from the design decisions in this phase:
 
 * **Effects are overlays, not inserts.** They carry a timeline position but do
-  not advance the running time and are not mixed into the master. An editor
-  lays them on their own track; baking them in would be an irreversible
-  decision the tool has no business making.
+  not advance the running time. The export mixes them into a separate `_fx`
+  master and leaves the plain master as the narration alone, so nothing is
+  baked in beyond recall: an editor can still lay each on its own track.
 * **Anchors are targets, not commands.** A `[@ MM:SS]` marker records where the
   writer wanted a section to begin. TTS duration cannot be dialled to a mark,
   so the timeline reports the signed drift and leaves the response — trim,
@@ -52,6 +52,8 @@ class TimelineEntry:
     source_path: Path | None = None
     target_s: float | None = None
     generated: bool = True
+    # An effect meant to loop — an ambience — rather than play once.
+    loop: bool = False
 
     # The chapter this entry begins, if it begins one. Carried here so a chapter
     # list is a read of the timeline rather than a second query — the timestamp
@@ -258,6 +260,7 @@ def build_timeline(
                         else None
                     ),
                     generated=generated,
+                    loop=slot.loop,
                 )
             )
             index += 1

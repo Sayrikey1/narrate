@@ -225,6 +225,8 @@ class ExportIn(BaseModel):
     # own folder, so two variants of an episode never overwrite each other.
     voice_id: str | None = None
     variant_label: str | None = None
+    # False writes the plain masters only; None follows the `mix_effects` setting.
+    mix: bool | None = None
 
 
 class EffectsGenerateIn(BaseModel):
@@ -268,6 +270,9 @@ def _export_payload(result: ExportResult) -> dict[str, Any]:
         "out_dir": str(result.out_dir),
         "master": result.master.name,
         "masters": {k: v.name for k, v in result.masters.items()},
+        # The same masters with the effects mixed in: `<title>_fx.*`.
+        "fx_masters": {k: v.name for k, v in result.fx_masters.items()},
+        "effects_mixed": result.effects_mixed,
         "mp3": result.mp3.name if result.mp3 else None,
         "plan": result.plan.name,
         "duration_s": result.duration_s,
@@ -1321,11 +1326,14 @@ def create_app(
                 piece_format=options.piece_format,
                 voice_id=options.voice_id,
                 variant_label=options.variant_label,
+                mix_effects=options.mix,
             )
         except NothingToExport as exc:
             raise HTTPException(409, str(exc)) from exc
         except audio.UnknownFormat as exc:
             raise HTTPException(400, str(exc)) from exc
+        except (audio.FFmpegFailed, audio.FFmpegMissing, FileNotFoundError) as exc:
+            raise HTTPException(502, str(exc)) from exc
         return _export_payload(result)
 
     # -- projects in detail, and their media --------------------------------

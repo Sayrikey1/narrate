@@ -9,10 +9,17 @@ An export produces four things:
 * **`plan.md`** — the editing document;
 * **`timeline.json`** — the same information for tooling and the UI.
 
-Effects are copied in as separate files, not mixed into the master. They are
-overlays with timeline positions; an editor lays them on their own track.
-Baking them in would be irreversible, and the point of the plan is to leave
-that decision to a person.
+Every master comes in two versions, per format asked for: the narration alone
+(`Episode-1.mp3`) and the finished episode **with its effects mixed in**
+(`Episode-1_fx.mp3`). In the mix, a one-off sound plays once at its timeline
+position, clearly under the voice; a looped ambience runs as a bed under its
+whole chunk, faded in and out. Levels are set from measured loudness, relative
+to the narration, because generated sounds arrive at whatever level they
+arrive at.
+
+Every effect also keeps its own timeline-named file, so an editor can still
+lay them on their own track. `mix_effects` off (`narrate export --no-mix`)
+writes the narration masters only.
 
 The master is WAV deliberately: it is the correct input for the two-pass
 `loudnorm` that F9 will add, so normalisation later will not mean re-encoding
@@ -22,14 +29,27 @@ from a lossy intermediate.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 from dataclasses import dataclass, field
+from glob import escape as glob_escape
 from pathlib import Path
 
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
-from narrate.audio import AudioFormat, concat, encode, make_silence, parse_formats
+from narrate.audio import (
+    AudioFormat,
+    FFmpegFailed,
+    Overlay,
+    concat,
+    duration_seconds,
+    encode,
+    loudness_lufs,
+    make_silence,
+    mix,
+    parse_formats,
+)
 from narrate.db.models import Chunk, Cut, Export, Take
 from narrate.db.session import session_scope
 from narrate.plan import PlanContext, gather_context, render_plan, render_timeline_json
@@ -39,6 +59,7 @@ from narrate.timeline import (
     EFFECT,
     NARRATION,
     Timeline,
+    TimelineEntry,
     build_timeline,
     export_basename,
     takes_by_voice,
@@ -65,6 +86,9 @@ class ExportResult:
     gap_seconds: float
     fingerprint: str
     names: dict[int, str] = field(default_factory=dict)
+    # The same masters with the effects mixed in, per format: `<title>_fx.*`.
+    fx_masters: dict[str, Path] = field(default_factory=dict)
+    effects_mixed: int = 0
 
 
 def cut_fingerprint(take_ids: list[int]) -> str:
@@ -96,6 +120,104 @@ def export_is_current(session: Session, script_id: int) -> bool:
         return False
     current = cut_fingerprint([take.id for _, take in selected_takes(session, script_id)])
     return latest.cut_fingerprint == current
+
+
+# Loop ambiences fade rather than start and stop dead.
+BED_FADE_IN_S = 1.0
+BED_FADE_OUT_S = 2.0
+# Without a usable loudness reading (silence, a failed read), fixed levels.
+FALLBACK_EFFECT_DB = -6.0
+FALLBACK_BED_DB = -18.0
+# However far the measurement says to move a sound, not further than this.
+GAIN_LIMITS_DB = (-40.0, 12.0)
+
+
+def _overlays(
+    timeline: Timeline, placed: list[TimelineEntry], narration: Path, settings: Settings
+) -> list[Overlay]:
+    """Each effect's place, length and level in the mix.
+
+    A looped effect runs under its chunk's whole narration; a one-off plays
+    once. Levels follow measured loudness: the effect is moved to sit a set
+    distance below the narration, whatever level it was generated at.
+    """
+    voice = loudness_lufs(narration)
+    measured: dict[Path, float | None] = {}
+    ends = {e.chunk_ordinal: e.end_s for e in timeline.narration}
+    out: list[Overlay] = []
+    playable: dict[Path, bool] = {}
+    for entry in placed:
+        assert entry.source_path is not None
+        source = entry.source_path
+        if source not in playable:
+            # A file with nothing to decode would fail the mix — or, looped,
+            # hang it — so it is left out; its own piece still ships.
+            try:
+                playable[source] = duration_seconds(source) > 0
+            except FFmpegFailed:
+                playable[source] = False
+        if not playable[source]:
+            continue
+        if source not in measured:
+            measured[source] = loudness_lufs(source)
+        own = measured[source]
+        until = ends.get(entry.chunk_ordinal, entry.end_s)
+        # Under its whole chunk, however long the sound itself is — a longer
+        # ambience is cut and faded at the chunk's end, not left running on.
+        bed = entry.loop and until > entry.start_s
+        target = settings.bed_level_lu if entry.loop else settings.effect_level_lu
+        if voice is not None and own is not None:
+            low, high = GAIN_LIMITS_DB
+            gain = min(high, max(low, voice + target - own))
+        else:
+            gain = FALLBACK_BED_DB if entry.loop else FALLBACK_EFFECT_DB
+        out.append(
+            Overlay(
+                path=source,
+                start_s=entry.start_s,
+                gain_db=gain,
+                length_s=(until - entry.start_s) if bed else None,
+                fade_in_s=BED_FADE_IN_S if bed else 0.0,
+                fade_out_s=BED_FADE_OUT_S if bed else 0.0,
+            )
+        )
+    return out
+
+
+def _backfill_durations(session: Session, script_id: int, voice_id: str | None) -> None:
+    """Measure any take being exported whose length was never recorded.
+
+    Positions on the timeline are sums of take lengths; a take generated while
+    ffmpeg was missing has none, so everything after it — pieces, chapters and
+    the effects in the mix — would be placed early.
+    """
+    takes = (
+        list(takes_by_voice(session, script_id, voice_id).values())
+        if voice_id is not None
+        else [take for _, take in selected_takes(session, script_id)]
+    )
+    for take in takes:
+        if take.duration_s is None and take.asset_path and Path(take.asset_path).exists():
+            try:
+                take.duration_s = duration_seconds(Path(take.asset_path))
+            except FFmpegFailed:
+                continue
+    session.flush()
+
+
+def _remove_stale_pieces(target: Path, project_name: str, wanted: set[str]) -> None:
+    """Delete this project's timeline-named pieces that this export does not write.
+
+    Only files named exactly by the piece convention, for this project, in this
+    folder — nothing else is touched.
+    """
+    prefix = export_basename(project_name, 0.0, 0.0).rsplit("_", 2)[0]
+    pattern = re.compile(
+        rf"^{re.escape(prefix)}_\d{{2}}-\d{{2}}-\d{{2}}-\d{{3}}_\d{{2}}-\d{{2}}-\d{{2}}-\d{{3}}$"
+    )
+    for path in target.iterdir():
+        if path.is_file() and pattern.match(path.stem) and path.stem not in wanted:
+            path.unlink()
 
 
 def _variant_slug(label: str) -> str:
@@ -184,6 +306,7 @@ def export_script(
     piece_format: str | None = None,
     voice_id: str | None = None,
     variant_label: str | None = None,
+    mix_effects: bool | None = None,
 ) -> ExportResult:
     """Stitch the cut and write it out in each requested delivery format.
 
@@ -214,6 +337,7 @@ def export_script(
     slug = _variant_slug(variant_label or voice_id) if voice_id else ""
 
     with session_scope(engine) as session:
+        _backfill_durations(session, script_id, voice_id)
         timeline = build_timeline(session, script_id, gap_seconds=gap, voice_id=voice_id)
         _check_ready(session, timeline, script_id, voice_id=voice_id)
         context = gather_context(session, script_id)
@@ -231,6 +355,11 @@ def export_script(
     # re-roll never silently renames a file already handed over.
     piece_fmt = _piece_format(piece)
     names: dict[int, str] = {}
+    wanted = {
+        export_basename(project_name, e.start_s, e.end_s)
+        for e in timeline.entries
+        if e.kind in (NARRATION, EFFECT) and e.source_path is not None
+    }
     for entry in timeline.entries:
         if entry.kind not in (NARRATION, EFFECT) or entry.source_path is None:
             continue
@@ -269,14 +398,54 @@ def export_script(
         if silence is not None:
             silence.unlink(missing_ok=True)
 
+    # The finished episode: the same master with the effects laid in.
+    mixing = settings.mix_effects if mix_effects is None else mix_effects
+    placed = [e for e in timeline.effects if e.source_path is not None]
+    fx_master: Path | None = None
+    mixed = 0
+    overlays = _overlays(timeline, placed, master, settings) if mixing and placed else []
+    if overlays:
+        # A WAV only when WAV was asked for: otherwise the mix is scratch, and
+        # must not overwrite a `_fx.wav` of the user's in a folder they chose.
+        wants_wav = any(f.key == "wav" for f in requested)
+        try:
+            fx_master = mix(
+                master,
+                overlays,
+                target / (f"{safe_title}_fx.wav" if wants_wav else "_mix.wav"),
+                sample_rate=settings.sample_rate,
+                channels=1,
+            )
+            mixed = len(overlays)
+        except FFmpegFailed:
+            # The narration masters still ship; the report says nothing was mixed.
+            fx_master = None
+
     masters: dict[str, Path] = {}
+    fx_masters: dict[str, Path] = {}
     for fmt in requested:
         if fmt.key == "wav":
             masters["wav"] = master
+            if fx_master is not None:
+                fx_masters["wav"] = fx_master
             continue
         masters[fmt.key] = encode(
             master, target / f"{safe_title}{fmt.suffix}", fmt, settings.mp3_bitrate
         )
+        if fx_master is not None:
+            fx_masters[fmt.key] = encode(
+                fx_master, target / f"{safe_title}_fx{fmt.suffix}", fmt, settings.mp3_bitrate
+            )
+    if fx_master is not None and "wav" not in fx_masters:
+        # The PCM mix was only the source for the formats asked for.
+        fx_master.unlink(missing_ok=True)
+    if out_dir is None:
+        # An `_fx` master this export did not write carries an old cut — from a
+        # format no longer asked for, or from before mixing was turned off.
+        keep = set(fx_masters.values())
+        for stale in target.glob(f"{glob_escape(safe_title)}_fx.*"):
+            if stale not in keep:
+                stale.unlink()
     mp3_path = masters.get("mp3")
 
     plan_path = target / "plan.md"
@@ -284,7 +453,10 @@ def export_script(
     pack_path = target / "publish.md"
     pack_json_path = target / "publish.json"
     with session_scope(engine) as session:
-        plan_path.write_text(render_plan(timeline, session, names, context), encoding="utf-8")
+        fx_names = [path.name for path in fx_masters.values()]
+        plan_path.write_text(
+            render_plan(timeline, session, names, context, fx_names=fx_names), encoding="utf-8"
+        )
         # Written here rather than on demand because the chapter timestamps are
         # only correct once the audio they describe exists — which is now.
         pack = gather_publish(session, script_id)
@@ -292,10 +464,17 @@ def export_script(
     pack_path.write_text(render_publish_pack(timeline, pack), encoding="utf-8")
     pack_json_path.write_text(render_publish_json(timeline, pack), encoding="utf-8")
 
+    if out_dir is None:
+        # Only now the new export is complete: a regeneration changes timings,
+        # so the pieces an earlier export wrote carry times that are wrong, and
+        # two files for one chunk is how an editor lays the wrong one.
+        _remove_stale_pieces(target, project_name, wanted)
+
     fingerprint = cut_fingerprint([t for t in take_ids])
 
     with session_scope(engine) as session:
-        for fmt_key, deliverable in masters.items():
+        both = [*masters.items(), *((f"{key}_fx", path) for key, path in fx_masters.items())]
+        for fmt_key, deliverable in both:
             session.add(
                 Export(
                     script_id=script_id,
@@ -321,6 +500,8 @@ def export_script(
         planned=len(timeline.planned),
         gap_seconds=gap,
         fingerprint=fingerprint,
+        fx_masters=fx_masters,
+        effects_mixed=mixed,
         names=names,
     )
 

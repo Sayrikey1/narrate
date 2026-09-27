@@ -198,8 +198,19 @@ Unknown outcomes are recorded and surfaced for a human rather than guessed at.
 
 ## 5. Sound effects
 
-Effects are **overlays**: they carry a timeline position but are not mixed into
-the narration master, so an editor drops them on their own track.
+Effects are **overlays** with a timeline position. The export writes every
+master twice, per format: the narration alone (`Episode-1.mp3`) and the
+finished episode with the effects mixed in (`Episode-1_fx.mp3`). Each effect
+also keeps its own timeline-named file, for an editor who wants its own track.
+
+| Mixing | Detail |
+| --- | --- |
+| Where | At its timeline position — the start of the chunk after its `[SFX: …]` marker |
+| Looped effects | Run as a bed under the whole chunk, faded in over 1s and out over 2s |
+| Levels | Set from measured loudness (EBU R128), relative to the narration: one-off sounds 10 LU below it, beds 22 LU below. Settings `effect_level_lu` and `bed_level_lu` |
+| Safety | No input is normalised (the narration keeps its level); a limiter catches the rare peak where a sound meets a loud word |
+| Off | `narrate export --no-mix`, or `mix_effects = false`, writes the plain masters only |
+
 
 | Feature | Detail |
 | --- | --- |
@@ -468,7 +479,6 @@ Stated plainly, because a gap you know about is cheaper than one you discover:
 - **Postgres.** The seam exists — `NARRATE_DATABASE_URL` — but no dialect other than SQLite is supported or tested
 - **Multi-user.** Single-operator by design; run state is in-memory and process-local
 - **Loudness normalisation.** WAV masters are the correct input for it, done elsewhere
-- **Effects mixed into the master.** They are overlays with positions, by design
 - **`.docx` / `.pdf` scripts.** PDF in particular loses the paragraph breaks the chunker splits on
 - **Verified dialogue pricing.** Declared at the ordinary rate and flagged unverified until probed
 - **Image generation.** The thumbnail brief *is* the deliverable. If it is ever
