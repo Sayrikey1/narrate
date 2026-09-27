@@ -5,37 +5,45 @@ Entirely optional. Markers you write are always honoured; this only proposes
 suggests can cause a generation on its own**. That keeps the tool's
 spend-is-opt-in posture intact even when a model is doing the thinking.
 
-Two constraints shape the implementation:
-
-* **Strict `json_schema` output.** Groq supports constrained decoding on
-  exactly `openai/gpt-oss-120b` and `openai/gpt-oss-20b`, which is why those
-  are the only models offered. The response cannot come back malformed, so
-  there is no defensive parsing here.
-* **Per-chunk requests.** The free tier allows 8,000 tokens per minute — below
-  a full episode plus its response. Asking chunk by chunk keeps each request
-  small and lets a partial failure cost only one chunk.
-
-Raw `httpx`, matching the decision made for ElevenLabs: one endpoint does not
-justify a second SDK, and the OpenAI-compatible surface is a single POST.
+The request machinery — the client, the rate card, strict schema decoding, the
+429 handling — lives in `narrate.llm`, shared with the other features that ask a
+model a question. What stays here is the part specific to sound: the schema, the
+brief given to the model, and the decision to ask **per chunk** rather than per
+episode, which keeps each request inside the free tier's per-minute budget and
+lets a partial failure cost only one chunk.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
-from decimal import Decimal
-from typing import Any
 
 import httpx
 
-from narrate.money import MICROS_PER_USD
+from narrate import llm
+from narrate.llm import (
+    MODEL_RATES,
+    GroqError,
+    TokenUsage,
+    chat_json,
+    client_for,
+    cost_micros,
+    resolve_model,
+)
 from narrate.settings import Settings
 
-# Published Groq rates, per million tokens.
-MODEL_RATES: dict[str, tuple[float, float]] = {
-    "openai/gpt-oss-120b": (0.15, 0.60),
-    "openai/gpt-oss-20b": (0.075, 0.30),
-}
+# Re-exported: `MODEL_RATES` and `GroqError` were part of this module's surface
+# before the shared client existed, and the CLI imports them from here.
+__all__ = [
+    "MAX_PER_CHUNK",
+    "MODEL_RATES",
+    "SCHEMA",
+    "SYSTEM_PROMPT",
+    "GroqError",
+    "Suggestion",
+    "SuggestionRun",
+    "estimate_tokens",
+    "suggest_for_chunks",
+]
 
 MAX_PER_CHUNK = 3
 
@@ -107,16 +115,11 @@ class SuggestionRun:
     @property
     def cost_micros(self) -> int:
         """What the suggestions cost to produce. Small, but not nothing."""
-        rate_in, rate_out = MODEL_RATES.get(self.model, (0.0, 0.0))
-        total = (
-            Decimal(self.prompt_tokens) * Decimal(str(rate_in))
-            + Decimal(self.completion_tokens) * Decimal(str(rate_out))
-        ) / Decimal(1_000_000)
-        return int(total * MICROS_PER_USD)
+        return cost_micros(self.model, self.prompt_tokens, self.completion_tokens)
 
-
-class GroqError(RuntimeError):
-    pass
+    def add(self, usage: TokenUsage) -> None:
+        self.prompt_tokens += usage.prompt_tokens
+        self.completion_tokens += usage.completion_tokens
 
 
 async def suggest_for_chunks(
@@ -132,39 +135,33 @@ async def suggest_for_chunks(
     `chunks` is `(ordinal, text)`. Requests are sequential rather than
     concurrent: the free tier's limits are per minute, and a burst of parallel
     calls is the fastest way to hit a 429 for no benefit.
-    """
-    chosen = model or settings.groq_model
-    if chosen not in MODEL_RATES:
-        raise GroqError(
-            f"{chosen!r} is not a Groq model with strict structured output. "
-            f"Use one of: {', '.join(sorted(MODEL_RATES))}."
-        )
 
+    A failing chunk is recorded and the loop continues, so a partial run still
+    returns what it got — and is still charged for what it spent.
+    """
+    chosen = resolve_model(model, settings)
     run = SuggestionRun(model=chosen)
+
     owns_client = client is None
-    http = client or httpx.AsyncClient(
-        base_url=settings.groq_base_url,
-        headers={"Authorization": f"Bearer {settings.require_groq_key()}"},
-        timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0),
-    )
+    http = client or client_for(settings)
 
     try:
         for ordinal, text in chunks:
             try:
-                payload = await _ask(http, chosen, text, max_per_chunk)
-            except httpx.HTTPError as exc:
-                run.errors.append(f"chunk {ordinal}: {exc}")
-                continue
-            except GroqError as exc:
+                content, usage = await chat_json(
+                    http,
+                    chosen,
+                    system=SYSTEM_PROMPT.format(max_effects=max_per_chunk),
+                    user=text,
+                    schema=SCHEMA,
+                    name="effect_slots",
+                )
+            except (httpx.HTTPError, GroqError) as exc:
                 run.errors.append(f"chunk {ordinal}: {exc}")
                 continue
 
-            usage = payload.get("usage", {})
-            run.prompt_tokens += int(usage.get("prompt_tokens", 0))
-            run.completion_tokens += int(usage.get("completion_tokens", 0))
-
-            content = payload["choices"][0]["message"]["content"]
-            for item in json.loads(content).get("effects", [])[:max_per_chunk]:
+            run.add(usage)
+            for item in content.get("effects", [])[:max_per_chunk]:
                 run.suggestions.append(
                     Suggestion(
                         chunk_ordinal=ordinal,
@@ -181,45 +178,6 @@ async def suggest_for_chunks(
     return run
 
 
-async def _ask(
-    client: httpx.AsyncClient, model: str, text: str, max_effects: int
-) -> dict[str, Any]:
-    response = await client.post(
-        "/chat/completions",
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT.format(max_effects=max_effects)},
-                {"role": "user", "content": text},
-            ],
-            # Constrained decoding: "never errors or produces invalid JSON".
-            # Note Groq does not allow this together with `tools`, and it
-            # cannot be streamed.
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "effect_slots", "strict": True, "schema": SCHEMA},
-            },
-            "temperature": 0.4,
-        },
-    )
-    if response.status_code == 429:
-        retry = response.headers.get("retry-after", "?")
-        raise GroqError(
-            f"rate limited (retry after {retry}s). The free tier allows 8,000 tokens "
-            "per minute, which a long script exceeds."
-        )
-    if response.status_code >= 400:
-        raise GroqError(f"HTTP {response.status_code}: {response.text[:200]}")
-    result: dict[str, Any] = response.json()
-    return result
-
-
 def estimate_tokens(chunks: list[tuple[int, str]]) -> int:
-    """Rough input size, for showing a cost before the call.
-
-    Four characters per token is the usual approximation for English prose;
-    it only needs to be good enough to say "fractions of a cent" convincingly.
-    """
-    prose = sum(len(text) for _, text in chunks)
-    overhead = len(SYSTEM_PROMPT) * len(chunks)
-    return (prose + overhead) // 4
+    """Rough input size for a suggestion run, for showing a cost before the call."""
+    return llm.estimate_tokens([text for _, text in chunks], SYSTEM_PROMPT)
