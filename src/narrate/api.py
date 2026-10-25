@@ -432,6 +432,8 @@ def create_app(
                         "prefix_tags": project.prefix_tags,
                         "spend_micros": rollup.cost_micros,
                         "waste_pct": rollup.waste_pct,
+                        # What the cap is measured against: this month's charges.
+                        "month_micros": budget.spent_micros,
                         "cap_micros": budget.cap_micros,
                         "cap_used_pct": budget.used_pct,
                     }
@@ -488,7 +490,11 @@ def create_app(
             if body.voice_id is not None:
                 project.voice_id = body.voice_id
             if body.monthly_cap_usd is not None:
-                project.monthly_cap_micros = int(body.monthly_cap_usd * 1_000_000)
+                # Zero removes the cap, as it does when a project is created: a
+                # $0 cap would refuse every charge, which nobody sets on purpose.
+                project.monthly_cap_micros = (
+                    int(body.monthly_cap_usd * 1_000_000) if body.monthly_cap_usd > 0 else None
+                )
 
             spec = registry.get(project.model_id)
 

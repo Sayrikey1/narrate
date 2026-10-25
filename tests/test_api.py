@@ -1338,3 +1338,20 @@ def test_export_zip_on_the_command_line_packs_the_folder_beside_it(
     assert "unzips to 007/" in result.output
     with zipfile.ZipFile(folder / "007.zip") as bundle:
         assert all(n.startswith("007/") for n in bundle.namelist())
+
+
+def test_a_monthly_cap_can_be_changed_and_removed(client: TestClient) -> None:
+    """Zero removes it, as on creation — a $0 cap would refuse every charge."""
+    project = client.post(
+        "/api/projects", json={"name": "Capped", "voice_id": "v1", "monthly_cap_usd": 15}
+    ).json()
+
+    def cap() -> object:
+        listed = client.get("/api/projects").json()
+        return next(p for p in listed if p["id"] == project["id"])["cap_micros"]
+
+    assert cap() == 15_000_000
+    client.patch(f"/api/projects/{project['id']}", json={"monthly_cap_usd": 20})
+    assert cap() == 20_000_000
+    client.patch(f"/api/projects/{project['id']}", json={"monthly_cap_usd": 0})
+    assert cap() is None

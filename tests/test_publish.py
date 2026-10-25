@@ -367,6 +367,17 @@ def test_unusable_chapters_are_kept_out_of_the_pasted_description() -> None:
     assert "would not be accepted" in description
 
 
+def test_the_description_box_is_the_same_text_in_both_twins() -> None:
+    """What the page copies for YouTube is what the markdown says to paste."""
+    ctx = publish.PublishContext(description="Some words.", boilerplate="Subscribe.")
+    data = json.loads(publish.render_publish_json(_three_good_chapters(), ctx))
+    box = data["description_box"]
+
+    assert box.startswith("Some words.\n\nChapters:\n0:00")
+    assert box.endswith("Subscribe.")
+    assert box in publish.render_publish_pack(_three_good_chapters(), ctx)
+
+
 def test_the_json_twin_carries_what_the_ui_needs() -> None:
     """The UI reads this, never the markdown — re-parsing a rendered document is
     how a display and its source drift apart."""

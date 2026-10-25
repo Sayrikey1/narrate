@@ -79,6 +79,18 @@ def test_a_delete_is_previewed_then_done_and_the_spend_still_adds_up(
     assert spend  # the episode's own figures were readable before
 
 
+def test_the_project_list_says_what_was_spent_this_month(
+    client: TestClient, generated: tuple[int, int]
+) -> None:
+    """The figure the cap is measured against, so a card can show "$8.31 of $15"."""
+    project_id, script_id = generated
+    spend = client.get(f"/api/scripts/{script_id}/cost").json()["cost_micros"]
+
+    listed = {p["id"]: p for p in client.get("/api/projects").json()}
+    assert spend > 0
+    assert listed[project_id]["month_micros"] == listed[project_id]["spend_micros"] == spend
+
+
 def test_a_deleted_episode_cannot_be_generated(
     client: TestClient, generated: tuple[int, int]
 ) -> None:

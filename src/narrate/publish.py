@@ -369,6 +369,23 @@ def _title_section(ctx: PublishContext) -> list[str]:
     return [*lines, ""]
 
 
+def description_box(ctx: PublishContext, chapters: ChapterList) -> str:
+    """What goes in YouTube's description box, exactly as it is pasted.
+
+    Assembled in the order it gets pasted: the episode's own words, then the
+    chapters (which belong in the description for YouTube to find them — and
+    only when YouTube would accept them), then whatever the channel always says.
+    """
+    body: list[str] = []
+    if ctx.description:
+        body.append(ctx.description.strip())
+    if chapters.usable:
+        body.append("Chapters:\n" + chapters.text)
+    if ctx.boilerplate:
+        body.append(ctx.boilerplate.strip())
+    return "\n\n".join(body)
+
+
 def _description_section(ctx: PublishContext, chapters: ChapterList) -> list[str]:
     lines = ["## Description", ""]
     if not ctx.description and not ctx.boilerplate:
@@ -379,18 +396,7 @@ def _description_section(ctx: PublishContext, chapters: ChapterList) -> list[str
         ]
         return lines
 
-    # Assembled in the order it gets pasted: the episode's own words, then the
-    # chapters (which belong in the description for YouTube to find them), then
-    # whatever the channel always says.
-    body: list[str] = []
-    if ctx.description:
-        body.append(ctx.description.strip())
-    if chapters.usable:
-        body.append("Chapters:\n" + chapters.text)
-    if ctx.boilerplate:
-        body.append(ctx.boilerplate.strip())
-
-    lines += ["```text", "\n\n".join(body), "```", ""]
+    lines += ["```text", description_box(ctx, chapters), "```", ""]
     if chapters.chapters and not chapters.usable:
         lines += [
             "> The chapters are left out above because they would not be accepted. "
@@ -532,6 +538,8 @@ def render_publish_json(timeline: Timeline, context: PublishContext | None = Non
         },
         "description": ctx.description,
         "boilerplate": ctx.boilerplate,
+        # The same text the markdown shows to paste, so "Copy" copies that.
+        "description_box": description_box(ctx, chapters),
         "tags": list(ctx.all_tags),
         "chapters": {
             "usable": chapters.usable,

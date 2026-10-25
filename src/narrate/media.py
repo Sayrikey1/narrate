@@ -90,11 +90,14 @@ class MediaFile:
     take_id: int | None = None
     effect_id: int | None = None
     script_id: int | None = None
+    # When the file was last written, as a Unix time: what "newest first" sorts by.
+    modified: float = 0.0
 
     @classmethod
     def of(
         cls, path: Path, root: Path, kind: str, *, address: str | None = None, **extra: object
     ) -> MediaFile:
+        stat = path.stat()
         return cls(
             name=path.name,
             # Relative to the media root: an absolute path in a URL invites
@@ -102,8 +105,9 @@ class MediaFile:
             # outside the root has an `address` instead.
             path=address or str(path.relative_to(root)),
             kind=kind,
-            bytes=path.stat().st_size,
+            bytes=stat.st_size,
             playable=path.suffix.lower() in AUDIO_SUFFIXES,
+            modified=stat.st_mtime,
             **extra,  # type: ignore[arg-type]
         )
 

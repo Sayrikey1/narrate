@@ -111,10 +111,13 @@ async def test_project_media_finds_every_artifact(
     # Working files are not artifacts.
     assert not any(f.name.startswith("_") for f in media.exports[0].files)
 
-    # Every listed path resolves inside the root and exists.
+    # Every listed path resolves inside the root and exists, and says when it
+    # was written — what the media page sorts newest-first by.
     for group in [*media.exports, media.effects, media.takes]:
         for file in group.files:
-            assert resolve_media_path(file.path, settings).exists()
+            path = resolve_media_path(file.path, settings)
+            assert path.exists()
+            assert file.modified == path.stat().st_mtime
 
 
 def test_media_types_are_sensible() -> None:
