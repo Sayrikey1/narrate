@@ -56,12 +56,13 @@ class Settings(BaseSettings):
     # copied from elsewhere. NARRATE_STT_MODEL_DIR, in the environment or .env.
     stt_model_dir: Path | None = None
 
-    @field_validator("stt_model_dir", "export_dir", mode="before")
+    @field_validator("stt_model_dir", "export_dir", "api_key", "groq_api_key", mode="before")
     @classmethod
     def _unset_when_empty(cls, value: object) -> object:
         # `NARRATE_STT_MODEL_DIR=` would otherwise parse as Path("."), and a
         # model download would land in whichever directory the command ran in;
-        # an empty export directory would do the same with every export.
+        # an empty export directory would do the same with every export. An
+        # empty key is no key: `GROQ_API_KEY=` must not count as having one.
         if isinstance(value, str) and not value.strip():
             return None
         return value

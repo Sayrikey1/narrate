@@ -28,6 +28,10 @@ def _no_real_export_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     environment outranks `.env`, and empty means unset.
     """
     monkeypatch.setenv("NARRATE_EXPORT_DIR", "")
+    # Nor its keys: a test must never be able to reach a paid provider. The
+    # environment outranks `.env`, and an empty key is no key.
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    monkeypatch.setenv("ELEVEN_API", "")
 
 
 @pytest.fixture
