@@ -126,6 +126,9 @@ export interface Take {
   /** What `narrate verify` found. "clear" means no issues were found — which
    *  is not the same as perfect, and is never drawn as a tick. */
   verify_status: VerifyStatus;
+  /** A person listened to what the check flagged and said the take is fine.
+   *  `verify_status` and `findings` still say what the check found. */
+  verify_accepted: boolean;
   findings: Finding[];
 }
 

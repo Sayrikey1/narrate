@@ -43,6 +43,11 @@ export function ChunkList({
     onChange();
   }
 
+  async function accept(take: Take, accepted: boolean) {
+    await api.acceptTake(take.id, accepted);
+    onChange();
+  }
+
   // Closing hands focus back to the button that opened the panel, rather than
   // dropping it on the page — the panel is gone, and so was the focused element.
   function close(ordinal: number) {
@@ -113,6 +118,25 @@ export function ChunkList({
                           use this
                         </button>
                       )}
+                      {flaggedByCheck(take) &&
+                        (take.verify_accepted ? (
+                          <button
+                            className="ghost small"
+                            onClick={() => void accept(take, false)}
+                            aria-label={`Flag take ${take.ordinal} again`}
+                            title="Report this take as flagged again"
+                          >
+                            undo
+                          </button>
+                        ) : (
+                          <button
+                            className="ghost small"
+                            onClick={() => void accept(take, true)}
+                            title="You listened and it is right — a name the check cannot spell, say. Stops it being flagged; what was found stays below."
+                          >
+                            It's fine
+                          </button>
+                        ))}
                     </div>
                     <Findings take={take} onHear={(f) => hear(take, f)} />
                   </div>
@@ -160,6 +184,13 @@ export function ChunkList({
  *  recognisable passes every one of them. */
 function CheckBadge({ take }: { take: Take }) {
   const fails = take.findings.filter((f) => f.severity === "fail").length;
+  if (flaggedByCheck(take) && take.verify_accepted) {
+    return (
+      <span className="tag quiet" title="You listened and said it is fine — what the check found is below">
+        fine by ear
+      </span>
+    );
+  }
   switch (take.verify_status) {
     case "suspect":
       return (
@@ -186,6 +217,10 @@ function CheckBadge({ take }: { take: Take }) {
   }
 }
 
+function flaggedByCheck(take: Take): boolean {
+  return take.verify_status === "suspect" || take.verify_status === "review";
+}
+
 /** Enough to act on. A take that is mostly wrong — truncated, or silent —
  *  can produce dozens of findings, and the first few say what needs saying. */
 const MOST_FINDINGS = 4;
@@ -196,7 +231,8 @@ function Findings({ take, onHear }: { take: Take; onHear: (f: Finding) => void }
   const shown = problems.slice(0, MOST_FINDINGS);
   const hidden = problems.length - shown.length;
   return (
-    <ul className="findings">
+    // Kept when accepted, so the spots can be heard again before an undo.
+    <ul className={take.verify_accepted ? "findings accepted" : "findings"}>
       {shown.map((finding, index) => (
         <li key={index} className={finding.severity}>
           <button

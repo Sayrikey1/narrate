@@ -106,6 +106,43 @@ async def test_a_phantom_extra_word_is_dropped_on_a_second_listen(
     assert any(name == target and window is not None for name, window in hears.calls)
 
 
+async def test_a_word_doubled_only_by_the_transcriber_is_dropped_on_a_second_listen(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Episode 011's "blood tests. tests.": the second listen found the scripted
+    "tests" beside the extra one and took it as the extra heard again. It has to
+    hear the word as often as the first pass did."""
+    _, script_id = project_and_script
+    await _generated(engine, script_id, settings, registry)
+    target = _take_file(engine, script_id, 3)
+    # Chunk 3 reads "The jackdaws had not fled": a second "had" in front of it.
+    hears = HearsTheScript(engine, extras={target: ("had", 0.9)}, phantoms={target})
+
+    results = service.verify_script(engine, script_id, hears, registry)
+
+    chunk3 = next(r for r in results if r.chunk_ordinal == 3)
+    assert chunk3.status == "clear"
+    [extra] = [f for f in chunk3.findings if f.kind == "extra"]
+    assert (extra.severity, extra.heard) == (INFO, "had")
+    assert "not twice" in extra.note
+
+
+async def test_a_word_the_narrator_really_doubled_survives_the_second_listen(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    _, script_id = project_and_script
+    await _generated(engine, script_id, settings, registry)
+    target = _take_file(engine, script_id, 3)
+    hears = HearsTheScript(engine, extras={target: ("had", 0.9)})
+
+    results = service.verify_script(engine, script_id, hears, registry)
+
+    chunk3 = next(r for r in results if r.chunk_ordinal == 3)
+    assert chunk3.status == "suspect"
+    [extra] = chunk3.problems
+    assert (extra.severity, extra.kind, extra.heard) == (FAIL, "extra", "had")
+
+
 async def test_a_real_extra_word_survives_the_second_listen(
     engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
 ) -> None:
@@ -353,3 +390,68 @@ async def test_the_timeline_knows_which_takes_speech_to_text_heard(
     with session_scope(engine) as session:
         narration = build_timeline(session, script_id).narration
     assert [e.heard for e in narration] == [False] + [True] * (len(narration) - 1)
+
+
+def test_fine_on_the_command_line_accepts_the_cut_take_and_can_be_taken_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from narrate import cli
+    from narrate.db.models import Cut, Project, Script
+    from narrate.db.session import init_db, make_engine
+    from narrate.settings import get_settings
+
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("NARRATE_DB_PATH", str(db))
+    monkeypatch.setenv("NARRATE_DATABASE_URL", f"sqlite:///{db}")
+    monkeypatch.setenv("NARRATE_ASSETS_DIR", str(tmp_path / "assets"))
+    engine = make_engine(db)
+    init_db(engine)
+    with session_scope(engine) as session:
+        project = Project(name="p", model_id="eleven_v3")
+        session.add(project)
+        session.flush()
+        script = Script(project_id=project.id, title="s", source_text="x", source_sha256="h")
+        session.add(script)
+        session.flush()
+        for ordinal, status in ((1, "suspect"), (2, "clear")):
+            chunk = Chunk(script_id=script.id, ordinal=ordinal, text="x")
+            session.add(chunk)
+            session.flush()
+            take = Take(
+                chunk_id=chunk.id,
+                idempotency_key=f"k{ordinal}",
+                model_id="eleven_v3",
+                voice_id="v",
+                submitted_text="x",
+                submitted_chars=1,
+                billed_chars=1,
+                cost_micros=100,
+                status="succeeded",
+                verify_status=status,
+            )
+            session.add(take)
+            session.flush()
+            session.add(Cut(chunk_id=chunk.id, script_id=script.id, take_id=take.id))
+        script_id = script.id
+
+    def accepted() -> list[bool]:
+        with session_scope(engine) as session:
+            takes = session.scalars(select(Take).order_by(Take.id)).all()
+            return [t.verify_accepted_at is not None for t in takes]
+
+    get_settings.cache_clear()
+    try:
+        runner = CliRunner()
+        fine = runner.invoke(cli.app, ["verify", str(script_id), "--fine", "1,2"])
+        assert fine.exit_code == 0, fine.output
+        assert "fine by ear" in fine.output
+        assert "not flagged" in fine.output
+        assert accepted() == [True, False]
+
+        back = runner.invoke(cli.app, ["verify", str(script_id), "--not-fine", "1"])
+        assert back.exit_code == 0, back.output
+        assert accepted() == [False, False]
+    finally:
+        get_settings.cache_clear()

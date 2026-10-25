@@ -83,6 +83,7 @@ function take(over: Partial<Take> = {}): Take {
     model_id: "eleven_v3",
     in_cut: true,
     verify_status: "suspect",
+    verify_accepted: false,
     findings: [finding()],
     ...over,
   };
@@ -283,6 +284,57 @@ describe("a flagged take says what and where", () => {
     );
     await click(button("Regenerate…"));
     expect(button("Price it")).toBeTruthy();
+  });
+});
+
+describe("a take that is right but always flagged", () => {
+  it("can be called fine after listening, without paying for another", async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    const onChange = vi.fn();
+    await render(
+      <ChunkList chunks={[chunk([take()])]} scriptId={5} busy={false} onChange={onChange} onRegenerate={vi.fn()} />,
+    );
+
+    await click(button("It's fine"));
+
+    expect(fetch.mock.calls[0][0]).toBe("/api/takes/16/accept?accepted=true");
+    expect(onChange).toHaveBeenCalled();
+  });
+
+  it("says so once accepted, keeps what was found, and can be undone", async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response("{}", { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    await render(
+      <ChunkList
+        chunks={[chunk([take({ verify_accepted: true })])]}
+        scriptId={5}
+        busy={false}
+        onChange={() => {}}
+        onRegenerate={vi.fn()}
+      />,
+    );
+    expect(host.textContent).toContain("fine by ear");
+    expect(host.textContent).not.toContain("flagged · 1");
+    // The spot can still be heard again before deciding to undo.
+    expect(button("1:22")).toBeTruthy();
+    expect(button("It's fine")).toBeFalsy();
+
+    await click(host.querySelector('[aria-label="Flag take 1 again"]'));
+    expect(fetch.mock.calls[0][0]).toBe("/api/takes/16/accept?accepted=false");
+  });
+
+  it("is not offered on a take with nothing flagged", async () => {
+    await render(
+      <ChunkList
+        chunks={[chunk([take({ verify_status: "clear", findings: [] })])]}
+        scriptId={5}
+        busy={false}
+        onChange={() => {}}
+        onRegenerate={vi.fn()}
+      />,
+    );
+    expect(button("It's fine")).toBeFalsy();
   });
 });
 

@@ -188,7 +188,7 @@ def _summary_line(timeline: Timeline, ctx: PlanContext) -> str:
         parts.append(f"{len(timeline.effects)} effects")
     if timeline.planned:
         parts.append(f"{len(timeline.planned)} planned")
-    suspect = sum(1 for e in timeline.narration if e.check == "suspect")
+    suspect = sum(1 for e in timeline.narration if e.check == "suspect" and not e.accepted)
     if suspect:
         parts.append(f"**{suspect} take(s) flagged**")
     if ctx.cost_micros:

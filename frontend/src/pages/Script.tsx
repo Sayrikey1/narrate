@@ -56,9 +56,16 @@ export function ScriptPage({
   const deleteTrigger = useRef<HTMLButtonElement | null>(null);
   const [detail, setDetail] = useState(false);
 
-  // Suspect and to-review alike: the aim is an episode with nothing to hear.
+  // Suspect and to-review alike: the aim is an episode with nothing to hear —
+  // less what a person has listened to and said is fine, which regenerating
+  // would only pay to have flagged again.
   const flaggedRows = chunks.filter((c) =>
-    c.takes.some((t) => t.in_cut && (t.verify_status === "suspect" || t.verify_status === "review")),
+    c.takes.some(
+      (t) =>
+        t.in_cut &&
+        !t.verify_accepted &&
+        (t.verify_status === "suspect" || t.verify_status === "review"),
+    ),
   );
   const flagged = flaggedRows.map((c) => c.ordinal);
   const [fixing, setFixing] = useState(false);
@@ -147,13 +154,16 @@ export function ScriptPage({
       const started = await api.verify(scriptId);
       setLog([`Checking takes against the script (${started.mode}) — nothing is sent anywhere.`]);
       follow(started.run_key, (result) => {
-        const rows = (result.results ?? []) as { status: string }[];
-        const count = (status: string) => rows.filter((r) => r.status === status).length;
-        const checked = count("suspect") + count("review") + count("clear");
+        const rows = (result.results ?? []) as { status: string; accepted?: boolean }[];
+        const count = (status: string) =>
+          rows.filter((r) => r.status === status && !r.accepted).length;
+        const byEar = rows.filter((r) => r.accepted).length;
+        const checked = count("suspect") + count("review") + count("clear") + byEar;
         if (!rows.length) return "Nothing new to check.";
         return (
           `${checked} take(s) checked: ${count("suspect")} flagged, ` +
           `${count("review")} to review, ${count("clear")} with no issues found.` +
+          (byEar ? ` ${byEar} flagged but already fine by ear.` : "") +
           (count("error") ? ` ${count("error")} could not be checked.` : "") +
           (count("unverified") ? ` ${count("unverified")} not checked.` : "")
         );

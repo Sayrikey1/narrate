@@ -218,6 +218,10 @@ def plan(
                 continue
             cut_take = session.get(Take, cut[chunk.id]) if chunk.id in cut else None
             status = cut_take.verify_status if cut_take else "none"
+            if cut_take is not None and cut_take.verify_accepted_at is not None:
+                # Listened to and accepted: nothing left for --suspect or
+                # --flagged to fix, though it can still be named with --chunk.
+                status = "accepted"
             if suspect_only and not chunks and status != "suspect":
                 continue
             if flagged_only and not chunks and status not in _RETRY:

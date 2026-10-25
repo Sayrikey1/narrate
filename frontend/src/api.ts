@@ -188,6 +188,9 @@ export const api = {
   ) => post<GenerateStarted>(`/api/scripts/${id}/generate`, body),
   setCut: (id: number, chunk_ordinal: number, take_ordinal: number) =>
     post(`/api/scripts/${id}/cut`, { chunk_ordinal, take_ordinal }),
+  /** A flagged take listened to and judged fine — or, with false, flagged again. */
+  acceptTake: (takeId: number, accepted: boolean) =>
+    post(`/api/takes/${takeId}/accept?accepted=${accepted}`),
 
   slots: (id: number) => request<Slot[]>(`/api/scripts/${id}/effects`),
   addSlot: (id: number, body: Omit<Slot, "id" | "source" | "accepted" | "note" | "effect_id" | "slug" | "cost_micros">) =>

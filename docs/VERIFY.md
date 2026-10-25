@@ -105,6 +105,8 @@ you to ignore it, so most of the work is in *not* reporting things:
    are transcribed again; a word the narrator really said is there again, and a
    transcriber phantom is not. That step removed every phantom in the episode
    and kept both unscripted words.
+   It must hear the word as often as the first pass did: a word the transcriber
+   doubled at a pause is otherwise "heard again" in the scripted copy beside it.
 4. **The waveform is a second witness.** A short loud burst walled in by
    digital silence is how *Them* was garbled. On its own a burst is only worth
    a listen; it becomes suspect when the transcript agrees.

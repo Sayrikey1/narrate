@@ -2431,6 +2431,8 @@ def takes(
 def _check_label(take: Take) -> str:
     """How a take's verification reads in a table. Never a tick."""
     status = take.verify_status
+    if take.verify_accepted_at is not None and status in verify_service.FLAGGED:
+        return f"[dim]fine by ear ({status})[/dim]"
     if status == "suspect":
         count = sum(1 for f in verify_service.findings_of(take) if f.severity == FAIL)
         return f"[red]suspect ({count})[/red]"
@@ -2489,6 +2491,14 @@ def verify(
         False, "--download-model", help="Download the speech model, then exit."
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the download confirmation."),
+    fine: str = typer.Option(
+        None,
+        "--fine",
+        help="Chunks whose flagged take in the cut you listened to and accept, e.g. 3,6.",
+    ),
+    not_fine: str = typer.Option(
+        None, "--not-fine", help="Take back --fine for these chunks, e.g. 6."
+    ),
 ) -> None:
     """Check that every word in the script was actually spoken. Costs nothing.
 
@@ -2498,12 +2508,19 @@ def verify(
 
     "No issues found" is not a guarantee. A word clipped short but still
     recognisable passes every check here, so listen to anything that matters.
+
+    Some things are misread every time — a name the transcriber cannot spell
+    stays flagged however often it is regenerated. Listen, and if it is right,
+    `--fine` stops it being reported without paying for new takes.
     """
     if download_model:
         _download_speech_model(yes)
         return
     if script_id is None:
         _die("Name a script to check:  narrate verify <script_id>")
+    if fine or not_fine:
+        _accept_by_ear(script_id, fine, not_fine)
+        return
 
     settings = get_settings()
     engine = _engine()
@@ -2608,23 +2625,27 @@ def verify(
                 REVIEW: "[yellow]review[/yellow]",
                 INFO: "[dim]info[/dim]",
             }[finding.severity]
+            if result.accepted and finding.severity != INFO:
+                severity = "[dim]fine by ear[/dim]"
             detail = finding.summary + (f"\n[dim]{finding.note}[/dim]" if finding.note else "")
             table.add_row(
                 str(result.chunk_ordinal), str(result.take_ordinal), when, severity, detail
             )
 
-    flagged = [r for r in results if r.status in ("suspect", "review")]
+    flagged = [r for r in results if r.flagged]
     if table.row_count:
         console.print(table)
 
     clear = sum(1 for r in results if r.status == "clear")
+    by_ear = sum(1 for r in results if r.accepted and r.status in verify_service.FLAGGED)
     errors = [r for r in results if r.status == "error"]
     checked = len(results) - len(unchecked) - len(errors)
     console.print(
         f"{checked} take(s) checked: "
-        f"[red]{sum(1 for r in results if r.status == 'suspect')} suspect[/red], "
-        f"[yellow]{sum(1 for r in results if r.status == 'review')} to review[/yellow], "
+        f"[red]{sum(1 for r in flagged if r.status == 'suspect')} suspect[/red], "
+        f"[yellow]{sum(1 for r in flagged if r.status == 'review')} to review[/yellow], "
         f"{clear} with no issues found."
+        + (f" {by_ear} flagged but fine by ear." if by_ear else "")
         + (f" {len(unchecked)} not checked." if unchecked else "")
         + (f" [red]{len(errors)} could not be checked.[/red]" if errors else "")
     )
@@ -2635,17 +2656,19 @@ def verify(
         )
     # In the cut only: with --all-takes, an old take the cut has moved past is
     # history, not something a script gating on this should stop for.
-    suspects = sorted({r.chunk_ordinal for r in results if r.in_cut and r.status == "suspect"})
+    suspects = sorted({r.chunk_ordinal for r in flagged if r.in_cut and r.status == "suspect"})
     # Only takes in the cut are worth regenerating for: with --all-takes, an old
     # flagged take the cut has already moved past must not send you back to it.
-    to_fix = sorted(
-        {r.chunk_ordinal for r in results if r.in_cut and r.status in ("suspect", "review")}
-    )
+    to_fix = sorted({r.chunk_ordinal for r in flagged if r.in_cut})
     if to_fix:
         listed = ",".join(map(str, to_fix))
         console.print(
             f"Fix them (shows the price, sends nothing):  "
             f"[bold]narrate regenerate {script_id} --chunk {listed} --export[/bold]"
+        )
+        console.print(
+            "[dim]Or, if one sounds right when you listen — a name the transcriber "
+            f"cannot spell —  narrate verify {script_id} --fine {listed}[/dim]"
         )
     if suspects:
         raise typer.Exit(EXIT_SUSPECT)
@@ -2655,6 +2678,41 @@ def verify(
         # 1, as for any error: the episode was not fully checked, so a script
         # gating on this must not read the silence as a pass.
         raise typer.Exit(1)
+
+
+def _accept_by_ear(script_id: int, fine: str | None, not_fine: str | None) -> None:
+    """Mark the cut's flagged takes as heard and fine, or take that back."""
+    engine = _engine()
+    wanted = {int(x): True for x in (fine or "").split(",") if x.strip()}
+    wanted |= {int(x): False for x in (not_fine or "").split(",") if x.strip()}
+    with session_scope(engine) as session:
+        _require_script(session, script_id)
+        rows = session.execute(
+            select(Chunk.ordinal, Take.id, Take.ordinal)
+            .join(Cut, Cut.chunk_id == Chunk.id)
+            .join(Take, Take.id == Cut.take_id)
+            .where(Chunk.script_id == script_id, Chunk.ordinal.in_(list(wanted)))
+        ).all()
+    found = {ordinal: (take_id, take) for ordinal, take_id, take in rows}
+    missing = sorted(set(wanted) - set(found))
+    if missing:
+        _die(f"Script {script_id} has no take in the cut for chunk {', '.join(map(str, missing))}.")
+    for ordinal in sorted(wanted):
+        take_id, take = found[ordinal]
+        try:
+            verify_service.accept(engine, take_id, wanted[ordinal])
+        except verify_service.CannotAccept:
+            console.print(
+                f"[dim]Chunk {ordinal}, take {take}: not flagged — nothing to accept.[/dim]"
+            )
+            continue
+        if wanted[ordinal]:
+            console.print(
+                f"[green]Chunk {ordinal}, take {take}: fine by ear.[/green] "
+                "[dim]No longer reported as flagged; its findings are kept.[/dim]"
+            )
+        else:
+            console.print(f"[yellow]Chunk {ordinal}, take {take}: flagged again.[/yellow]")
 
 
 def _stamp(seconds: float) -> str:
@@ -2779,6 +2837,7 @@ def regenerate_cmd(
             "suspect": "[red]suspect[/red]",
             "review": "[yellow]review[/yellow]",
             "clear": "[dim]no issues found[/dim]",
+            "accepted": "[dim]fine by ear[/dim]",
         }.get(item.cut_status, "[dim]-[/dim]")
         table.add_row(
             str(item.ordinal),
@@ -2952,13 +3011,15 @@ def _still_flagged(engine: Engine, script_id: int, ordinals: list[int]) -> dict[
     """Chunks whose take in the cut is still suspect or to review."""
     with session_scope(engine) as session:
         rows = session.execute(
-            select(Chunk.ordinal, Take.verify_status)
+            select(Chunk.ordinal, Take)
             .join(Cut, Cut.chunk_id == Chunk.id)
             .join(Take, Take.id == Cut.take_id)
             .where(Chunk.script_id == script_id, Chunk.ordinal.in_(ordinals))
             .order_by(Chunk.ordinal)
         ).all()
-    return {ordinal: status for ordinal, status in rows if status in ("suspect", "review")}
+        return {
+            ordinal: take.verify_status for ordinal, take in rows if verify_service.flagged(take)
+        }
 
 
 def _rebuild_episode(engine: Engine, script_id: int, settings: Settings) -> None:
@@ -3040,7 +3101,7 @@ def cut_set(
             existing.take_id = chosen.id
         else:
             session.add(Cut(chunk_id=row.id, script_id=script_id, take_id=chosen.id))
-        flagged = chosen.verify_status in ("suspect", "review")
+        flagged = verify_service.flagged(chosen)
         problems = [f.summary for f in verify_service.findings_of(chosen) if f.severity != INFO]
     console.print(f"[green]Chunk {chunk_ordinal} now uses take {take}.[/green]")
     if flagged:
@@ -3112,15 +3173,16 @@ def export(
         narration = build_timeline(
             session, script_id, gap_seconds=settings.gap_seconds, voice_id=voice or None
         ).narration
-    suspects = [e.chunk_ordinal for e in narration if e.check == "suspect"]
+    suspects = [e.chunk_ordinal for e in narration if e.check == "suspect" and not e.accepted]
     # Keyed on the take, not its duration: a take recorded without one (ffmpeg
     # missing at the time, or from before durations were kept) still ships.
     # "Checked" means heard by speech-to-text — the waveform alone cannot clear
-    # a take, so a take it merely flagged for review was never checked either.
+    # a take, so a take it merely flagged for review was never checked either —
+    # or heard by a person who accepted what was flagged.
     unchecked = [
         e.chunk_ordinal
         for e in narration
-        if e.take_id is not None and e.check != "suspect" and not e.heard
+        if e.take_id is not None and e.check != "suspect" and not e.heard and not e.accepted
     ]
     if require_verified and (suspects or unchecked):
         problems = []

@@ -125,6 +125,7 @@ def _adopt_pre_alembic(engine: Engine) -> None:
             "verify_findings_json": "TEXT",
             "verifier": "VARCHAR(96)",
             "verified_at": "DATETIME",
+            "verify_accepted_at": "DATETIME",
         },
     }
     inspector = inspect(engine)

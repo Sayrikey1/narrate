@@ -858,6 +858,26 @@ async def test_flagged_selects_suspect_and_review_alike(
     assert [p.ordinal for p in regen.plan(engine, script_id, registry, suspect_only=True)] == [1]
 
 
+async def test_flagged_leaves_out_a_take_accepted_by_ear(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Fixing everything flagged must not pay again for a take a person has
+    listened to and said is fine — though naming its chunk still works."""
+    _, script_id = project_and_script
+    await _episode(engine, script_id, settings, registry, HearsTheScript(engine))
+    with session_scope(engine) as session:
+        for chunk in session.scalars(select(Chunk)).all():
+            for take in chunk.takes:
+                take.verify_status = {1: "suspect", 2: "review"}.get(chunk.ordinal, "clear")
+    [first] = service.stored(engine, script_id, chunks=[1])
+    service.accept(engine, first.take_id)
+
+    assert [p.ordinal for p in regen.plan(engine, script_id, registry, flagged_only=True)] == [2]
+    assert regen.plan(engine, script_id, registry, suspect_only=True) == []
+    [named] = regen.plan(engine, script_id, registry, chunks=[1])
+    assert named.cut_status == "accepted"
+
+
 # --------------------------------------------------------------------------
 # Found in review: retries only where a retry can help
 # --------------------------------------------------------------------------

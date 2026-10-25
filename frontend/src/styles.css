@@ -1027,6 +1027,7 @@ button.chip[aria-pressed="true"] { border-color: var(--accent); color: var(--acc
   align-items: baseline; gap: var(--s-2);
 }
 .findings li.faint { display: block; }
+.findings.accepted { opacity: 0.6; }
 .findings li.fail { color: var(--danger); }
 .findings li.review { color: var(--planned); }
 .findings li > span { color: var(--text); }

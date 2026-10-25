@@ -275,6 +275,7 @@ def _check_payload(result: verify_service.TakeCheck) -> dict[str, Any]:
         "chunk_ordinal": result.chunk_ordinal,
         "take_ordinal": result.take_ordinal,
         "status": result.status,
+        "accepted": result.accepted,
         "in_cut": result.in_cut,
         "seconds": result.seconds,
         "error": result.error,
@@ -979,6 +980,7 @@ def create_app(
                                 "model_id": take.model_id,
                                 "in_cut": selected.get(row.id) == take.id,
                                 "verify_status": take.verify_status,
+                                "verify_accepted": take.verify_accepted_at is not None,
                                 "findings": [
                                     {**f.as_dict(), "summary": f.summary}
                                     for f in verify_service.findings_of(take)
@@ -1308,6 +1310,21 @@ def create_app(
 
         background.add_task(work)
         return {"run_key": run_key, "mode": mode}
+
+    @app.post("/api/takes/{take_id}/accept")
+    def accept_take(take_id: int, accepted: bool = True) -> dict[str, Any]:
+        """A flagged take listened to and judged fine — or that taken back."""
+        try:
+            take = verify_service.accept(db, take_id, accepted)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except verify_service.CannotAccept as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {
+            "id": take.id,
+            "verify_status": take.verify_status,
+            "verify_accepted": take.verify_accepted_at is not None,
+        }
 
     @app.post("/api/scripts/{script_id}/regenerate")
     async def regenerate_chunks(

@@ -122,7 +122,13 @@ def _build_previous_release(path: Path) -> None:
             conn.execute(text(f"ALTER TABLE script DROP COLUMN {column}"))
         for column in ("description_boilerplate", "default_tags"):
             conn.execute(text(f"ALTER TABLE project DROP COLUMN {column}"))
-        for column in ("verify_status", "verify_findings_json", "verifier", "verified_at"):
+        for column in (
+            "verify_status",
+            "verify_findings_json",
+            "verifier",
+            "verified_at",
+            "verify_accepted_at",
+        ):
             conn.execute(text(f"ALTER TABLE take DROP COLUMN {column}"))
         conn.execute(text("ALTER TABLE project DROP COLUMN archived_at"))
         conn.execute(text("ALTER TABLE script DROP COLUMN archived_at"))
@@ -209,7 +215,14 @@ def test_account_level_entries_may_have_no_project(tmp_path: Path) -> None:
 # release, which the narrower test above could not notice.
 LATER_COLUMNS: dict[str, tuple[str, ...]] = {
     "chunk": ("start_offset", "target_start_s", "turns_json", "chapter_title"),
-    "take": ("voices_json", "verify_status", "verify_findings_json", "verifier", "verified_at"),
+    "take": (
+        "voices_json",
+        "verify_status",
+        "verify_findings_json",
+        "verifier",
+        "verified_at",
+        "verify_accepted_at",
+    ),
     "script": ("description", "tags", "target_seconds", "archived_at"),
     "project": ("description_boilerplate", "default_tags", "archived_at"),
 }
@@ -277,7 +290,13 @@ def test_existing_takes_start_unverified_after_the_upgrade(tmp_path: Path) -> No
             )
         )
     with engine.begin() as conn:
-        for column in ("verify_status", "verify_findings_json", "verifier", "verified_at"):
+        for column in (
+            "verify_status",
+            "verify_findings_json",
+            "verifier",
+            "verified_at",
+            "verify_accepted_at",
+        ):
             conn.execute(text(f"ALTER TABLE take DROP COLUMN {column}"))
         conn.execute(text("ALTER TABLE project DROP COLUMN archived_at"))
         conn.execute(text("ALTER TABLE script DROP COLUMN archived_at"))
@@ -305,6 +324,7 @@ def test_a_deleted_episode_keeps_its_row_after_the_upgrade(tmp_path: Path) -> No
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE project DROP COLUMN archived_at"))
         conn.execute(text("ALTER TABLE script DROP COLUMN archived_at"))
+        conn.execute(text("ALTER TABLE take DROP COLUMN verify_accepted_at"))
         conn.execute(text("UPDATE alembic_version SET version_num = 'b8e41d27c3f9'"))
     engine.dispose()
 
@@ -315,3 +335,43 @@ def test_a_deleted_episode_keeps_its_row_after_the_upgrade(tmp_path: Path) -> No
             text("SELECT archived_at FROM script UNION ALL SELECT archived_at FROM project")
         ).all()
     assert [tuple(r) for r in rows] == [(None,), (None,)]
+
+
+def test_flagged_takes_are_not_accepted_after_the_upgrade(tmp_path: Path) -> None:
+    """Nobody has listened to them yet, so a flagged take stays flagged."""
+    db = tmp_path / "prev.db"
+    engine = make_engine(db)
+    init_db(engine)
+    with session_scope(engine) as session:
+        project = Project(name="p", model_id="eleven_v3")
+        session.add(project)
+        session.flush()
+        script = Script(project_id=project.id, title="s", source_text="x", source_sha256="h")
+        session.add(script)
+        session.flush()
+        chunk = Chunk(script_id=script.id, ordinal=1, text="x")
+        session.add(chunk)
+        session.flush()
+        session.add(
+            Take(
+                chunk_id=chunk.id,
+                idempotency_key="k",
+                model_id="eleven_v3",
+                voice_id="v",
+                submitted_text="x",
+                submitted_chars=1,
+                billed_chars=1,
+                cost_micros=100,
+                verify_status="suspect",
+            )
+        )
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE take DROP COLUMN verify_accepted_at"))
+        conn.execute(text("UPDATE alembic_version SET version_num = 'd4a7e2c91b36'"))
+    engine.dispose()
+
+    engine = make_engine(db)
+    init_db(engine)
+    with engine.begin() as conn:
+        row = conn.execute(text("SELECT verify_status, verify_accepted_at FROM take")).one()
+    assert tuple(row) == ("suspect", None)

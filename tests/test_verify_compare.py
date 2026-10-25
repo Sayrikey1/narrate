@@ -80,6 +80,50 @@ def test_a_name_heard_as_two_words_is_not_a_defect() -> None:
     assert problems(found) == []
 
 
+@pytest.mark.parametrize(
+    ("written", "heard"),
+    [
+        # Episode 011: the possessive written out as "is", and "who'd" as
+        # "who would". Each was flagged on four takes running.
+        ("That's not who sat on Theranos's board.", "That's not who sat on Theranos board."),
+        ("And the patients who'd trusted them.", "And the patients who trusted them."),
+        ("And the patients who\u2019d trusted them.", "And the patients who trusted them."),
+        ("The company's board met.", "The company board met."),
+        ("We'll see what they've done.", "We see what they done."),
+    ],
+)
+def test_a_contraction_ending_run_into_its_word_is_not_a_defect(written: str, heard: str) -> None:
+    assert problems(classify(written, evenly(heard))) == []
+
+
+def test_a_contraction_ending_is_not_a_defect_even_with_a_gap() -> None:
+    """ "Theranos's" heard as "Theranos" left 0.3s before "board" — the ending
+    itself, spoken where the transcriber stopped writing."""
+    heard = evenly("That's not who sat on Theranos") + words(("board.", 2.4, 2.7, 0.99))
+    found = classify("That's not who sat on Theranos's board.", heard)
+    assert problems(found) == []
+    assert [(f.kind, f.expected, f.note) for f in found] == [
+        ("missing", "is", "the ending of a contraction")
+    ]
+
+
+def test_a_word_dropped_beside_a_contraction_still_fails() -> None:
+    found = problems(classify("The patients who'd trusted them.", evenly("The who trusted them.")))
+    assert [(f.severity, f.kind, f.expected) for f in found] == [(FAIL, "missing", "patients")]
+
+
+def test_a_name_spelled_by_ear_with_a_k_is_not_garbled() -> None:
+    """ "Carreyrou" came back as "Kerrirou" at p=0.22: one name, spelled by ear,
+    differing first in a letter that sounds the same."""
+    heard = words(
+        ("John", 0.0, 0.4, 0.90),
+        ("Kerrirou,", 0.42, 0.96, 0.22),
+        ("a", 1.0, 1.1, 0.99),
+        ("reporter", 1.1, 1.5, 0.99),
+    )
+    assert problems(classify("John Carreyrou, a reporter", heard)) == []
+
+
 def test_a_low_confidence_phantom_after_a_long_word_is_info() -> None:
     """small.en tacks a near-zero-confidence word onto a sentence-final word
     ("product." + "act"). It is a known phantom, not something to act on."""
@@ -141,6 +185,32 @@ def test_a_dropped_content_word_fails_even_with_no_hole() -> None:
         classify("It is a decision about what you want.", evenly("It is a about what you want."))
     )
     assert [(f.severity, f.kind, f.expected) for f in found] == [(FAIL, "missing", "decision")]
+
+
+@pytest.mark.parametrize(
+    ("written", "heard", "lost"),
+    [
+        ("He didn't sign it.", "He did sign it.", "not"),
+        ("He did not sign it.", "He did sign it.", "not"),
+        ("There is no way out.", "There is way out.", "no"),
+    ],
+)
+def test_a_dropped_negation_fails_even_with_no_hole(written: str, heard: str, lost: str) -> None:
+    """Short like "the", but losing it reverses the sentence."""
+    found = problems(classify(written, evenly(heard)))
+    assert [(f.severity, f.kind, f.expected) for f in found] == [(FAIL, "missing", lost)]
+
+
+@pytest.mark.parametrize(
+    ("written", "heard"),
+    [
+        ("He didn't sign it.", "He did not sign it."),
+        ("You cannot win.", "You can't win."),
+        ("It isn't over.", "It is not over."),
+    ],
+)
+def test_a_negation_read_either_way_is_not_a_defect(written: str, heard: str) -> None:
+    assert problems(classify(written, evenly(heard))) == []
 
 
 def test_a_neighbour_stretched_over_the_hole_still_fails() -> None:

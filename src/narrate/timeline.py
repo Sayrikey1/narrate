@@ -71,6 +71,9 @@ class TimelineEntry:
     # alone cannot clear a take, so a gate that must know a take was *heard*
     # reads this, not `check`.
     heard: bool = False
+    # A person listened to what the check flagged and accepted the take, so it
+    # is no longer reported as flagged — `check` still says what was found.
+    accepted: bool = False
 
     @property
     def duration_s(self) -> float:
@@ -120,8 +123,9 @@ class Timeline:
 
     @property
     def flagged(self) -> list[TimelineEntry]:
-        """Narration whose take `narrate verify` flagged, in running order."""
-        return [e for e in self.narration if e.check in ("suspect", "review")]
+        """Narration whose take `narrate verify` flagged, in running order —
+        less any a person has since listened to and accepted."""
+        return [e for e in self.narration if e.check in ("suspect", "review") and not e.accepted]
 
     @property
     def chapter_starts(self) -> list[TimelineEntry]:
@@ -285,6 +289,7 @@ def build_timeline(
                 check=take.verify_status if take else None,
                 issues=_issues(take) if take else (),
                 heard=take is not None and heard_by_transcript(take.verifier),
+                accepted=take is not None and take.verify_accepted_at is not None,
             )
         )
         index += 1

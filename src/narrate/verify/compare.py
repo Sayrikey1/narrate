@@ -52,7 +52,7 @@ INFO = "info"
 
 # Bumped whenever a rule or threshold changes, so a take checked under old rules
 # can be found and re-checked. Recorded in `Take.verifier`.
-RULES_VERSION = 2
+RULES_VERSION = 5
 
 # -- thresholds, each with the measurement behind it ---------------------------
 
@@ -93,11 +93,13 @@ LONG_WORD_VOICED_S = 0.8
 
 # Words whose loss is still a fail when there is a gap, but not on its own. A
 # dropped "the" with no audible hole is more often the transcriber's than the
-# narrator's.
+# narrator's. "not" and "no" are short too, but not on this list: losing one
+# reverses the sentence — "He didn't sign it" heard as "He did sign it" — and
+# that is worth a listen even when the transcriber might be to blame.
 STOP = frozenset(
     """a an the and or but so of to in on at by for with from it its is are was
     were be been am i you he she we they them us me him her this that these those
-    then than there their our your my do did does not no yes as if""".split()
+    then than there their our your my do did does yes as if""".split()
 )
 
 _NUMBER_WORDS = {
@@ -267,6 +269,35 @@ def normalise(text: str) -> list[str]:
     return _normaliser()(text.translate(_BRACKETS)).split()
 
 
+# A contraction whose ending is a single consonant. The normaliser writes it out
+# in full — "Theranos's" becomes "theranos is", "who'd" becomes "who would" —
+# but what is spoken is one /s/, /z/, /d/, /l/ or /v/ that the transcriber runs
+# into the word before: "Theranos's board" came back as "Theranos board", and
+# "who'd trusted" as "who trusted". Each read as a missing word, and every
+# regeneration was flagged the same way, three times over. "n't" is not one of
+# these: losing it reverses the sentence.
+_CLITIC = re.compile(r"(?<=\w)['\u2019](?:s|d|ll|ve)\b", re.IGNORECASE)
+
+
+def _clitics(text: str, expected: list[str]) -> frozenset[int]:
+    """Positions in `expected` that exist only because a contraction was written out.
+
+    Found by normalising the text again with those endings removed and seeing
+    which tokens disappear, so it agrees with the normaliser by construction
+    rather than by a second list of what each contraction expands to.
+    """
+    bare = normalise(_CLITIC.sub("", text))
+    if len(bare) == len(expected):
+        return frozenset()
+    matcher = difflib.SequenceMatcher(None, expected, bare, autojunk=False)
+    return frozenset(
+        index
+        for tag, first, last, _, _ in matcher.get_opcodes()
+        if tag == "delete"
+        for index in range(first, last)
+    )
+
+
 # Words interchangeable in speech, compared as one.
 _SAME_WORD = {"an": "a", "per": "a"}
 
@@ -316,7 +347,7 @@ def join_pieces(words: list[Word]) -> list[Word]:
 
 
 @dataclass(frozen=True)
-class _Heard:
+class Heard:
     """A normalised heard token and the span of words it came from."""
 
     token: str
@@ -328,7 +359,7 @@ class _Heard:
     words: int = 1
 
 
-def heard_tokens(words: list[Word]) -> list[_Heard]:
+def heard_tokens(words: list[Word]) -> list[Heard]:
     """Normalise the transcript *with context*, keeping each token's timing.
 
     Numbers need their neighbours — "ten", "million", "dollars" is one token —
@@ -351,7 +382,7 @@ def heard_tokens(words: list[Word]) -> list[_Heard]:
         spans, previous = rebuilt, current
 
     return [
-        _Heard(
+        Heard(
             token=token,
             start=words[first].start,
             end=words[last].end,
@@ -360,6 +391,26 @@ def heard_tokens(words: list[Word]) -> list[_Heard]:
         )
         for token, (first, last) in zip(previous, spans, strict=True)
     ]
+
+
+def heard_at(tokens: list[Heard], word: str, lo: float, hi: float) -> list[Heard]:
+    """Each place `word` was heard, starting between `lo` and `hi` seconds.
+
+    As a run of up to three tokens, not only one: two listens can split a word
+    differently — "Cashflow" the first time, "cash flow" the second. One entry
+    per place, its least confident token.
+    """
+    target = canon([word])
+    found: dict[float, Heard] = {}
+    for index, token in enumerate(tokens):
+        if not lo <= token.start <= hi:
+            continue
+        for n in (1, 2, 3):
+            run = tokens[index : index + n]
+            if len(run) == n and canon([h.token for h in run]) == target:
+                found.setdefault(token.start, min(run, key=lambda h: h.probability))
+                break
+    return list(found.values())
 
 
 # -- alignment -----------------------------------------------------------------
@@ -459,6 +510,16 @@ def _soundex(word: str) -> str:
     return (out + "000")[:4]
 
 
+# Soundex keeps the first letter as written, so a name spelled by ear —
+# "Carreyrou" heard as "kerrirou" — differs in a letter that sounds the same.
+_SAME_INITIAL = str.maketrans("kq", "cc")
+
+
+def _sounds_alike(a: str, b: str) -> bool:
+    x, y = _soundex(a), _soundex(b)
+    return x[:1].translate(_SAME_INITIAL) + x[1:] == y[:1].translate(_SAME_INITIAL) + y[1:]
+
+
 def _is_numeric(tokens: list[str]) -> bool:
     return bool(tokens) and all(
         _NUMERIC.fullmatch(t) or t in _NUMBER_WORDS or t in _QUANTITY_LETTERS for t in tokens
@@ -510,6 +571,7 @@ def classify(
     """
     words = join_pieces(words)
     expected = normalise(expected_spoken)
+    clitics = _clitics(expected_spoken, expected)
     heard = heard_tokens(words)
     ops = align(expected, [h.token for h in heard])
 
@@ -522,7 +584,7 @@ def classify(
         start = k
         while k < len(ops) and ops[k].op != "=":
             k += 1
-        findings.extend(_region(ops, start, k, expected, heard))
+        findings.extend(_region(ops, start, k, expected, heard, clitics))
 
     if voiced is not None:
         for h in heard:
@@ -550,7 +612,12 @@ def classify(
 
 
 def _region(
-    ops: list[_Op], start: int, stop: int, expected: list[str], heard: list[_Heard]
+    ops: list[_Op],
+    start: int,
+    stop: int,
+    expected: list[str],
+    heard: list[Heard],
+    clitics: frozenset[int] = frozenset(),
 ) -> list[Finding]:
     region = ops[start:stop]
     e_idx = [o.e for o in region if o.e is not None]
@@ -659,15 +726,19 @@ def _region(
         stretched = any(h.end - h.start >= STRETCH_S and h.probability < STRETCH_P for h in near)
         content = [d for d in deleted if d not in STOP]
         severity = FAIL if (gap >= GAP_S or stretched or content or len(deleted) >= 2) else INFO
+        # Only a contraction's ending is missing. A gap is no evidence here: the
+        # ending is spoken *in* it, after the word the transcriber cut short.
+        ending = all(i in clitics for i in deleted_at)
         out.append(
             Finding(
-                severity=cap(severity),
+                severity=INFO if ending else cap(severity),
                 kind="missing",
                 expected=" ".join(deleted),
                 start_s=anchor,
                 end_s=after.start if after else None,
                 gap_s=round(gap, 2) if gap else None,
                 context=context,
+                note="the ending of a contraction" if ending else "",
                 word=min(deleted_at),
                 word_end=max(deleted_at),
             )
@@ -711,7 +782,7 @@ def _region(
         garbled = (
             expected_word not in STOP
             and h.probability < GARBLE_P
-            and _soundex(expected_word) != _soundex(h.token)
+            and not _sounds_alike(expected_word, h.token)
             and not inflected
         )
         kind = "garbled" if garbled and not reworded else "reworded"
@@ -758,7 +829,7 @@ def _peel(
     e_idx: list[int],
     h_idx: list[int],
     expected: list[str],
-    heard: list[_Heard],
+    heard: list[Heard],
     same: Callable[[list[str], list[str]], bool],
 ) -> tuple[set[int], set[int], str] | None:
     """Tokens to keep, after peeling up to two off either end of either side.

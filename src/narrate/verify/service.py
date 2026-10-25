@@ -45,9 +45,10 @@ from narrate.verify.compare import (
     REVIEW,
     RULES_VERSION,
     Finding,
+    Heard,
     Word,
-    canon,
     classify,
+    heard_at,
     heard_tokens,
     join_pieces,
     verdict,
@@ -90,10 +91,49 @@ class TakeCheck:
     seconds: float = 0.0
     error: str | None = None
     in_cut: bool = False
+    # A person listened to what was flagged and said the take is fine.
+    accepted: bool = False
 
     @property
     def problems(self) -> list[Finding]:
         return [f for f in self.findings if f.severity in (FAIL, REVIEW)]
+
+    @property
+    def flagged(self) -> bool:
+        return self.status in FLAGGED and not self.accepted
+
+
+# Verdicts that send a take back to be listened to — until a person has.
+FLAGGED = frozenset({"suspect", "review"})
+
+
+def flagged(take: Take) -> bool:
+    """Whether a take still needs listening to: flagged, and not accepted by ear."""
+    return take.verify_status in FLAGGED and take.verify_accepted_at is None
+
+
+class CannotAccept(Exception):
+    """Accepting a take that has nothing flagged to accept."""
+
+
+def accept(engine: Engine, take_id: int, accepted: bool = True) -> Take:
+    """Say a flagged take is fine after listening to it — or take that back.
+
+    The check's verdict and findings are left as they were: this records a
+    person's judgement beside them, not a better check.
+    """
+    with session_scope(engine) as session:
+        take = session.get(Take, take_id)
+        if take is None:
+            raise LookupError(f"No take {take_id}.")
+        if accepted and take.verify_status not in FLAGGED:
+            raise CannotAccept(
+                f"Take {take.ordinal} is not flagged, so there is nothing to accept."
+            )
+        take.verify_accepted_at = datetime.now(UTC).replace(tzinfo=None) if accepted else None
+        session.flush()
+        session.expunge(take)
+        return take
 
 
 def expected_text(take: Take, chunk: Chunk, registry: Registry) -> str:
@@ -213,7 +253,9 @@ def check(
     if transcriber is not None:
         words = transcriber.transcribe(target.path)
         findings = classify(target.expected, words, voiced=envelope.voiced if envelope else None)
-        findings = [_confirm(f, target.path, transcriber) for f in findings]
+        if any(f.confirm for f in findings):
+            first = heard_tokens(join_pieces(words))
+            findings = [_confirm(f, target.path, transcriber, first) for f in findings]
 
     if envelope is not None and envelope.has_digital_silence():
         findings = _fold_bursts(findings, envelope, transcript=transcriber is not None)
@@ -252,7 +294,9 @@ def heard_by_transcript(verifier: str | None) -> bool:
     return bool(verifier) and not str(verifier).startswith(f"{ENERGY_ONLY}|")
 
 
-def _confirm(finding: Finding, path: Path, transcriber: Transcriber) -> Finding:
+def _confirm(
+    finding: Finding, path: Path, transcriber: Transcriber, first_pass: list[Heard]
+) -> Finding:
     """Listen again to an uncertain extra word before believing it."""
     if not finding.confirm or finding.kind != "extra":
         return finding
@@ -263,26 +307,27 @@ def _confirm(finding: Finding, path: Path, transcriber: Transcriber) -> Finding:
     # Tokenised the way the first pass was — in context — so a word that only
     # normalises correctly beside its neighbours (a number, a contraction) can
     # still be recognised as the same word the second time.
-    target = canon([finding.heard])
-    tokens = heard_tokens(join_pieces(again))
-    # A run of up to three, not only one: the two listens can split a word
-    # differently — "Cashflow" the first time, "cash flow" the second.
-    match = [
-        min(run, key=lambda h: h.probability)
-        for i in range(len(tokens))
-        for run in (tokens[i : i + n] for n in (1, 2, 3) if i + n <= len(tokens))
-        if canon([h.token for h in run]) == target
-        and abs(run[0].start - start) <= CONFIRM_TOLERANCE_S
-    ]
-    first = finding.probability or 0.0
-    if not match:
+    lo, hi = start - CONFIRM_TOLERANCE_S, start + CONFIRM_TOLERANCE_S
+    match = heard_at(heard_tokens(join_pieces(again)), finding.heard, lo, hi)
+    # As often as the first pass heard it there, not merely once. A word
+    # doubled at a pause — "blood tests. tests." on episode 011 — is "heard
+    # again" in the scripted copy beside it, which says nothing about the
+    # other: there, 0.14s of voice where a spoken "tests" takes 0.35s, and a
+    # single "tests" on the second listen.
+    needed = max(1, len(heard_at(first_pass, finding.heard, lo, hi)))
+    probability = finding.probability or 0.0
+    if len(match) < needed:
         return replace(
             finding,
             severity=INFO,
             confirm=False,
-            note="not heard on a second listen — a transcriber phantom",
+            note=(
+                "heard once on a second listen, not twice — the transcriber's repeat"
+                if match
+                else "not heard on a second listen — a transcriber phantom"
+            ),
         )
-    best = max(first, *(w.probability for w in match))
+    best = max(probability, *(w.probability for w in match))
     severity = FAIL if best >= INSERT_P else REVIEW
     return replace(
         finding,
@@ -337,6 +382,13 @@ def record(engine: Engine, result: TakeCheck) -> None:
         take = session.get(Take, result.take_id)
         if take is None:
             return
+        # An acceptance covers what was heard. A later check that finds only
+        # those things again — or fewer — leaves it standing; anything new
+        # needs listening to, so it is withdrawn.
+        if take.verify_accepted_at is not None:
+            heard = {_key(f) for f in findings_of(take)}
+            if not result.problems or any(_key(f) not in heard for f in result.problems):
+                take.verify_accepted_at = None
         take.verify_status = result.status
         take.verify_findings_json = json.dumps(
             [f.as_dict() for f in result.findings if f.severity != INFO]
@@ -345,6 +397,12 @@ def record(engine: Engine, result: TakeCheck) -> None:
         )
         take.verifier = result.verifier or None
         take.verified_at = datetime.now(UTC).replace(tzinfo=None)
+        result.accepted = take.verify_accepted_at is not None
+
+
+def _key(finding: Finding) -> tuple[str, str, str]:
+    """A finding by what it is, not when: a re-check shifts times slightly."""
+    return finding.kind, finding.expected, finding.heard
 
 
 def findings_of(take: Take) -> list[Finding]:
@@ -398,6 +456,7 @@ def stored(
                     findings=findings_of(take),
                     verifier=take.verifier or "",
                     in_cut=in_cut,
+                    accepted=take.verify_accepted_at is not None,
                 )
             )
         return out

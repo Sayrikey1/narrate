@@ -366,3 +366,79 @@ def test_rebuilding_catches_up_an_export_an_earlier_run_left_stale(
 
     assert result["regenerated"][0]["moved"] is False
     assert result["exported"]["chunks"] == 3
+
+
+def _check(client: TestClient, script_id: int, **body: Any) -> None:
+    started = client.post(f"/api/scripts/{script_id}/verify", json=body).json()
+    _drain(client, started["run_key"])
+
+
+def _cut_take(client: TestClient, script_id: int, ordinal: int) -> dict[str, Any]:
+    chunk = client.get(f"/api/scripts/{script_id}/chunks").json()[ordinal - 1]
+    take: dict[str, Any] = next(t for t in chunk["takes"] if t["in_cut"])
+    return take
+
+
+def test_a_flagged_take_listened_to_can_be_accepted(
+    client: TestClient, script_id: int, engine: Engine, hears: HearsTheScript
+) -> None:
+    """A name the transcriber cannot spell is flagged on every take; paying for
+    another does not help. Accepting it stops the reports, not the record."""
+    hears.drops[_take_file(engine, 2)] = "radio"
+    _check(client, script_id)
+    take = _cut_take(client, script_id, 2)
+    assert "Takes to check" in client.get(f"/api/scripts/{script_id}/plan").json()["markdown"]
+
+    answer = client.post(f"/api/takes/{take['id']}/accept")
+
+    assert answer.status_code == 200
+    assert answer.json()["verify_accepted"] is True
+    take = _cut_take(client, script_id, 2)
+    # The check's verdict and what it found stay, to be heard again.
+    assert (take["verify_status"], take["verify_accepted"]) == ("suspect", True)
+    assert take["findings"]
+    assert "Takes to check" not in client.get(f"/api/scripts/{script_id}/plan").json()["markdown"]
+
+
+def test_accepting_can_be_taken_back(
+    client: TestClient, script_id: int, engine: Engine, hears: HearsTheScript
+) -> None:
+    hears.drops[_take_file(engine, 2)] = "radio"
+    _check(client, script_id)
+    take_id = _cut_take(client, script_id, 2)["id"]
+    client.post(f"/api/takes/{take_id}/accept")
+
+    client.post(f"/api/takes/{take_id}/accept?accepted=false")
+
+    assert _cut_take(client, script_id, 2)["verify_accepted"] is False
+    assert "Takes to check" in client.get(f"/api/scripts/{script_id}/plan").json()["markdown"]
+
+
+def test_a_take_with_nothing_flagged_cannot_be_accepted(client: TestClient, script_id: int) -> None:
+    _check(client, script_id)
+    take_id = _cut_take(client, script_id, 1)["id"]
+
+    answer = client.post(f"/api/takes/{take_id}/accept")
+
+    assert answer.status_code == 409
+    assert "nothing to accept" in answer.json()["detail"]
+    assert client.post("/api/takes/99999/accept").status_code == 404
+
+
+def test_a_recheck_keeps_an_acceptance_unless_it_finds_something_new(
+    client: TestClient, script_id: int, engine: Engine, hears: HearsTheScript
+) -> None:
+    hears.drops[_take_file(engine, 2)] = "radio"
+    _check(client, script_id)
+    take_id = _cut_take(client, script_id, 2)["id"]
+    client.post(f"/api/takes/{take_id}/accept")
+
+    _check(client, script_id, recheck=True)
+    assert _cut_take(client, script_id, 2)["verify_accepted"] is True
+
+    # What was accepted was a missing "radio". A different word missing is
+    # something nobody has listened to.
+    hears.drops[_take_file(engine, 2)] = "answered"
+    _check(client, script_id, recheck=True)
+    take = _cut_take(client, script_id, 2)
+    assert (take["verify_status"], take["verify_accepted"]) == ("suspect", False)

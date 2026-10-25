@@ -258,6 +258,11 @@ class Take(Base):
     # rules can be found and checked again.
     verifier: Mapped[str | None] = mapped_column(String(96), default=None)
     verified_at: Mapped[datetime | None] = mapped_column(default=None)
+    # When a person listened to what the check flagged and said the take is
+    # fine. Kept apart from `verify_status`, which stays the check's own
+    # verdict, so the findings are still there to hear and the choice can be
+    # undone. Cleared when a later check finds anything that was not accepted.
+    verify_accepted_at: Mapped[datetime | None] = mapped_column(default=None)
 
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
