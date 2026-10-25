@@ -9,6 +9,16 @@ import type { ChunkRow, Slot, Timeline } from "../types";
 const deleteSlot = vi.fn(async () => ({}));
 const updateSlot = vi.fn(async () => ({ id: 1, planned: true }));
 const addSlot = vi.fn(async () => ({ id: 5 }));
+const draft = vi.fn(async () => ({
+  kind: "effects",
+  stored: 2,
+  cost_micros: 410,
+  prompt_tokens: 800,
+  completion_tokens: 90,
+  model: "m",
+  errors: [],
+  description_written: false,
+}));
 const acceptSlot = vi.fn(async () => ({}));
 const generateEffects = vi.fn(async (_id: number, dryRun: boolean) => ({
   outcomes: [{ status: dryRun ? "would_generate" : "generated", description: "camera flashes" }],
@@ -19,6 +29,9 @@ vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   api: {
     peaks: () => Promise.resolve({ peaks: [] }),
+    draftQuote: () =>
+      Promise.resolve({ kind: "effects", requests: 3, input_tokens: 900, output_tokens: 660, micros: 500, model: "m", available: true }),
+    draft: (...args: unknown[]) => draft(...(args as [])),
     deleteSlot: (...args: unknown[]) => deleteSlot(...(args as [])),
     updateSlot: (...args: unknown[]) => updateSlot(...(args as [])),
     acceptSlot: (...args: unknown[]) => acceptSlot(...(args as [])),
@@ -46,7 +59,7 @@ beforeEach(() => {
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
-  for (const mock of [deleteSlot, updateSlot, addSlot, acceptSlot, generateEffects, seek, play]) mock.mockClear();
+  for (const mock of [deleteSlot, updateSlot, addSlot, draft, acceptSlot, generateEffects, seek, play]) mock.mockClear();
 });
 
 afterEach(() => {
@@ -188,6 +201,22 @@ describe("generating effects", () => {
     await click(button("Generate 1 for $0.0250"));
     expect(generateEffects).toHaveBeenLastCalledWith(17, false);
     expect(host.textContent).toContain("Generated 1");
+  });
+});
+
+describe("suggesting effects", () => {
+  it("shows the price first, and what it cost after", async () => {
+    const onRefresh = vi.fn();
+    await render(
+      <EffectsPage scriptId={17} script={null} slots={[]} chunks={[]} timeline={null} onRefresh={onRefresh} />,
+    );
+    const suggest = button("Suggest effects…")!;
+    expect(suggest.textContent).toContain("~$0.0005");
+
+    await click(suggest);
+    expect(draft).toHaveBeenCalledWith(17, "effects");
+    expect(host.textContent).toContain("2 suggestions added, none chosen · cost $0.0004");
+    expect(onRefresh).toHaveBeenCalled();
   });
 });
 

@@ -1207,6 +1207,18 @@ def test_a_waveform_path_cannot_leave_the_media_folder(client: TestClient) -> No
     assert client.get("/api/peaks/file", params={"path": "../../.env"}).status_code == 403
 
 
+def test_a_draft_is_priced_before_anything_is_sent(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    quote = client.get(f"/api/scripts/{script['script_id']}/drafts/titles/quote").json()
+    assert quote["micros"] > 0 and quote["requests"] == 2
+    # The tests can never see a real key, so drafting is refused, not sent.
+    assert quote["available"] is False
+    refused = client.post(f"/api/scripts/{script['script_id']}/drafts/titles")
+    assert refused.status_code == 400
+    assert client.get(f"/api/scripts/{script['script_id']}/drafts/poems/quote").status_code == 404
+
+
 # -- the SPA fallback -------------------------------------------------------
 
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { DraftButton } from "../components/DraftButton";
 import { initial } from "../components/Rail";
 import * as transport from "../transport";
 import { DocumentView } from "../ui/DocumentView";
@@ -419,6 +420,7 @@ function Titles({
         <h2 id="titles-h" className="card-title">
           🏷️ Titles
         </h2>
+        <DraftButton scriptId={scriptId} kind="titles" label="Draft more" onDone={onChange} />
       </div>
       {title.candidates.length > 0 ? (
         <div className="title-list">
@@ -434,7 +436,7 @@ function Titles({
         </div>
       ) : (
         <Empty title="No title chosen">
-          Generate candidates with <code>narrate publish draft --go</code>.
+          Draft some with the button above, or write one below.
         </Empty>
       )}
       <OwnTitle scriptId={scriptId} onChange={onChange} />
@@ -564,8 +566,17 @@ function Thumbnail({
         <h2 id="thumb-h" className="card-title">
           🖼️ Thumbnail brief
         </h2>
-        {brief && <span className="pill accent-soft">chosen</span>}
+        {brief ? (
+          <span className="pill accent-soft">chosen</span>
+        ) : null}
       </div>
+      <DraftButton
+        scriptId={scriptId}
+        kind="briefs"
+        label={data.briefs.length ? "Draft more briefs" : "Draft briefs"}
+        onDone={onChange}
+        className="draft-block"
+      />
       {brief ? (
         <dl className="brief">
           <div>
@@ -598,8 +609,7 @@ function Thumbnail({
         </dl>
       ) : (
         <Empty title="No brief yet">
-          <code>narrate publish brief --go</code>. No image is generated — the brief is the
-          deliverable.
+          Draft some with the button above. No image is generated — the brief is the deliverable.
         </Empty>
       )}
       {others.length > 0 && (

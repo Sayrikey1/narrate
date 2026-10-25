@@ -153,6 +153,32 @@ export interface Take {
   error?: FailureReason | null;
 }
 
+export type DraftKind = "titles" | "briefs" | "effects";
+
+/** What a draft would send and roughly cost, before anything is sent. */
+export interface DraftQuote {
+  kind: DraftKind;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  micros: number;
+  model: string;
+  /** A Groq key is set. */
+  available: boolean;
+}
+
+/** What a draft produced, and what it cost. */
+export interface Drafted {
+  kind: DraftKind;
+  stored: number;
+  cost_micros: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  model: string;
+  errors: string[];
+  description_written: boolean;
+}
+
 /** The ledger compared with what ElevenLabs says it billed. */
 export interface Reconciled {
   window_start: string;

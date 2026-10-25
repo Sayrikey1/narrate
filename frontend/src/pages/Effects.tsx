@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, usd } from "../api";
+import { DraftButton } from "../components/DraftButton";
 import { AddEffect, EffectLibrary, FxCard, WhereTheySit } from "../components/EffectPanel";
 import { PageHeader } from "../ui/layout";
 import type { ChunkRow, ScriptSummary, Slot, Timeline } from "../types";
@@ -67,7 +68,9 @@ export function EffectsPage({
         title="Effects"
         subtitle={facts.join(" · ")}
         actions={
-          planned.length > 0 && (
+          <>
+            <DraftButton scriptId={scriptId} kind="effects" label="Suggest effects…" onDone={onRefresh} />
+            {planned.length > 0 && (
             <button
               type="button"
               className="primary large"
@@ -84,7 +87,8 @@ export function EffectsPage({
                       ? `✨ Place ${planned.length} from the library — free`
                       : `✨ Generate ${quote.count} for ${usd(quote.cost)}`}
             </button>
-          )
+            )}
+          </>
         }
       />
 

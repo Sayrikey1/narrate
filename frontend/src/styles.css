@@ -2152,6 +2152,13 @@ button.daily-col.on .daily-bar { filter: brightness(1.15); }
 .history-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; font-size: var(--t-md); }
 .history-text time { font-size: var(--t-xs); }
 
+/* A paid draft: the price on the button, what it cost beside it after. */
+.draft { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.draft.draft-block { margin-bottom: var(--s-3); }
+.draft button .mono { font-size: var(--t-xs); }
+.draft-result { font-size: var(--t-sm); }
+.draft-off { font-size: var(--t-sm); }
+
 /* --------------------------------------------------------- quick switcher -- */
 
 kbd {

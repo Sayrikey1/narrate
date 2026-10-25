@@ -35,7 +35,7 @@ from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
 
 from narrate import activity as activity_mod
-from narrate import audio, episodes, ledger, previews, templates, waveform
+from narrate import audio, drafting, episodes, ledger, previews, templates, waveform
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
@@ -65,6 +65,7 @@ from narrate.db.session import open_db, session_scope
 from narrate.export import ExportResult, NothingToExport, export_is_current, export_script
 from narrate.failures import explain
 from narrate.ingest import ScriptHasTakes, UnsupportedScript, decode_script, ingest_script
+from narrate.llm import GroqError
 from narrate.money import fmt_usd
 from narrate.plan import gather_context, render_plan, render_timeline_json
 from narrate.provider.base import ProviderError, SFXProvider, TTSProvider
@@ -1196,6 +1197,60 @@ def create_app(
             if body.tags is not None:
                 script.tags = _joined_tags(body.tags)
         return script_publish(script_id)
+
+    @app.get("/api/scripts/{script_id}/drafts/{kind}/quote")
+    def draft_quote(script_id: int, kind: str) -> dict[str, Any]:
+        """What drafting titles, briefs or effect suggestions would cost. Sends
+        nothing."""
+        if kind not in ("titles", "briefs", "effects"):
+            raise HTTPException(404, f"Nothing called {kind!r} is drafted.")
+        with session_scope(db) as session:
+            _script(session, script_id)
+            priced = drafting.quote(session, script_id, config, kind)
+        return {
+            "kind": kind,
+            "requests": priced.requests,
+            "input_tokens": priced.input_tokens,
+            "output_tokens": priced.output_tokens,
+            "micros": priced.micros,
+            "model": priced.model,
+            "available": config.has_groq_key,
+        }
+
+    @app.post("/api/scripts/{script_id}/drafts/{kind}")
+    async def run_draft(script_id: int, kind: str) -> dict[str, Any]:
+        """Draft with a language model, priced first on the page: titles (and a
+        description and tags), thumbnail briefs, or effect suggestions. Every
+        proposal is stored unchosen, and the tokens are charged whatever comes
+        back."""
+        if kind not in ("titles", "briefs", "effects"):
+            raise HTTPException(404, f"Nothing called {kind!r} is drafted.")
+        _refuse_if_deleted(script_id)
+        with session_scope(db) as session:
+            _script(session, script_id)
+        try:
+            if kind == "titles":
+                done = await drafting.draft_titles(db, script_id, config)
+            elif kind == "briefs":
+                done = await drafting.draft_briefs(db, script_id, config)
+            else:
+                done = await drafting.suggest_effects(db, script_id, config)
+        except drafting.NoGroqKey as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except drafting.NothingToDraftFrom as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except GroqError as exc:
+            raise HTTPException(502, str(exc)) from exc
+        return {
+            "kind": kind,
+            "stored": done.stored,
+            "cost_micros": done.cost_micros,
+            "prompt_tokens": done.usage.prompt_tokens,
+            "completion_tokens": done.usage.completion_tokens,
+            "model": done.usage.model,
+            "errors": done.errors,
+            "description_written": done.description_written,
+        }
 
     @app.post("/api/scripts/{script_id}/titles")
     def add_own_title(script_id: int, body: TitleIn) -> dict[str, Any]:

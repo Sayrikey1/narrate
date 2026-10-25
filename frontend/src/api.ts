@@ -9,6 +9,9 @@ import type {
   DeleteBody,
   Deleted,
   DeletePlan,
+  DraftKind,
+  DraftQuote,
+  Drafted,
   EpisodeStatus,
   ExportResult,
   GenerateStarted,
@@ -182,6 +185,10 @@ export const api = {
   /** The description or tags, set by hand. Answers with the pack as it now is. */
   updatePublish: (id: number, body: { description?: string; tags?: string[] }) =>
     patch<Publish>(`/api/scripts/${id}/publish`, body),
+  /** What drafting with a model would cost. Sends nothing. */
+  draftQuote: (id: number, kind: DraftKind) => request<DraftQuote>(`/api/scripts/${id}/drafts/${kind}/quote`),
+  /** Draft with a model: proposals stored unchosen, tokens charged. */
+  draft: (id: number, kind: DraftKind) => post<Drafted>(`/api/scripts/${id}/drafts/${kind}`),
   /** A title written by hand, chosen as it is added. */
   addTitle: (id: number, text: string) =>
     post<{ id: number; text: string }>(`/api/scripts/${id}/titles`, { text }),

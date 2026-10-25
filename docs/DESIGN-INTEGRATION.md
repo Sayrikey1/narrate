@@ -69,9 +69,9 @@ never invented.
 
 ### 4. Paid actions, price shown first
 
-- [ ] Suggest effects
-- [ ] Draft more titles
-- [ ] Draft thumbnail briefs
+- [x] Suggest effects
+- [x] Draft more titles
+- [x] Draft thumbnail briefs
 
 ### 5. New ideas — only if chosen
 

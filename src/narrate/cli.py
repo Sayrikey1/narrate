@@ -23,12 +23,12 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
-from sqlalchemy import Engine, func, select
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from narrate import (
     audio,
-    copywrite,
+    drafting,
     episodes,
     ledger,
     llm,
@@ -86,7 +86,7 @@ from narrate.registry import ModelSpec, Registry, UnknownModel, detect_drift, sa
 from narrate.runner import generate as run_generate
 from narrate.script_parse import format_time, parse_script
 from narrate.settings import MissingAPIKey, Settings, get_settings, resolve_provider
-from narrate.suggest import MODEL_RATES, SuggestionRun, estimate_tokens, suggest_for_chunks
+from narrate.suggest import MODEL_RATES
 from narrate.timeline import build_timeline
 from narrate.verify import service as verify_service
 from narrate.verify import transcribe as stt
@@ -3930,58 +3930,6 @@ def publish_accept(
         console.print(f"[yellow]{len(candidate_ids)} rejected.[/yellow]")
 
 
-def _copy_brief(session: Session, script_id: int) -> str:
-    """What the model is told about the episode.
-
-    Deliberately not the whole script. The free tier allows 8,000 tokens per
-    minute and a 20,000-character episode exceeds that on its own — but a title
-    does not need every word, it needs the shape. The chapter names *are* that
-    shape when they exist, which is why they go first.
-    """
-    script = _require_script(session, script_id)
-    chunks = list(
-        session.scalars(
-            select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
-        ).all()
-    )
-    chapters = [c.chapter_title for c in chunks if c.chapter_title]
-
-    parts = [f"Working title: {script.title}"]
-    if chapters:
-        parts.append("Sections:\n" + "\n".join(f"- {c}" for c in chapters))
-    if chunks:
-        parts.append("How it opens:\n" + chunks[0].text[:1600])
-    if len(chunks) > 1:
-        parts.append("How it ends:\n" + chunks[-1].text[-600:])
-    return "\n\n".join(parts)
-
-
-def _record_copy(engine: Engine, script_id: int, run: copywrite.CopyRun, note: str) -> None:
-    """Charge the ledger for tokens spent, before the results are looked at.
-
-    Spent is spent. Writing the row first means a run whose output is then
-    discarded is still accounted for, which is the only way the monthly figure
-    stays true.
-    """
-    if not run.usage.spent:
-        return
-    with session_scope(engine) as session:
-        script = _require_script(session, script_id)
-        ledger.record_operation(
-            session,
-            kind="copy",
-            provider=ledger.GROQ,
-            units=float(run.usage.total_tokens),
-            unit_kind=ledger.TOKENS,
-            cost_micros=run.cost_micros,
-            model_id=run.model,
-            project_id=script.project_id,
-            script_id=script_id,
-            cost_source="usage",
-            note=(f"{note} ({run.usage.prompt_tokens} in, {run.usage.completion_tokens} out)"),
-        )
-
-
 def _copy_gate(settings: Settings, what: str, manual: str) -> None:
     """Refuse before the database is touched when there is no key."""
     if not settings.has_groq_key:
@@ -4012,18 +3960,15 @@ def publish_draft(
     )
 
     with session_scope(engine) as session:
-        brief = _copy_brief(session, script_id)
-
-    chosen_model = model or settings.groq_model
-    requests = 1 if no_package else 2
-    tokens = llm.estimate_tokens([brief] * requests, copywrite.TITLE_PROMPT, per_text=False)
-    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+        priced = drafting.quote(
+            session, script_id, settings, "titles", model=model, package=not no_package
+        )
 
     if not go:
         console.print(
             Panel(
-                f"Would send {requests} request(s) to {chosen_model} — about {tokens:,} "
-                f"input tokens, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"Would send {priced.requests} request(s) to {priced.model} — about "
+                f"{priced.input_tokens:,} input tokens, roughly {fmt_usd(priced.micros, 4)}.\n\n"
                 f"Titles are stored **unchosen**, so the pack's headline does not change "
                 "until you accept one.\n\n"
                 "[bold]Re-run with --go.[/bold]",
@@ -4033,64 +3978,37 @@ def publish_draft(
         )
         return
 
-    run = asyncio.run(
-        copywrite.propose_copy(
-            brief,
-            settings,
-            model=model,
-            titles=count,
-            want_package=not no_package,
+    done = asyncio.run(
+        drafting.draft_titles(
+            engine, script_id, settings, count=count, package=not no_package, model=model
         )
     )
-    _record_copy(engine, script_id, run, f"{len(run.titles)} title(s)")
-
-    for error in run.errors:
+    for error in done.errors:
         console.print(f"[red]{error}[/red]")
 
-    stored = 0
-    with session_scope(engine) as session:
-        for idea in run.titles:
-            try:
-                publish.add_title(
-                    session,
-                    script_id,
-                    idea.text,
-                    formula=idea.formula,
-                    rationale=idea.reason,
-                    source="proposed",
-                    accepted=False,
-                    model_id=run.model,
-                )
-            except publish.DuplicateTitle:
-                continue
-            stored += 1
-        script = _require_script(session, script_id)
-        if run.description:
-            script.description = run.description
-        if run.tags:
-            script.tags = ", ".join(run.tags)
-
     usage = (
-        f"Used {run.usage.prompt_tokens:,} + {run.usage.completion_tokens:,} tokens "
-        f"({fmt_usd(run.cost_micros, 4)}) on {run.model}."
+        f"Used {done.usage.prompt_tokens:,} + {done.usage.completion_tokens:,} tokens "
+        f"({fmt_usd(done.cost_micros, 4)}) on {done.usage.model}."
     )
-    if not stored and not run.description:
+    if not done.stored and not done.description_written:
         console.print("[yellow]Nothing came back.[/yellow]")
         console.print(f"[dim]{usage}[/dim]")
         return
 
-    if stored:
-        table = Table("formula", "chars", "title", "why")
-        for idea in run.titles:
-            table.add_row(
-                idea.formula,
-                str(len(idea.text)),
-                idea.text,
-                idea.reason[:48],
-            )
+    if done.stored:
+        with session_scope(engine) as session:
+            fresh = session.scalars(
+                select(TitleCandidate)
+                .where(TitleCandidate.script_id == script_id, TitleCandidate.source == "proposed")
+                .order_by(TitleCandidate.id.desc())
+                .limit(done.stored)
+            ).all()
+            table = Table("formula", "chars", "title", "why")
+            for idea in reversed(fresh):
+                table.add_row(idea.formula, str(len(idea.text)), idea.text, idea.rationale[:48])
         console.print(table)
-    if run.description:
-        console.print(f"[green]Description and {len(run.tags)} tag(s) written.[/green]")
+    if done.description_written:
+        console.print("[green]Description and tags written.[/green]")
     console.print(f"[dim]{usage}[/dim]")
     console.print("[dim]Titles stored unchosen — choose with `narrate publish accept <#>`.[/dim]")
 
@@ -4114,17 +4032,13 @@ def publish_brief(
     _copy_gate(settings, "the thumbnail brief", "`narrate publish briefs` to see the format")
 
     with session_scope(engine) as session:
-        brief = _copy_brief(session, script_id)
-
-    chosen_model = model or settings.groq_model
-    tokens = llm.estimate_tokens([brief], copywrite.THUMBNAIL_PROMPT)
-    rough = int(tokens * MODEL_RATES.get(chosen_model, (0.0, 0.0))[0])
+        priced = drafting.quote(session, script_id, settings, "briefs", model=model)
 
     if not go:
         console.print(
             Panel(
-                f"Would send 1 request to {chosen_model} — about {tokens:,} input "
-                f"tokens, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"Would send 1 request to {priced.model} — about {priced.input_tokens:,} input "
+                f"tokens, roughly {fmt_usd(priced.micros, 4)}.\n\n"
                 f"{count} concept(s), each a written brief. **No image is generated** "
                 "and no second provider is involved.\n\n"
                 "[bold]Re-run with --go.[/bold]",
@@ -4134,51 +4048,34 @@ def publish_brief(
         )
         return
 
-    run = asyncio.run(copywrite.propose_thumbnails(brief, settings, model=model, count=count))
-    _record_copy(engine, script_id, run, f"{len(run.briefs)} thumbnail brief(s)")
-
-    for error in run.errors:
+    done = asyncio.run(drafting.draft_briefs(engine, script_id, settings, count=count, model=model))
+    for error in done.errors:
         console.print(f"[red]{error}[/red]")
 
     usage = (
-        f"Used {run.usage.prompt_tokens:,} + {run.usage.completion_tokens:,} tokens "
-        f"({fmt_usd(run.cost_micros, 4)}) on {run.model}."
+        f"Used {done.usage.prompt_tokens:,} + {done.usage.completion_tokens:,} tokens "
+        f"({fmt_usd(done.cost_micros, 4)}) on {done.usage.model}."
     )
-    if not run.briefs:
+    if not done.stored:
         console.print("[yellow]Nothing came back.[/yellow]")
         console.print(f"[dim]{usage}[/dim]")
         return
 
     with session_scope(engine) as session:
-        _require_script(session, script_id)
-        highest = session.scalar(
-            select(func.max(ThumbnailBrief.ordinal)).where(ThumbnailBrief.script_id == script_id)
-        )
-        for offset, idea in enumerate(run.briefs, start=(highest or 0) + 1):
-            session.add(
-                ThumbnailBrief(
-                    script_id=script_id,
-                    ordinal=offset,
-                    archetype=idea.archetype,
-                    overlay_text=idea.overlay_text,
-                    subject=idea.subject,
-                    contrast=idea.contrast,
-                    rationale=idea.reason,
-                    principles=idea.principles,
-                    source="proposed",
-                    accepted=False,
-                    model_id=run.model,
-                )
+        fresh = session.scalars(
+            select(ThumbnailBrief)
+            .where(ThumbnailBrief.script_id == script_id)
+            .order_by(ThumbnailBrief.ordinal.desc())
+            .limit(done.stored)
+        ).all()
+        table = Table("composition", "words", "text on image", "subject")
+        for idea in reversed(fresh):
+            table.add_row(
+                idea.archetype,
+                str(len(idea.overlay_text.split())),
+                idea.overlay_text,
+                idea.subject[:46],
             )
-
-    table = Table("composition", "words", "text on image", "subject")
-    for idea in run.briefs:
-        table.add_row(
-            idea.archetype,
-            str(len(idea.overlay_text.split())),
-            idea.overlay_text,
-            idea.subject[:46],
-        )
     console.print(table)
     console.print(f"[dim]{usage}[/dim]")
     console.print(
@@ -4400,25 +4297,15 @@ def effects_suggest(
 
     with session_scope(engine) as session:
         _require_script(session, script_id)
-        chunks = [
-            (c.ordinal, c.text)
-            for c in session.scalars(
-                select(Chunk).where(Chunk.script_id == script_id).order_by(Chunk.ordinal)
-            ).all()
-        ]
-    if not chunks:
+        priced = drafting.quote(session, script_id, settings, "effects", model=model)
+    if not priced.requests:
         _die("This script has no chunks yet.")
-
-    chosen = model or settings.groq_model
-    tokens = estimate_tokens(chunks)
-    rate_in = MODEL_RATES.get(chosen, (0.0, 0.0))[0]
-    rough = int(tokens * rate_in / 1_000_000 * 1_000_000)
 
     if not go:
         console.print(
             Panel(
-                f"Would send {len(chunks)} chunk(s) to {chosen} — about {tokens:,} input "
-                f"tokens, roughly {fmt_usd(rough, 4)}.\n\n"
+                f"Would send {priced.requests} chunk(s) to {priced.model} — about "
+                f"{priced.input_tokens:,} input tokens, roughly {fmt_usd(priced.micros, 4)}.\n\n"
                 "Every proposal is stored **unaccepted**, so nothing can be generated "
                 "until you say so.\n\n"
                 "[bold]Re-run with --go.[/bold]",
@@ -4428,38 +4315,19 @@ def effects_suggest(
         )
         return
 
-    run = asyncio.run(_suggest(chunks, settings, chosen, max_per_chunk))
-
-    # Tokens were spent whether or not the model proposed anything, so the
-    # charge is recorded before the results are even looked at.
-    if run.prompt_tokens or run.completion_tokens:
-        with session_scope(engine) as session:
-            script = _require_script(session, script_id)
-            ledger.record_operation(
-                session,
-                kind="suggestion",
-                provider=ledger.GROQ,
-                units=float(run.prompt_tokens + run.completion_tokens),
-                unit_kind=ledger.TOKENS,
-                cost_micros=run.cost_micros,
-                model_id=run.model,
-                project_id=script.project_id,
-                script_id=script_id,
-                cost_source="usage",
-                note=(
-                    f"{len(run.suggestions)} proposed from {len(chunks)} chunk(s) "
-                    f"({run.prompt_tokens} in, {run.completion_tokens} out)"
-                ),
-            )
-
-    for error in run.errors:
+    done = asyncio.run(
+        drafting.suggest_effects(
+            engine, script_id, settings, max_per_chunk=max_per_chunk, accept=accept, model=model
+        )
+    )
+    for error in done.errors:
         console.print(f"[red]{error}[/red]")
     # Tokens were spent whether or not anything came back, so say so either way.
     usage = (
-        f"Used {run.prompt_tokens:,} + {run.completion_tokens:,} tokens "
-        f"({fmt_usd(run.cost_micros, 4)}) on {run.model}."
+        f"Used {done.usage.prompt_tokens:,} + {done.usage.completion_tokens:,} tokens "
+        f"({fmt_usd(done.cost_micros, 4)}) on {done.usage.model}."
     )
-    if not run.suggestions:
+    if not done.suggestions:
         console.print(
             "[green]No effects proposed.[/green] "
             "[dim]An empty answer is a valid one — the model found nothing the text "
@@ -4468,30 +4336,18 @@ def effects_suggest(
         console.print(f"[dim]{usage}[/dim]")
         return
 
-    table = Table(title=f"{len(run.suggestions)} proposed")
+    table = Table(title=f"{len(done.suggestions)} proposed")
     table.add_column("at chunk", justify="right")
     table.add_column("description")
     table.add_column("length", justify="right")
     table.add_column("why")
-    with session_scope(engine) as session:
-        for item in run.suggestions:
-            add_slot(
-                session,
-                script_id,
-                item.chunk_ordinal,
-                item.description,
-                item.duration_s,
-                item.loop,
-                source="suggested",
-                accepted=accept,
-                note=item.reason,
-            )
-            table.add_row(
-                str(item.chunk_ordinal),
-                item.description,
-                f"{item.duration_s:g}s",
-                item.reason[:52],
-            )
+    for item in done.suggestions:
+        table.add_row(
+            str(item.chunk_ordinal),
+            item.description,
+            f"{item.duration_s:g}s",
+            item.reason[:52],
+        )
     console.print(table)
     console.print(usage)
     if accept:
@@ -4501,12 +4357,6 @@ def effects_suggest(
             "[dim]Stored unaccepted — nothing will be generated. Accept with "
             "`narrate effects accept <slot>`.[/dim]"
         )
-
-
-async def _suggest(
-    chunks: list[tuple[int, str]], settings: Settings, model: str, max_per_chunk: int
-) -> SuggestionRun:
-    return await suggest_for_chunks(chunks, settings, model=model, max_per_chunk=max_per_chunk)
 
 
 @effects_app.command("accept")
