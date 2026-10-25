@@ -751,11 +751,16 @@ def test_one_generate_produces_speech_and_effects(
 # -- the SPA fallback -------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", ["/script/1", "/script/1/media", "/script/1/effects", "/costs"])
+@pytest.mark.parametrize(
+    "path", ["/", "/index.html", "/script/1", "/script/1/media", "/script/1/effects", "/costs"]
+)
 def test_client_routes_survive_a_hard_refresh(
     client: TestClient, path: str, tmp_path: Path
 ) -> None:
-    """A bookmarked page must load, not 404.
+    """A bookmarked page must load, not 404 - and never from a stale cache.
+
+    The shell names the build's hashed assets, so a cached copy keeps running
+    the build before last: `no-cache` makes the browser ask every time.
 
     Skipped when the frontend has not been built, since the fallback only
     exists once there is a shell to return.
@@ -767,6 +772,7 @@ def test_client_routes_survive_a_hard_refresh(
     response = client.get(path)
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["cache-control"] == "no-cache"
 
 
 def test_an_unknown_api_path_still_404s(client: TestClient) -> None:

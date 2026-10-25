@@ -1878,9 +1878,17 @@ def create_app(
             if full_path.startswith("api/"):
                 raise HTTPException(404, "No such endpoint")
             direct = (FRONTEND_DIST / full_path).resolve()
+            shell = FRONTEND_DIST.resolve() / "index.html"
             if full_path and direct.is_file() and FRONTEND_DIST.resolve() in direct.parents:
-                return FileResponse(direct)
-            return FileResponse(FRONTEND_DIST / "index.html")
+                if direct != shell:
+                    return FileResponse(direct)
+            # The shell names this build's hashed assets, so the browser must
+            # ask for it again every time. Without a Cache-Control header it
+            # guessed a lifetime from the file's age - hours, for a build days
+            # old - and kept showing the build before last after a rebuild.
+            # The assets themselves change name with every build, so they can
+            # be cached as long as the browser likes.
+            return FileResponse(shell, headers={"Cache-Control": "no-cache"})
 
     return app
 
