@@ -3,7 +3,7 @@ import { api, usd } from "../api";
 import { Link, scriptPath } from "../router";
 import { Notice, Skeleton } from "../ui/feedback";
 import { CloseIcon, SparkleIcon } from "./Icon";
-import type { Cost, GenerateStarted, Slot } from "../types";
+import type { Cost, Credits, GenerateStarted, Slot } from "../types";
 
 type Projection = GenerateStarted["projection"];
 
@@ -23,6 +23,7 @@ export function GeneratePanel({
   slots,
   missing,
   cost,
+  credits,
   busy,
   running,
   log,
@@ -34,6 +35,9 @@ export function GeneratePanel({
   /** Chunk numbers without audio, to name them rather than count them. */
   missing: number[];
   cost: Cost | null;
+  /** What is left on the ElevenLabs subscription, to warn before a run would
+   *  outlast it. */
+  credits?: Credits | null;
   busy: boolean;
   /** A generation started from here is under way. */
   running: boolean;
@@ -172,6 +176,14 @@ export function GeneratePanel({
             )}
             {cost?.cap_micros != null && <CapAfter cost={cost} adds={total} />}
           </div>
+
+          {credits?.available && quote && credits.remaining < quote.chars && (
+            <Notice tone="warn" title="ElevenLabs may run out partway">
+              It shows {credits.remaining.toLocaleString()} credits left, and this sends{" "}
+              {quote.chars.toLocaleString()} characters. If they run out, the run stops there and
+              keeps every chunk that finished.
+            </Notice>
+          )}
 
           <p className="note flush">
             One Generate covers the narration and the accepted effects; the cap is checked against

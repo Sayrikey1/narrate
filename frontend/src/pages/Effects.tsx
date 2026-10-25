@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, usd } from "../api";
-import { AddEffect, FxCard, WhereTheySit } from "../components/EffectPanel";
+import { AddEffect, EffectLibrary, FxCard, WhereTheySit } from "../components/EffectPanel";
 import { PageHeader } from "../ui/layout";
 import type { ChunkRow, ScriptSummary, Slot, Timeline } from "../types";
 
@@ -12,10 +12,12 @@ export function EffectsPage({
   slots,
   chunks,
   timeline,
+  projectName,
   onRefresh,
 }: {
   scriptId: number;
   script: ScriptSummary | null;
+  projectName?: string;
   slots: Slot[];
   chunks: ChunkRow[];
   timeline: Timeline | null;
@@ -155,6 +157,7 @@ export function EffectsPage({
                     others={Math.max(0, same.length - 1)}
                     timeline={current}
                     chunk={chunks.find((c) => c.ordinal === slot.at_chunk_ordinal)}
+                    chunks={chunks}
                     onChange={onRefresh}
                   />
                 );
@@ -165,6 +168,16 @@ export function EffectsPage({
 
         <div className="side">
           <AddEffect scriptId={scriptId} chunks={chunks} onChange={onRefresh} />
+          {script && (
+            <EffectLibrary
+              projectId={script.project_id}
+              projectName={projectName ?? "This project"}
+              scriptId={scriptId}
+              chunks={chunks}
+              refreshKey={slots.length}
+              onChange={onRefresh}
+            />
+          )}
           <p className="note side-note">
             A sound is generated once and placed as often as you like — repeats cost nothing. The
             export mixes the effects into an <code>_fx</code> version of each master, and keeps the

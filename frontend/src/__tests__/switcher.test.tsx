@@ -6,8 +6,8 @@ import { QuickSwitcher } from "../components/QuickSwitcher";
 import type { Project, ScriptSummary } from "../types";
 
 const projects: Project[] = [
-  { id: 1, name: "HINDSIGHT", voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, cap_micros: null, cap_used_pct: 0 },
-  { id: 2, name: "Wealth Quadrants", voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, cap_micros: null, cap_used_pct: 0 },
+  { id: 1, name: "HINDSIGHT", voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, default_tags: [], description_boilerplate: "", cap_micros: null, cap_used_pct: 0 },
+  { id: 2, name: "Wealth Quadrants", voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, default_tags: [], description_boilerplate: "", cap_micros: null, cap_used_pct: 0 },
 ];
 const scripts: ScriptSummary[] = [
   { id: 16, project_id: 1, title: "010", chunks: 7, chars: 14000, model_id: null },

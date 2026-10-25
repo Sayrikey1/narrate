@@ -38,6 +38,8 @@ export function ProjectForm({
   const [cap, setCap] = useState(
     project?.cap_micros != null ? String(project.cap_micros / 1_000_000) : "",
   );
+  const [channelTags, setChannelTags] = useState((project?.default_tags ?? []).join(", "));
+  const [footer, setFooter] = useState(project?.description_boilerplate ?? "");
   const [message, setMessage] = useState<{ tone: "error" | "ok"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -56,6 +58,8 @@ export function ProjectForm({
           settings,
           // Empty means no cap: zero is how the server is told to remove one.
           monthly_cap_usd: cap.trim() ? Number(cap) : 0,
+          default_tags: channelTags.split(","),
+          description_boilerplate: footer,
         });
         setMessage({
           tone: "ok",
@@ -134,15 +138,30 @@ export function ProjectForm({
           </span>
         </div>
 
-        {editing && project && (
-          <div className="dashed-note">
-            <strong>🏷️ Channel defaults</strong>
-            <span>
-              Default tags and description text go into every publish pack. For now they are set
-              from the command line: <code>narrate project set "{project.name}" --default-tags</code>{" "}
-              or <code>--description-boilerplate</code>.
-            </span>
-          </div>
+        {editing && (
+          <fieldset className="dashed-note channel-defaults">
+            <legend>🏷️ Channel defaults</legend>
+            <span>Go into every episode's publish pack, after the episode's own.</span>
+            <label>
+              <span>Default tags</span>
+              <input
+                value={channelTags}
+                placeholder="history, business, documentary"
+                disabled={busy}
+                onChange={(e) => setChannelTags(e.target.value)}
+              />
+            </label>
+            <label>
+              <span>Description footer</span>
+              <textarea
+                rows={3}
+                value={footer}
+                placeholder="Links and a sign-off that every description ends with."
+                disabled={busy}
+                onChange={(e) => setFooter(e.target.value)}
+              />
+            </label>
+          </fieldset>
         )}
 
         <div className="settings-save">

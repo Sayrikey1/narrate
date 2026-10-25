@@ -2,11 +2,13 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FxCard, WhereTheySit } from "../components/EffectPanel";
+import { EffectLibrary, FxCard, WhereTheySit } from "../components/EffectPanel";
 import { EffectsPage } from "../pages/Effects";
-import type { Slot, Timeline } from "../types";
+import type { ChunkRow, Slot, Timeline } from "../types";
 
 const deleteSlot = vi.fn(async () => ({}));
+const updateSlot = vi.fn(async () => ({ id: 1, planned: true }));
+const addSlot = vi.fn(async () => ({ id: 5 }));
 const acceptSlot = vi.fn(async () => ({}));
 const generateEffects = vi.fn(async (_id: number, dryRun: boolean) => ({
   outcomes: [{ status: dryRun ? "would_generate" : "generated", description: "camera flashes" }],
@@ -16,10 +18,16 @@ const generateEffects = vi.fn(async (_id: number, dryRun: boolean) => ({
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   api: {
+    peaks: () => Promise.resolve({ peaks: [] }),
     deleteSlot: (...args: unknown[]) => deleteSlot(...(args as [])),
+    updateSlot: (...args: unknown[]) => updateSlot(...(args as [])),
     acceptSlot: (...args: unknown[]) => acceptSlot(...(args as [])),
     generateEffects: (id: number, dryRun: boolean) => generateEffects(id, dryRun),
-    addSlot: vi.fn(),
+    addSlot: (...args: unknown[]) => addSlot(...(args as [])),
+    effectLibrary: () =>
+      Promise.resolve([
+        { id: 9, slug: "door-closing-3s", description: "door closing", duration_s: 3, loop: false, cost_micros: 25_000, placements: 2, episodes: 1 },
+      ]),
     audioEffect: (id: number) => `/api/audio/effect/${id}`,
   },
 }));
@@ -38,7 +46,7 @@ beforeEach(() => {
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
-  for (const mock of [deleteSlot, acceptSlot, generateEffects, seek, play]) mock.mockClear();
+  for (const mock of [deleteSlot, updateSlot, addSlot, acceptSlot, generateEffects, seek, play]) mock.mockClear();
 });
 
 afterEach(() => {
@@ -58,6 +66,15 @@ const button = (label: string) =>
 const click = async (element: Element | undefined) => {
   await act(async () => (element as HTMLElement).click());
 };
+
+const CHUNKS: ChunkRow[] = [1, 2, 3].map((ordinal) => ({
+  ordinal,
+  text: `Chunk ${ordinal} opens with these words.`,
+  chars: 30,
+  source: "paragraph",
+  target_start_s: null,
+  takes: [],
+}));
 
 function slot(over: Partial<Slot> = {}): Slot {
   return {
@@ -79,7 +96,7 @@ function slot(over: Partial<Slot> = {}): Slot {
 describe("a placement", () => {
   it("asks before it is removed, and says the sound stays", async () => {
     const onChange = vi.fn();
-    await render(<FxCard slot={slot()} reused={false} others={1} timeline={null} chunk={undefined} onChange={onChange} />);
+    await render(<FxCard slot={slot()} reused={false} others={1} timeline={null} chunk={undefined} chunks={CHUNKS} onChange={onChange} />);
 
     await click(button("Remove door closing"));
     expect(host.textContent).toContain("Remove this placement?");
@@ -98,12 +115,63 @@ describe("a placement", () => {
 
   it("offers a suggestion to accept, for free, or to dismiss", async () => {
     const suggested = slot({ accepted: false, effect_id: null, slug: null, source: "suggested", note: "The passage turns to the verdict." });
-    await render(<FxCard slot={suggested} reused={false} others={0} timeline={null} chunk={undefined} onChange={vi.fn()} />);
+    await render(<FxCard slot={suggested} reused={false} others={0} timeline={null} chunk={undefined} chunks={CHUNKS} onChange={vi.fn()} />);
 
     expect(host.textContent).toContain("not accepted yet");
     expect(host.textContent).toContain("Accepting is free");
     await click(button("Accept"));
     expect(acceptSlot).toHaveBeenCalledWith(1, true);
+  });
+});
+
+describe("editing a placement", () => {
+  it("moves it without touching its sound", async () => {
+    await render(<FxCard slot={slot()} reused={false} others={0} timeline={null} chunk={undefined} chunks={CHUNKS} onChange={vi.fn()} />);
+    await click(button("Edit door closing"));
+    expect(host.textContent).toContain("Moving it keeps its sound, and is free.");
+
+    const where = host.querySelector<HTMLSelectElement>(".fx-edit select")!;
+    await act(async () => {
+      where.value = "3";
+      where.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await act(async () => host.querySelector<HTMLFormElement>(".fx-edit")!.requestSubmit());
+
+    expect(updateSlot).toHaveBeenCalledWith(1, { at_chunk_ordinal: 3 });
+  });
+
+  it("says a new description is a new sound, priced at the next Generate", async () => {
+    await render(<FxCard slot={slot()} reused={false} others={0} timeline={null} chunk={undefined} chunks={CHUNKS} onChange={vi.fn()} />);
+    await click(button("Edit door closing"));
+    const description = host.querySelector<HTMLInputElement>(".fx-edit input")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(description, "door slamming");
+      description.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    expect(host.textContent).toContain("That's a different sound");
+    await act(async () => host.querySelector<HTMLFormElement>(".fx-edit")!.requestSubmit());
+    expect(updateSlot).toHaveBeenCalledWith(1, {
+      at_chunk_ordinal: 2,
+      description: "door slamming",
+      duration_s: 3,
+      loop: false,
+    });
+  });
+});
+
+describe("the effect library", () => {
+  it("places a sound the project already paid for, free", async () => {
+    const onChange = vi.fn();
+    await render(
+      <EffectLibrary projectId={1} projectName="HINDSIGHT" scriptId={17} chunks={CHUNKS} refreshKey={0} onChange={onChange} />,
+    );
+    expect(host.textContent).toContain("2 placements · 1 episode");
+
+    await click(button("Place…"));
+    await click(button("Place here — free"));
+    expect(addSlot).toHaveBeenCalledWith(17, { effect_id: 9, at_chunk_ordinal: 1 });
+    expect(onChange).toHaveBeenCalled();
   });
 });
 

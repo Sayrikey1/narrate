@@ -4,7 +4,7 @@ import { QuickSwitcher } from "./components/QuickSwitcher";
 import { Rail } from "./components/Rail";
 import { Topbar } from "./components/Topbar";
 import { Transport } from "./components/Transport";
-import { useCatalogue, useScript } from "./hooks";
+import { useActiveRuns, useCatalogue, useCredits, useScript, useSpend } from "./hooks";
 import { Notice } from "./ui/feedback";
 import { CastPage } from "./pages/Cast";
 import { CostsPage } from "./pages/Costs";
@@ -132,6 +132,28 @@ function Shell() {
     ),
   ).length;
   const totalSpend = projects.reduce((sum, p) => sum + p.spend_micros, 0) + deletedSpend;
+  const credits = useCredits(totalSpend);
+  const spend = useSpend(totalSpend);
+  // A run finishing changes spend, takes and timings: fetch them again.
+  const runs = useActiveRuns(() => {
+    void refresh();
+    void state.refresh();
+  });
+
+  // The narration's waveform for the player, drawn again when the timeline moves.
+  const [peaks, setPeaks] = useState<number[] | null>(null);
+  useEffect(() => {
+    setPeaks(null);
+    if (!timeline || !timeline.entries.some((e) => e.generated)) return;
+    let alive = true;
+    api
+      .waveform(timeline.script_id)
+      .then((w) => alive && setPeaks(w.peaks))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [timeline]);
 
   const chunkStarts = useMemo(
     () => (timeline?.entries ?? []).filter((e) => e.kind === "narration").map((e) => e.start_s),
@@ -157,6 +179,7 @@ function Shell() {
         totalSpend={totalSpend}
         flagged={flagged}
         effects={slots.length}
+        credits={credits}
       />
 
       <div className="main">
@@ -165,6 +188,7 @@ function Shell() {
           project={project}
           episodes={episodes}
           episode={episode}
+          runs={runs}
           onSearch={() => setSwitcher(true)}
         />
 
@@ -190,6 +214,7 @@ function Shell() {
               episode={episode}
               timeline={timeline}
               chunks={chunks}
+              spend={spend}
             />
           )}
 
@@ -204,6 +229,7 @@ function Shell() {
               chunks={chunks}
               slots={slots}
               cost={cost}
+              credits={credits}
               onRefresh={() => {
                 void state.refresh();
                 void refresh();
@@ -218,6 +244,7 @@ function Shell() {
               slots={slots}
               chunks={chunks}
               timeline={timeline}
+              projectName={project?.name}
               onRefresh={() => void state.refresh()}
             />
           )}
@@ -253,6 +280,8 @@ function Shell() {
             <CostsPage
               projects={projects}
               scripts={scripts}
+              credits={credits}
+              spend={spend}
               selected={projectId}
               onChanged={() => void refresh()}
             />
@@ -273,6 +302,7 @@ function Shell() {
           subtitle={[project?.name, voiceName(project?.voice_id)].filter(Boolean).join(" · ")}
           chunkStarts={chunkStarts}
           markers={markers}
+          peaks={peaks}
         />
       </div>
 

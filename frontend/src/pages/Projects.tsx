@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { usd } from "../api";
+import { useEffect, useState } from "react";
+import { api, usd } from "../api";
 import { EpisodeTable } from "../components/EpisodeTable";
 import { PlusIcon } from "../components/Icon";
 import { PickUp } from "../components/PickUp";
@@ -10,7 +10,16 @@ import { initial } from "../components/Rail";
 import { ScriptUpload } from "../components/ScriptUpload";
 import { Link, navigate, scriptPath } from "../router";
 import { PageHeader } from "../ui/layout";
-import type { ChunkRow, Model, Project, ScriptSummary, Timeline, Voice } from "../types";
+import type {
+  ChunkRow,
+  EpisodeStatus,
+  Model,
+  Project,
+  ScriptSummary,
+  Spend,
+  Timeline,
+  Voice,
+} from "../types";
 
 /** The landing page: every project, the episode to pick up, the selected
  *  project's episodes and settings, and adding an episode to it. */
@@ -25,6 +34,7 @@ export function ProjectsPage({
   episode,
   timeline,
   chunks,
+  spend,
 }: {
   projects: Project[];
   scripts: ScriptSummary[];
@@ -37,6 +47,8 @@ export function ProjectsPage({
   episode: ScriptSummary | null;
   timeline: Timeline | null;
   chunks: ChunkRow[];
+  /** This month's spend and last month's total, for the spend card. */
+  spend?: Spend | null;
 }) {
   // `#new-project` opens the form directly, for a bookmark or a screenshot.
   const [creating, setCreating] = useState(() => window.location.hash === "#new-project");
@@ -45,6 +57,7 @@ export function ProjectsPage({
   // The shell loads an episode's state when it changes, so for a moment it can
   // still hold the last one's: shown as loading rather than as the wrong facts.
   const loaded = episode !== null && timeline?.script_id === episode.id;
+  const statuses = useStatuses(project, episodes.length);
 
   return (
     <>
@@ -134,9 +147,17 @@ export function ProjectsPage({
               episode={episode}
               timeline={loaded ? timeline : null}
               chunks={loaded ? chunks : []}
+              lastActivity={statuses.rows[episode.id]?.last_activity}
             />
           )}
-          {project && <EpisodeTable projectName={project.name} episodes={episodes} />}
+          {project && (
+            <EpisodeTable
+              projectName={project.name}
+              episodes={episodes}
+              statuses={statuses.rows}
+              failed={statuses.failed}
+            />
+          )}
           {project && <ProjectSettings project={project} models={models} onChanged={onChanged} />}
         </div>
 
@@ -156,11 +177,38 @@ export function ProjectsPage({
 
           <ScriptMarkers />
 
-          {projects.length > 0 && <MonthSpend projects={projects} />}
+          {projects.length > 0 && <MonthSpend projects={projects} spend={spend ?? null} />}
         </div>
       </div>
     </>
   );
+}
+
+/** Every episode's status in the project, fetched again when its episodes or
+ *  its spend change — after a run, an upload, a delete. */
+function useStatuses(project: Project | null, count: number) {
+  const [rows, setRows] = useState<Record<number, EpisodeStatus>>({});
+  const [failed, setFailed] = useState(false);
+  const id = project?.id ?? null;
+  const spend = project?.spend_micros;
+
+  useEffect(() => {
+    if (id === null) return;
+    let alive = true;
+    api
+      .episodes(id)
+      .then((list) => {
+        if (!alive) return;
+        setRows(Object.fromEntries(list.map((r) => [r.script_id, r])));
+        setFailed(false);
+      })
+      .catch(() => alive && setFailed(true));
+    return () => {
+      alive = false;
+    };
+  }, [id, count, spend]);
+
+  return { rows, failed };
 }
 
 /** What can be typed into a script, kept beside the box it goes into. */
@@ -202,7 +250,7 @@ function ScriptMarkers() {
 }
 
 /** This month's spend by project — the figures each cap is measured against. */
-function MonthSpend({ projects }: { projects: Project[] }) {
+function MonthSpend({ projects, spend }: { projects: Project[]; spend: Spend | null }) {
   const month = new Date().toLocaleString("en-GB", { month: "long" });
   const spending = projects.filter((p) => p.month_micros > 0);
   const total = spending.reduce((sum, p) => sum + p.month_micros, 0);
@@ -234,9 +282,22 @@ function MonthSpend({ projects }: { projects: Project[] }) {
           </div>
         ))}
       </div>
-      <Link className="link-quiet" to="/costs">
-        Full breakdown →
-      </Link>
+      <div className="spend-foot">
+        {spend && spend.last_month_micros > 0 ? (
+          <span className="faint">
+            {new Date(`${spend.last_month_start}T00:00:00Z`).toLocaleString("en-GB", {
+              month: "long",
+              timeZone: "UTC",
+            })}
+            : <span className="mono">{usd(spend.last_month_micros, 2)}</span>
+          </span>
+        ) : (
+          <span />
+        )}
+        <Link className="link-quiet" to="/costs">
+          Full breakdown →
+        </Link>
+      </div>
     </section>
   );
 }

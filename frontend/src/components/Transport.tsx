@@ -3,6 +3,7 @@ import { formatClock } from "../time";
 import * as transport from "../transport";
 import type { TransportState } from "../transport";
 import { NextIcon, PauseIcon, PlayIcon, PrevIcon } from "./Icon";
+import { WaveBars } from "./Wave";
 
 /** An effect on the scrub bar: where it starts, and whether it has audio yet. */
 export interface TransportMarker {
@@ -19,6 +20,7 @@ export function Transport({
   subtitle,
   chunkStarts,
   markers,
+  peaks,
 }: {
   title?: string;
   /** "HINDSIGHT · Rachel". */
@@ -26,6 +28,8 @@ export function Transport({
   /** Where each narration chunk starts, for previous and next. */
   chunkStarts: number[];
   markers: TransportMarker[];
+  /** The episode's narration as a waveform, drawn as the scrub bar. */
+  peaks?: number[] | null;
 }) {
   const state = useTransport();
 
@@ -97,9 +101,15 @@ export function Transport({
 
       <div className="transport-time">
         <span className="mono">{now}</span>
-        <div className="transport-scrub">
-          <div className="player-track" />
-          <div className="player-fill" style={{ width: `${pct}%` }} />
+        <div className={peaks?.length ? "transport-scrub waved" : "transport-scrub"}>
+          {peaks?.length ? (
+            <WaveBars peaks={peaks} played={pct / 100} muted={state.muted.narration} />
+          ) : (
+            <>
+              <div className="player-track" />
+              <div className="player-fill" style={{ width: `${pct}%` }} />
+            </>
+          )}
           <div className="player-head" style={{ left: `${pct}%` }} />
           {state.duration > 0 &&
             markers.map((marker, index) => (

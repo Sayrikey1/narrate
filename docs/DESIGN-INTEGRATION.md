@@ -55,17 +55,17 @@ never invented.
 
 ### 3. Free backend additions
 
-- [ ] Waveform data for takes, effects and files
-- [ ] Episode status for the pipeline bars, and whether an export is out of date
-- [ ] Spend this month and last, and per day
-- [ ] ElevenLabs credits left
-- [ ] The global "Generating…" status
-- [ ] An activity history per episode (migration)
-- [ ] Plain-language provider errors; failed takes shown with their reason
-- [ ] Editing an effect; the effect library
-- [ ] How much each speaker speaks
-- [ ] Editing description, tags and your own titles
-- [ ] "Matches ElevenLabs" — reconcile from the UI
+- [x] Waveform data for takes, effects and files
+- [x] Episode status for the pipeline bars, and whether an export is out of date
+- [x] Spend this month and last, and per day
+- [x] ElevenLabs credits left
+- [x] The global "Generating…" status
+- [x] An activity history per episode — read from existing records, so no migration
+- [x] Plain-language provider errors; failed takes shown with their reason
+- [x] Editing an effect; the effect library
+- [x] How much each speaker speaks
+- [x] Editing description, tags and your own titles
+- [x] "Matches ElevenLabs" — reconcile from the UI
 
 ### 4. Paid actions, price shown first
 

@@ -1,4 +1,4 @@
-import type { ChunkRow, ExportResult, Publish, Timeline } from "../types";
+import type { ChunkRow, EpisodeStatus, ExportResult, Publish, Timeline } from "../types";
 
 /** Where the episode is: script, audio, check, export, publish.
  *
@@ -9,12 +9,15 @@ export function Stepper({
   timeline,
   exported,
   publish,
+  status,
 }: {
   chunks: ChunkRow[];
   timeline: Timeline | null;
   /** An export made while this page was open. */
   exported: ExportResult | null;
   publish: Publish | null;
+  /** The episode's status from the server: whether its last export is current. */
+  status?: EpisodeStatus | null;
 }) {
   const total = chunks.length;
   const chars = chunks.reduce((sum, c) => sum + c.chars, 0);
@@ -35,6 +38,11 @@ export function Stepper({
   const checked = clear + byEar + review + flagged;
 
   const complete = total > 0 && missing.length === 0;
+  // The server's word wins once it is in: an export made on this page goes out
+  // of date the moment a regeneration moves the cut.
+  const current = !!status?.exported_at && status.export_current;
+  const stale = !!status?.exported_at && !status.export_current;
+  const exportedNow = !!exported && !status;
   const chapters = publish?.data.chapters;
 
   return (
@@ -96,20 +104,26 @@ export function Stepper({
       <Step
         icon="📦"
         name="Export"
-        state={exported ? "✓" : complete ? "ready" : "blocked"}
-        done={!!exported}
-        tone={complete ? "ok" : "warn"}
+        state={stale ? "out of date" : exportedNow || current ? "✓" : complete ? "ready" : "blocked"}
+        done={!stale && (exportedNow || current)}
+        tone={stale ? "warn" : complete ? "ok" : "warn"}
         bar={
-          exported || complete
-            ? "var(--ok)"
-            : "repeating-linear-gradient(90deg, var(--warnf) 0 6px, transparent 6px 10px)"
+          stale
+            ? "var(--warnf)"
+            : exportedNow || current || complete
+              ? "var(--ok)"
+              : "repeating-linear-gradient(90deg, var(--warnf) 0 6px, transparent 6px 10px)"
         }
       >
-        {exported
-          ? `Exported ${Object.keys(exported.masters).join(", ")} just now`
-          : complete
-            ? "Every chunk has a take in the cut"
-            : `Waiting on chunk ${missing.map((e) => e.chunk_ordinal).join(", ")}`}
+        {stale
+          ? `Exported ${day(status!.exported_at!)}, before the cut changed — export again`
+          : exportedNow && exported
+            ? `Exported ${Object.keys(exported.masters).join(", ")} just now`
+            : current
+              ? `Exported ${day(status!.exported_at!)} from this cut`
+              : complete
+                ? "Every chunk has a take in the cut"
+                : `Waiting on chunk ${missing.map((e) => e.chunk_ordinal).join(", ")}`}
       </Step>
 
       <Step icon="🚀" name="Publish" state="next" tone="faint" bar="var(--off)">
@@ -179,4 +193,12 @@ function split(parts: [number, string][]): string {
       return `${colour} ${from}% ${(at / sum) * 100}%`;
     });
   return `linear-gradient(90deg, ${stops.join(", ")})`;
+}
+
+/** "today" or "23 Oct". */
+function day(iso: string): string {
+  const then = new Date(iso);
+  return then.toDateString() === new Date().toDateString()
+    ? "today"
+    : then.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 }

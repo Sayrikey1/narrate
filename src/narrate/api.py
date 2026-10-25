@@ -19,8 +19,10 @@ import hashlib
 import json
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -30,12 +32,16 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlalchemy import Engine, func, select
+from sqlalchemy.orm import Session
 
-from narrate import audio, episodes, ledger, previews, templates
+from narrate import activity as activity_mod
+from narrate import audio, episodes, ledger, previews, templates, waveform
 from narrate import effects as effects_mod
 from narrate import media as media_mod
 from narrate import produce as produce_mod
+from narrate import reconcile as reconcile_mod
 from narrate import regenerate as regen
+from narrate import status as status_mod
 from narrate import voices as voices_mod
 from narrate.archive import Archived, ensure_live
 from narrate.db.models import (
@@ -46,20 +52,27 @@ from narrate.db.models import (
     EffectSlot,
     LedgerEntry,
     Project,
+    Reconciliation,
+    Run,
     Script,
     Take,
     ThumbnailBrief,
     TitleCandidate,
+    as_utc,
+    utcnow,
 )
 from narrate.db.session import open_db, session_scope
 from narrate.export import ExportResult, NothingToExport, export_is_current, export_script
+from narrate.failures import explain
 from narrate.ingest import ScriptHasTakes, UnsupportedScript, decode_script, ingest_script
 from narrate.money import fmt_usd
 from narrate.plan import gather_context, render_plan, render_timeline_json
-from narrate.provider.base import SFXProvider, TTSProvider
+from narrate.provider.base import ProviderError, SFXProvider, TTSProvider
 from narrate.provider.elevenlabs import ElevenLabsProvider
 from narrate.provider.mock import MockProvider, MockSFXProvider
 from narrate.publish import (
+    DuplicateTitle,
+    add_title,
     choose_brief,
     choose_title,
     gather_publish,
@@ -122,6 +135,10 @@ class RunTracker:
     def queue(self, run_key: str) -> asyncio.Queue[str | None] | None:
         return self._queues.get(run_key)
 
+    def active(self) -> list[str]:
+        """The keys of every run started here and not yet finished."""
+        return [key for key in self._queues if key not in self._results]
+
 
 # ---------------------------------------------------------------------------
 # Request bodies
@@ -142,6 +159,18 @@ class ProjectUpdate(BaseModel):
     prefix_tags: str | None = None
     settings: dict[str, float | bool] | None = None
     monthly_cap_usd: float | None = None
+    # The channel's own packaging, merged into every episode's publish pack.
+    default_tags: list[str] | None = None
+    description_boilerplate: str | None = None
+
+
+class PublishUpdate(BaseModel):
+    description: str | None = None
+    tags: list[str] | None = None
+
+
+class TitleIn(BaseModel):
+    text: str
 
 
 class ScriptIn(BaseModel):
@@ -214,9 +243,19 @@ class CutIn(BaseModel):
 
 class SlotIn(BaseModel):
     at_chunk_ordinal: int
-    description: str
+    description: str = ""
     duration_s: float | None = None
     loop: bool = False
+    # A sound already in the project's library: placed as it is, ready at once
+    # and free. The description, length and loop are the sound's own.
+    effect_id: int | None = None
+
+
+class SlotUpdate(BaseModel):
+    at_chunk_ordinal: int | None = None
+    description: str | None = None
+    duration_s: float | None = None
+    loop: bool | None = None
 
 
 class DeleteIn(BaseModel):
@@ -378,6 +417,85 @@ def create_app(
             for spec in registry.all()
         ]
 
+    # One answer a minute at most: the menu shows the credits on every page,
+    # and a page load should not be a round trip to ElevenLabs.
+    credits_cache: dict[str, Any] = {}
+
+    @app.get("/api/account/credits")
+    async def account_credits(fresh: bool = False) -> dict[str, Any]:
+        """What is left on the ElevenLabs subscription this billing month.
+
+        Free to ask. `fresh` skips the minute-long cache, for just after a run.
+        """
+        if resolve_provider() == "mock" or not config.has_api_key:
+            return {
+                "available": False,
+                "reason": "No ElevenLabs key is set, so nothing is being spent.",
+            }
+        cached = credits_cache.get("payload")
+        if cached and not fresh and time.monotonic() - credits_cache["at"] < 60:
+            return cached  # type: ignore[no-any-return]
+
+        provider = ElevenLabsProvider(config)
+        try:
+            sub = await provider.subscription()
+        except ProviderError as exc:
+            reason = explain(json.dumps(exc.as_dict()))
+            return {"available": False, "reason": reason.headline if reason else exc.message}
+        finally:
+            await provider.aclose()
+
+        payload = credits_of(sub)
+        credits_cache.update(payload=payload, at=time.monotonic())
+        return payload
+
+    @app.post("/api/reconcile")
+    async def run_reconcile(days: int = 7) -> dict[str, Any]:
+        """Compare the ledger with what ElevenLabs says it billed. Free: it reads
+        the account's usage figures, nothing more."""
+        if resolve_provider() == "mock" or not config.has_api_key:
+            raise HTTPException(400, "No ElevenLabs key is set, so there is nothing to compare.")
+        end = utcnow()
+        start = end - timedelta(days=max(1, min(days, 90)))
+        provider = ElevenLabsProvider(config)
+        try:
+            usage = await provider.usage_by_product(start, end, group_by=["model"])
+        except ProviderError as exc:
+            reason = explain(json.dumps(exc.as_dict()))
+            raise HTTPException(502, reason.headline if reason else exc.message) from exc
+        finally:
+            await provider.aclose()
+        try:
+            reconcile_mod.reconcile(db, usage, start, end)
+        except reconcile_mod.UnreadableUsageResponse as exc:
+            raise HTTPException(502, str(exc)) from exc
+        # The record just written, so this answer and the next page load agree.
+        latest = latest_reconcile()
+        if latest is None:
+            raise HTTPException(500, "The comparison was not recorded.")
+        return latest
+
+    @app.get("/api/reconcile/latest")
+    def latest_reconcile() -> dict[str, Any] | None:
+        """The last comparison with ElevenLabs, or nothing if there has not been one."""
+        with session_scope(db) as session:
+            row = session.scalars(
+                select(Reconciliation).order_by(Reconciliation.fetched_at.desc()).limit(1)
+            ).first()
+            if row is None:
+                return None
+            return _reconciled(
+                as_utc(row.window_start),
+                as_utc(row.window_end),
+                row.local_chars,
+                row.provider_chars,
+                row.local_micros,
+                row.drift_pct,
+                row.within_threshold,
+                row.note,
+                as_utc(row.fetched_at),
+            )
+
     @app.get("/api/voices")
     async def list_voices(search: str | None = None) -> list[dict[str, Any]]:
         """Voices the account can use, with a preview to audition before spending.
@@ -430,6 +548,8 @@ def create_app(
                         "voice_id": project.voice_id,
                         "model_id": project.model_id,
                         "prefix_tags": project.prefix_tags,
+                        "default_tags": _tags_of(project.default_tags),
+                        "description_boilerplate": project.description_boilerplate,
                         "spend_micros": rollup.cost_micros,
                         "waste_pct": rollup.waste_pct,
                         # What the cap is measured against: this month's charges.
@@ -512,6 +632,11 @@ def create_app(
                     f"prefix tags {project.prefix_tags!r}. Clear them in the same change, "
                     "or keep a model that honours them.",
                 )
+
+            if body.default_tags is not None:
+                project.default_tags = _joined_tags(body.default_tags)
+            if body.description_boilerplate is not None:
+                project.description_boilerplate = body.description_boilerplate.strip()
 
             rejected: list[str] = []
             if body.settings is not None:
@@ -625,12 +750,14 @@ def create_app(
                 .where(CastMember.project_id == project_id)
                 .order_by(CastMember.name)
             ).all()
+            spoken = _lines_spoken(session, project_id)
             return [
                 {
                     "id": row.id,
                     "name": row.name,
                     "voice_id": row.voice_id,
                     "note": row.note,
+                    **spoken.get((row.name, row.voice_id), {"lines": 0, "chars": 0, "episodes": 0}),
                 }
                 for row in rows
             ]
@@ -990,6 +1117,8 @@ def create_app(
                                     {**f.as_dict(), "summary": f.summary}
                                     for f in verify_service.findings_of(take)
                                 ],
+                                # Why a take has no audio, in words to act on.
+                                "error": _explained(take),
                             }
                             for take in takes
                         ],
@@ -1056,6 +1185,37 @@ def create_app(
                 "markdown": render_publish_pack(tl, context),
                 "data": json.loads(render_publish_json(tl, context)),
             }
+
+    @app.patch("/api/scripts/{script_id}/publish")
+    def update_publish(script_id: int, body: PublishUpdate) -> dict[str, Any]:
+        """Set an episode's description or tags by hand. Costs nothing."""
+        with session_scope(db) as session:
+            script = _script(session, script_id)
+            if body.description is not None:
+                script.description = body.description.strip()
+            if body.tags is not None:
+                script.tags = _joined_tags(body.tags)
+        return script_publish(script_id)
+
+    @app.post("/api/scripts/{script_id}/titles")
+    def add_own_title(script_id: int, body: TitleIn) -> dict[str, Any]:
+        """A title written by hand, chosen as it is added. One already among the
+        candidates is chosen instead of added twice."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            try:
+                row = add_title(session, script_id, body.text)
+            except DuplicateTitle:
+                cleaned = " ".join(body.text.split())
+                row = session.scalars(
+                    select(TitleCandidate).where(
+                        TitleCandidate.script_id == script_id, TitleCandidate.text == cleaned
+                    )
+                ).one()
+                choose_title(session, row)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            return {"id": row.id, "text": row.text, "accepted": True}
 
     @app.post("/api/scripts/{script_id}/titles/{candidate_id}/accept")
     def accept_title(script_id: int, candidate_id: int) -> dict[str, Any]:
@@ -1232,6 +1392,149 @@ def create_app(
                 "effect_seconds": projection.effect_seconds,
             },
         }
+
+    @app.get("/api/projects/{project_id}/episodes")
+    def project_episodes(project_id: int) -> list[dict[str, Any]]:
+        """Where every episode in a project is, for the pipeline bars - in one
+        request rather than one per episode."""
+        with session_scope(db) as session:
+            if session.get(Project, project_id) is None:
+                raise HTTPException(404, "No such project")
+            ids = session.scalars(
+                select(Script.id)
+                .where(Script.project_id == project_id, Script.archived_at.is_(None))
+                .order_by(Script.id)
+            ).all()
+            return [
+                _status_payload(
+                    status_mod.episode_status(session, i, registry, gap_seconds=config.gap_seconds)
+                )
+                for i in ids
+            ]
+
+    @app.get("/api/scripts/{script_id}/activity")
+    def script_activity(script_id: int) -> list[dict[str, Any]]:
+        """What happened to an episode, newest first, from the records it left."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            return [
+                {"at": e.at.isoformat(), "kind": e.kind, "icon": e.icon, "text": e.text}
+                for e in activity_mod.history(session, script_id)
+            ]
+
+    @app.get("/api/scripts/{script_id}/status")
+    def script_status(script_id: int) -> dict[str, Any]:
+        """Where one episode is: script, audio, check, export, publish."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            return _status_payload(
+                status_mod.episode_status(
+                    session, script_id, registry, gap_seconds=config.gap_seconds
+                )
+            )
+
+    @app.get("/api/spend")
+    def spend_summary() -> dict[str, Any]:
+        """This month's spend day by day and project by project, and last month's.
+
+        Every charge on the ledger, deleted projects' included, so the totals
+        agree with everything else on the Costs page.
+        """
+        now = utcnow()
+        this_month = ledger.month_start(now)
+        last_month = ledger.month_start(this_month - timedelta(days=1))
+        with session_scope(db) as session:
+            by_day = ledger.daily_spend(session, last_month)
+
+        def total(days: dict[int | None, int]) -> int:
+            return sum(days.values())
+
+        days = []
+        day = this_month.date()
+        while day <= now.date():
+            spent = by_day.get(day, {})
+            days.append(
+                {
+                    "date": day.isoformat(),
+                    "micros": total(spent),
+                    "by_project": {str(pid): m for pid, m in spent.items() if pid is not None},
+                }
+            )
+            day += timedelta(days=1)
+        return {
+            "month_start": this_month.date().isoformat(),
+            "month_micros": sum(d["micros"] for d in days),
+            "last_month_start": last_month.date().isoformat(),
+            "last_month_micros": sum(
+                total(spent) for day, spent in by_day.items() if day < this_month.date()
+            ),
+            "days": days,
+        }
+
+    @app.get("/api/runs/active")
+    def active_runs() -> list[dict[str, Any]]:
+        """What is generating or being checked right now, for the top bar.
+
+        Narration runs come from the database, so one started from the command
+        line shows too: chunks done are the takes it has made, chunks still to
+        go are what is outstanding now. Runs this server is doing without a run
+        record - the effects after the narration, a check - come from the
+        tracker.
+        """
+        now = utcnow()
+        here = tracker.active()
+        generating = {int(k.removeprefix("script-")) for k in here if k.startswith("script-")}
+        checking = {int(k.removeprefix("verify-")) for k in here if k.startswith("verify-")}
+        out: list[dict[str, Any]] = []
+        with session_scope(db) as session:
+            live = session.scalars(
+                select(Run)
+                .where(Run.status == "running", Run.dry_run.is_(False))
+                .order_by(Run.started_at)
+            ).all()
+            seen: set[int] = set()
+            for run in live:
+                takes = session.scalars(select(Take).where(Take.run_id == run.id)).all()
+                last = max([as_utc(run.started_at), *(as_utc(t.created_at) for t in takes)])
+                # A run that crashed stays "running" for good. One this server
+                # is not doing that has made nothing for ten minutes is taken to
+                # be one of those, not shown as generating for ever.
+                if run.script_id not in generating and now - last > timedelta(minutes=10):
+                    continue
+                script = session.get(Script, run.script_id)
+                if script is None or script.archived_at is not None or run.script_id in seen:
+                    continue
+                seen.add(run.script_id)
+                done = sum(1 for t in takes if t.status == "succeeded")
+                todo = ledger.outstanding(session, run.script_id, registry).chunks
+                out.append(
+                    {
+                        "script_id": run.script_id,
+                        "title": script.title,
+                        "phase": "narration",
+                        "done": done,
+                        "total": done + todo,
+                        "failed": sum(1 for t in takes if t.status != "succeeded"),
+                        "spent_micros": sum(t.cost_micros for t in takes),
+                    }
+                )
+            for phase, ids in (("effects", generating - seen), ("checking", checking)):
+                for script_id in sorted(ids):
+                    script = session.get(Script, script_id)
+                    if script is None:
+                        continue
+                    out.append(
+                        {
+                            "script_id": script_id,
+                            "title": script.title,
+                            "phase": phase,
+                            "done": None,
+                            "total": None,
+                            "failed": 0,
+                            "spent_micros": 0,
+                        }
+                    )
+        return out
 
     @app.get("/api/runs/{run_key}/events")
     async def run_events(run_key: str, request: Request) -> StreamingResponse:
@@ -1505,17 +1808,107 @@ def create_app(
     @app.post("/api/scripts/{script_id}/effects")
     def create_slot(script_id: int, body: SlotIn) -> dict[str, Any]:
         with session_scope(db) as session:
-            _script(session, script_id)
+            script = _script(session, script_id)
+            _require_chunk(session, script_id, body.at_chunk_ordinal)
+            if body.effect_id is not None:
+                effect = session.get(Effect, body.effect_id)
+                if (
+                    effect is None
+                    or effect.project_id != script.project_id
+                    or effect.status != "succeeded"
+                    or not effect.asset_path
+                    or not Path(effect.asset_path).exists()
+                ):
+                    raise HTTPException(404, "No such sound in this project's library")
+                slot = effects_mod.add_slot(
+                    session,
+                    script_id,
+                    body.at_chunk_ordinal,
+                    effect.prompt,
+                    effect.duration_s,
+                    effect.loop,
+                    source="manual",
+                )
+                slot.effect_id = effect.id
+                return {"id": slot.id}
+            if not body.description.strip():
+                raise HTTPException(422, "An effect needs a description.")
             slot = effects_mod.add_slot(
                 session,
                 script_id,
                 body.at_chunk_ordinal,
-                body.description,
+                body.description.strip(),
                 body.duration_s,
                 body.loop,
                 source="manual",
             )
             return {"id": slot.id}
+
+    @app.patch("/api/effects/slots/{slot_id}")
+    def update_slot(slot_id: int, body: SlotUpdate) -> dict[str, Any]:
+        """Move a placement, or change what it asks for.
+
+        Moving it keeps its sound. Changing the description, length or loop
+        makes it a different request, so the sound it had no longer answers it:
+        the placement goes back to planned, and the next Generate makes a new
+        one - or reuses one from the library that matches - at the price it
+        shows first.
+        """
+        given = body.model_fields_set
+        with session_scope(db) as session:
+            slot = session.get(EffectSlot, slot_id)
+            if slot is None:
+                raise HTTPException(404, "No such slot")
+            if body.at_chunk_ordinal is not None:
+                _require_chunk(session, slot.script_id, body.at_chunk_ordinal)
+                slot.at_chunk_ordinal = body.at_chunk_ordinal
+            changed = False
+            if body.description is not None:
+                cleaned = " ".join(body.description.split())
+                if not cleaned:
+                    raise HTTPException(422, "An effect needs a description.")
+                changed |= cleaned != slot.description
+                slot.description = cleaned
+            if "duration_s" in given:
+                if body.duration_s is not None and not 0.5 <= body.duration_s <= 30:
+                    raise HTTPException(422, "A length is between 0.5 and 30 seconds.")
+                changed |= body.duration_s != slot.duration_s
+                slot.duration_s = body.duration_s
+            if body.loop is not None:
+                changed |= body.loop != slot.loop
+                slot.loop = body.loop
+            if changed:
+                slot.effect_id = None
+            return {"id": slot.id, "planned": slot.effect_id is None}
+
+    @app.get("/api/projects/{project_id}/effects")
+    def effect_library(project_id: int) -> list[dict[str, Any]]:
+        """Every sound a project has paid for, most used first. Placing one again
+        costs nothing."""
+        with session_scope(db) as session:
+            if session.get(Project, project_id) is None:
+                raise HTTPException(404, "No such project")
+            out: list[dict[str, Any]] = []
+            for effect in session.scalars(
+                select(Effect).where(Effect.project_id == project_id, Effect.status == "succeeded")
+            ).all():
+                if not effect.asset_path or not Path(effect.asset_path).exists():
+                    continue
+                placed = effects_mod.placements(session, effect.id)
+                out.append(
+                    {
+                        "id": effect.id,
+                        "slug": effect.slug,
+                        "description": effect.prompt,
+                        "duration_s": effect.actual_duration_s or effect.duration_s,
+                        "loop": effect.loop,
+                        "cost_micros": effect.cost_micros,
+                        "placements": len(placed),
+                        "episodes": len({s.script_id for s in placed}),
+                    }
+                )
+            out.sort(key=lambda e: (-e["placements"], e["slug"]))
+            return out
 
     @app.post("/api/effects/slots/{slot_id}/accept")
     def accept_slot(slot_id: int, accepted: bool = True) -> dict[str, Any]:
@@ -1678,6 +2071,59 @@ def create_app(
             # an audio element depends on.
             filename=resolved.name if download else None,
         )
+
+    # -- waveforms -----------------------------------------------------------
+
+    def _peaks(path: Path | None, n: int) -> dict[str, list[float]]:
+        if path is None or not path.is_file():
+            raise HTTPException(404, "No audio to draw")
+        if path.suffix.lower() not in media_mod.AUDIO_SUFFIXES:
+            raise HTTPException(415, "Not an audio file")
+        try:
+            return {"peaks": waveform.peaks_for(path, n, config)}
+        except (audio.FFmpegMissing, audio.FFmpegFailed) as exc:
+            raise HTTPException(503, str(exc)) from exc
+
+    @app.get("/api/peaks/take/{take_id}")
+    def take_peaks(take_id: int, n: int = 48) -> dict[str, list[float]]:
+        """A take's waveform, `n` bars wide."""
+        with session_scope(db) as session:
+            take = session.get(Take, take_id)
+            path = Path(take.asset_path) if take and take.asset_path else None
+        return _peaks(path, n)
+
+    @app.get("/api/peaks/effect/{effect_id}")
+    def effect_peaks(effect_id: int, n: int = 24) -> dict[str, list[float]]:
+        """A sound effect's waveform, `n` bars wide."""
+        with session_scope(db) as session:
+            effect = session.get(Effect, effect_id)
+            path = Path(effect.asset_path) if effect and effect.asset_path else None
+        return _peaks(path, n)
+
+    @app.get("/api/peaks/file")
+    def file_peaks(path: str, n: int = 24) -> dict[str, list[float]]:
+        """A media file's waveform. The path is checked exactly as the file
+        endpoint checks it: inside the media root, or directly in an export."""
+        try:
+            with session_scope(db) as session:
+                resolved = media_mod.resolve_export_file(session, path)
+            if resolved is None:
+                resolved = media_mod.resolve_media_path(path, config)
+        except media_mod.OutsideMediaRoot as exc:
+            raise HTTPException(403, str(exc)) from exc
+        return _peaks(resolved, n)
+
+    @app.get("/api/scripts/{script_id}/waveform")
+    def script_waveform(script_id: int, n: int = 120) -> dict[str, Any]:
+        """The episode's narration as one waveform, for the player's scrub bar."""
+        with session_scope(db) as session:
+            _script(session, script_id)
+            timeline = build_timeline(session, script_id, gap_seconds=config.gap_seconds)
+        try:
+            peaks = waveform.episode_peaks(timeline, n, config)
+        except (audio.FFmpegMissing, audio.FFmpegFailed) as exc:
+            raise HTTPException(503, str(exc)) from exc
+        return {"peaks": peaks, "runtime_s": timeline.runtime_s}
 
     @app.get("/api/exports/{script_id}/archive")
     def export_archive(script_id: int, background: BackgroundTasks) -> FileResponse:
@@ -1891,6 +2337,137 @@ def create_app(
             return FileResponse(shell, headers={"Cache-Control": "no-cache"})
 
     return app
+
+
+def _reconciled(
+    start: datetime,
+    end: datetime,
+    local_chars: int,
+    provider_chars: int,
+    local_micros: int,
+    drift_pct: float,
+    within: bool,
+    note: str,
+    checked_at: datetime,
+) -> dict[str, Any]:
+    result = reconcile_mod.ReconcileResult(
+        window_start=start,
+        window_end=end,
+        local_chars=local_chars,
+        provider_chars=provider_chars,
+        local_micros=local_micros,
+        drift_pct=drift_pct,
+        within_threshold=within,
+        note=note,
+    )
+    return {
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "local_chars": local_chars,
+        "provider_chars": provider_chars,
+        "local_micros": local_micros,
+        "drift_pct": drift_pct,
+        "within_threshold": within,
+        "coverage_pct": result.coverage_pct,
+        "verdict": result.verdict,
+        "note": note,
+        "checked_at": checked_at.isoformat(),
+    }
+
+
+def _lines_spoken(session: Session, project_id: int) -> dict[tuple[str, str], dict[str, int]]:
+    """How much each cast member speaks across the project's live episodes.
+
+    A speaker's line becomes a chunk in their voice, or a named turn inside a
+    dialogue chunk; both are counted. Keyed by name and voice, so a speaker
+    recast in another voice starts again from what the scripts now say.
+    """
+    members = session.scalars(select(CastMember).where(CastMember.project_id == project_id)).all()
+    by_voice: dict[str, list[CastMember]] = {}
+    for member in members:
+        by_voice.setdefault(member.voice_id, []).append(member)
+    tally: dict[tuple[str, str], dict[str, Any]] = {
+        (m.name, m.voice_id): {"lines": 0, "chars": 0, "episodes": set()} for m in members
+    }
+    chunks = session.execute(
+        select(Chunk.script_id, Chunk.voice_id, Chunk.turns_json, Chunk.text)
+        .join(Script, Script.id == Chunk.script_id)
+        .where(Script.project_id == project_id, Script.archived_at.is_(None))
+    ).all()
+    for script_id, voice_id, turns_json, text in chunks:
+        if turns_json:
+            for turn in json.loads(turns_json):
+                for member in members:
+                    if member.name == turn.get("speaker"):
+                        entry = tally[(member.name, member.voice_id)]
+                        entry["lines"] += 1
+                        entry["chars"] += len(turn.get("text", ""))
+                        entry["episodes"].add(script_id)
+        elif voice_id in by_voice:
+            for member in by_voice[voice_id]:
+                entry = tally[(member.name, member.voice_id)]
+                entry["lines"] += 1
+                entry["chars"] += len(text)
+                entry["episodes"].add(script_id)
+    return {
+        key: {"lines": v["lines"], "chars": v["chars"], "episodes": len(v["episodes"])}
+        for key, v in tally.items()
+    }
+
+
+def _require_chunk(session: Session, script_id: int, ordinal: int) -> None:
+    """422 unless the script has a chunk with this number."""
+    found = session.scalar(
+        select(func.count())
+        .select_from(Chunk)
+        .where(Chunk.script_id == script_id, Chunk.ordinal == ordinal)
+    )
+    if not found:
+        raise HTTPException(422, f"There is no chunk {ordinal} in this episode.")
+
+
+def _tags_of(raw: str) -> list[str]:
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _joined_tags(tags: list[str]) -> str:
+    """Tags as stored: trimmed, without blanks or repeats, comma-separated."""
+    seen: list[str] = []
+    for tag in tags:
+        cleaned = " ".join(tag.replace(",", " ").split())
+        if cleaned and cleaned.lower() not in (s.lower() for s in seen):
+            seen.append(cleaned)
+    return ", ".join(seen)
+
+
+def _status_payload(status: status_mod.EpisodeStatus) -> dict[str, Any]:
+    payload = asdict(status)
+    payload["exported_at"] = status.exported_at.isoformat() if status.exported_at else None
+    payload["last_activity"] = status.last_activity.isoformat()
+    payload["needs_you"] = status.needs_you
+    payload["done"] = status.done
+    return payload
+
+
+def credits_of(sub: dict[str, Any]) -> dict[str, Any]:
+    """The subscription's credits this billing month, from the provider's reply."""
+    used = int(sub.get("character_count") or 0)
+    limit = int(sub.get("character_limit") or 0)
+    reset = sub.get("next_character_count_reset_unix")
+    return {
+        "available": True,
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used),
+        "resets_at": (datetime.fromtimestamp(int(reset), tz=UTC).isoformat() if reset else None),
+        "tier": sub.get("tier"),
+    }
+
+
+def _explained(take: Take) -> dict[str, str] | None:
+    """A failed take's reason as headline, detail and fix; `None` once it worked."""
+    explanation = explain(take.error_json, take.status)
+    return asdict(explanation) if explanation else None
 
 
 def _stub_voices() -> list[dict[str, Any]]:

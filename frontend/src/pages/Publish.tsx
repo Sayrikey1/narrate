@@ -208,7 +208,7 @@ function Packaging({
       <div className="side">
         <Thumbnail scriptId={scriptId} data={data} onChange={onChange} />
         {data.retention.good_pct > 0 && <RetentionTarget data={data} />}
-        <DescriptionAndTags data={data} />
+        <DescriptionAndTags key={data.description} scriptId={scriptId} data={data} onChange={onChange} />
       </div>
     </div>
   );
@@ -437,7 +437,67 @@ function Titles({
           Generate candidates with <code>narrate publish draft --go</code>.
         </Empty>
       )}
+      <OwnTitle scriptId={scriptId} onChange={onChange} />
     </section>
+  );
+}
+
+/** A title of your own, counted against the cut-off as you type. */
+function OwnTitle({ scriptId, onChange }: { scriptId: number; onChange: () => void }) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const chars = text.trim().length;
+
+  async function use() {
+    if (!text.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.addTitle(scriptId, text);
+      setText("");
+      onChange();
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form
+      className="own-title"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void use();
+      }}
+    >
+      <label htmlFor="own-title">
+        ✍️ Or write your own{" "}
+        {chars > 0 && (
+          <span className={chars > TITLE_LIMIT ? "warn mono" : "faint mono"}>
+            {chars} / {TITLE_LIMIT}
+          </span>
+        )}
+      </label>
+      <div className="own-title-row">
+        <input
+          id="own-title"
+          value={text}
+          placeholder="Type a title — it's checked against the 60-character cut-off as you go"
+          onChange={(e) => setText(e.target.value)}
+          disabled={busy}
+        />
+        <button type="submit" className="primary" disabled={busy || !text.trim()}>
+          {busy ? "Saving…" : "Use this title"}
+        </button>
+      </div>
+      {error && (
+        <p className="note error flush" role="alert">
+          {error}
+        </p>
+      )}
+    </form>
   );
 }
 
@@ -617,15 +677,51 @@ function RetentionTarget({ data }: { data: PublishData }) {
   );
 }
 
-/** What the description and tags are. Editing them here comes later; for now
- *  they are set from the command line, and the copy button takes them as-is. */
-function DescriptionAndTags({ data }: { data: PublishData }) {
+/** The description and tags, edited in place. The episode's own tags can be
+ *  removed here; the channel's come from the project and say so. */
+function DescriptionAndTags({
+  scriptId,
+  data,
+  onChange,
+}: {
+  scriptId: number;
+  data: PublishData;
+  onChange: () => void;
+}) {
+  const [text, setText] = useState(data.description);
+  const [tag, setTag] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const chapters = data.chapters.usable ? data.chapters.entries.length : 0;
   const added = [
     chapters ? `the ${chapters} chapters` : null,
     data.boilerplate ? "your channel's footer" : null,
   ].filter(Boolean) as string[];
   const sentence = added.join(" and ");
+
+  async function save(body: { description?: string; tags?: string[] }) {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.updatePublish(scriptId, body);
+      onChange();
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function addTag() {
+    const fresh = tag
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (!fresh.length) return;
+    setTag("");
+    void save({ tags: [...data.episode_tags, ...fresh] });
+  }
+
   return (
     <section className="panel" aria-labelledby="desc-h">
       <div className="card-head">
@@ -633,13 +729,26 @@ function DescriptionAndTags({ data }: { data: PublishData }) {
           📝 Description &amp; tags
         </h2>
       </div>
-      {data.description ? (
-        <p className="description">{data.description}</p>
-      ) : (
-        <p className="note flush">
-          Nothing written yet. Set it with{" "}
-          <code>narrate publish set {data.script_id} --description</code>.
-        </p>
+      <label className="sr-only" htmlFor="desc-text">
+        Description
+      </label>
+      <textarea
+        id="desc-text"
+        className="description-edit"
+        rows={6}
+        value={text}
+        placeholder="What the episode is about, in the words a viewer reads under it."
+        onChange={(e) => setText(e.target.value)}
+      />
+      {text !== data.description && (
+        <div className="toolbar description-actions">
+          <button type="button" className="small primary" disabled={saving} onClick={() => void save({ description: text })}>
+            {saving ? "Saving…" : "Save description"}
+          </button>
+          <button type="button" className="small ghost" disabled={saving} onClick={() => setText(data.description)}>
+            Undo
+          </button>
+        </div>
       )}
       {added.length > 0 && (
         <p className="field-hint flush-hint">
@@ -647,17 +756,50 @@ function DescriptionAndTags({ data }: { data: PublishData }) {
           below it when you copy the description.
         </p>
       )}
-      {data.tags.length > 0 ? (
-        <div className="tag-list" role="list" aria-label="Tags">
-          {data.tags.map((tag) => (
-            <span key={tag} role="listitem" className="pill plain">
-              {tag}
-            </span>
-          ))}
-        </div>
-      ) : (
-        <p className="note flush">
-          No tags yet. <code>narrate publish set {data.script_id} --tags a,b,c</code>
+      <div className="tag-list" role="group" aria-label="Tags">
+        {data.episode_tags.map((t) => (
+          <span key={t} className="pill plain tag-pill">
+            {t}
+            <button
+              type="button"
+              aria-label={`Remove tag ${t}`}
+              disabled={saving}
+              onClick={() => void save({ tags: data.episode_tags.filter((x) => x !== t) })}
+            >
+              ✕
+            </button>
+          </span>
+        ))}
+        {data.channel_tags.map((t) => (
+          <span key={`channel-${t}`} className="pill quiet" title="From the project's channel defaults">
+            {t}
+          </span>
+        ))}
+      </div>
+      <label className="tag-add">
+        <span aria-hidden>＋</span>
+        <input
+          aria-label="Add a tag"
+          placeholder="Add a tag — Enter to add, commas for several"
+          value={tag}
+          disabled={saving}
+          onChange={(e) => setTag(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              addTag();
+            }
+          }}
+        />
+      </label>
+      {data.channel_tags.length > 0 && (
+        <p className="field-hint flush-hint">
+          Dashed tags come from the channel's defaults, in the project's settings.
+        </p>
+      )}
+      {error && (
+        <p className="note error flush" role="alert">
+          {error}
         </p>
       )}
     </section>

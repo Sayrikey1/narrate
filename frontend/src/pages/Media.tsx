@@ -48,6 +48,8 @@ export function MediaPage({
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<Sort>("timeline");
   const [kind, setKind] = useState<FileKind | "all">("all");
+  // Which episodes' exports were made before their cut changed.
+  const [stale, setStale] = useState<Set<number>>(new Set());
 
   const projectId = project?.id ?? null;
   const load = () => {
@@ -62,6 +64,15 @@ export function MediaPage({
   };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(load, [projectId]);
+  useEffect(() => {
+    if (projectId === null) return;
+    api
+      .episodes(projectId)
+      .then((rows) =>
+        setStale(new Set(rows.filter((r) => r.exported_at && !r.export_current).map((r) => r.script_id))),
+      )
+      .catch(() => undefined);
+  }, [projectId]);
 
   const episode = scripts.find((s) => s.id === scriptId) ?? null;
   const all = useMemo(() => (media ? entriesOf(media, timeline) : []), [media, timeline]);
@@ -171,6 +182,7 @@ export function MediaPage({
                 wholeProject={wholeProject}
                 exportFolder={media?.export_folder ?? null}
                 searching={query.trim() !== ""}
+                stale={stale}
               />
             ) : (
               <div className="panel">

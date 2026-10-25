@@ -108,6 +108,43 @@ describe("the stepper says what is in the way", () => {
   });
 });
 
+describe("the stepper knows a stale export", () => {
+  it("says the export is out of date once the cut has moved", async () => {
+    const { chunks, timeline } = episode();
+    const complete = { ...timeline, complete: true, entries: timeline.entries.map((e) => ({ ...e, generated: true })) };
+    await render(
+      <Stepper
+        chunks={chunks}
+        timeline={complete}
+        exported={null}
+        publish={null}
+        status={{
+          script_id: 17,
+          chunks: 8,
+          with_audio: 8,
+          failed: [],
+          flagged: 0,
+          review: 0,
+          unchecked: 0,
+          exported_at: "2026-10-21T10:00:00+00:00",
+          export_current: false,
+          title_chosen: false,
+          chapters_usable: false,
+          runtime_s: 420,
+          spent_micros: 0,
+          outstanding_chunks: 0,
+          outstanding_micros: 0,
+          last_activity: "2026-10-25T10:00:00+00:00",
+          needs_you: true,
+          done: false,
+        }}
+      />,
+    );
+    expect(host.textContent).toContain("out of date");
+    expect(host.textContent).toContain("Exported 21 Oct, before the cut changed — export again");
+  });
+});
+
 describe("export explains itself", () => {
   const props = () => {
     const { chunks, timeline } = episode();
@@ -250,6 +287,28 @@ describe("generate shows the price first", () => {
     await click(button("Generate for $0.14"));
 
     expect(onGenerate).toHaveBeenCalledWith(true, 0.139);
+  });
+
+  it("warns when ElevenLabs has fewer credits left than the run sends", async () => {
+    stubDryRun();
+    await render(
+      <GeneratePanel
+        scriptId={17}
+        slots={planned}
+        missing={[8]}
+        cost={null}
+        credits={{ available: true, used: 99_500, limit: 100_000, remaining: 500, resets_at: null, tier: null }}
+        busy={false}
+        running={false}
+        log={[]}
+        onGenerate={vi.fn()}
+        onClose={() => {}}
+      />,
+    );
+    await act(async () => FakeRun.last?.finish());
+
+    expect(host.textContent).toContain("ElevenLabs may run out partway");
+    expect(host.textContent).toContain("500 credits left, and this sends 1,140 characters");
   });
 
   it("prices again without the effects when they are left out", async () => {

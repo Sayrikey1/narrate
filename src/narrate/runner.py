@@ -45,6 +45,7 @@ from narrate.provider.base import (
     DialogueRequest,
     DialogueTurn,
     FatalError,
+    InsufficientCredits,
     ProviderError,
     RetryableError,
     TTSProvider,
@@ -696,7 +697,10 @@ async def generate(
             return await persist_failure(job, exc, "unknown", MAX_ATTEMPTS)
         except ProviderError as exc:
             note(f"chunk {job.ordinal}: failed — {exc.message}")
-            if isinstance(exc, FatalError) and exc.status == 402:
+            # Out of credits, every further request fails the same way: stop
+            # rather than send them. Told by type, not status - ElevenLabs
+            # answers 401 as well as 402 when the account runs dry.
+            if isinstance(exc, InsufficientCredits):
                 stop.set()
                 report.stopped_reason = "credits"
             return await persist_failure(job, exc, "failed", 1)

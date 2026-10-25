@@ -65,6 +65,8 @@ function pack(over: Partial<Publish["data"]> = {}): Publish {
       boilerplate: "",
       description_box: "Some words.\n\nChapters:\n0:00 The Hook\n1:46 The Middle\n3:26 The End",
       tags: ["wealth", "money"],
+      episode_tags: ["wealth"],
+      channel_tags: ["money"],
       chapters: {
         usable: true,
         problems: [],
@@ -219,6 +221,37 @@ describe("the publish pack page", () => {
     await act(async () => copy?.click());
     expect(writeText).toHaveBeenCalledWith(pack().data.description_box);
     expect(host.textContent).toContain("✓ Copied");
+  });
+
+  it("edits the episode's tags and leaves the channel's alone", async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(pack()), { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    await render(<PublishPage scriptId={1} script={null} />);
+
+    // The channel's tag has no remove button: it belongs to the project.
+    expect(host.querySelector('button[aria-label="Remove tag money"]')).toBeNull();
+    await act(async () => host.querySelector<HTMLButtonElement>('button[aria-label="Remove tag wealth"]')!.click());
+
+    const patch = fetch.mock.calls.find(([, init]) => init?.method === "PATCH");
+    expect(patch?.[0]).toBe("/api/scripts/1/publish");
+    expect(JSON.parse(String(patch?.[1]?.body))).toEqual({ tags: [] });
+  });
+
+  it("chooses a title written by hand", async () => {
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(pack()), { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    await render(<PublishPage scriptId={1} script={null} />);
+
+    const input = host.querySelector<HTMLInputElement>("#own-title")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "A Title Of My Own");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(host.textContent).toContain("17 / 60");
+    await act(async () => input.form!.requestSubmit());
+
+    const post = fetch.mock.calls.find(([url, init]) => init?.method === "POST" && String(url).endsWith("/titles"));
+    expect(JSON.parse(String(post?.[1]?.body))).toEqual({ text: "A Title Of My Own" });
   });
 
   it("surfaces a failed load instead of an empty page", async () => {

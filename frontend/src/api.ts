@@ -1,13 +1,18 @@
 import type {
+  ActiveRun,
+  ActivityEvent,
   AudioFormatInfo,
   CastMember,
   ChunkRow,
   Cost,
+  Credits,
   DeleteBody,
   Deleted,
   DeletePlan,
+  EpisodeStatus,
   ExportResult,
   GenerateStarted,
+  LibraryEffect,
   Model,
   Plan,
   Project,
@@ -16,12 +21,14 @@ import type {
   Publish,
   RegenerateBody,
   RegenerateQuote,
+  Reconciled,
   ReplacePlan,
   ScriptCreated,
   ScriptSummary,
   SavedArchive,
   ScriptTemplate,
   Slot,
+  Spend,
   Timeline,
   Variant,
   VerifyCapability,
@@ -77,6 +84,8 @@ export const api = {
       prefix_tags?: string;
       settings?: VoiceSettings;
       monthly_cap_usd?: number;
+      default_tags?: string[];
+      description_boilerplate?: string;
     },
   ) =>
     patch<{ id: number; settings: VoiceSettings; rejected_settings: string[] }>(
@@ -170,6 +179,12 @@ export const api = {
   regenerate: (id: number, body: RegenerateBody) =>
     post<RegenerateQuote>(`/api/scripts/${id}/regenerate`, body),
   publish: (id: number) => request<Publish>(`/api/scripts/${id}/publish`),
+  /** The description or tags, set by hand. Answers with the pack as it now is. */
+  updatePublish: (id: number, body: { description?: string; tags?: string[] }) =>
+    patch<Publish>(`/api/scripts/${id}/publish`, body),
+  /** A title written by hand, chosen as it is added. */
+  addTitle: (id: number, text: string) =>
+    post<{ id: number; text: string }>(`/api/scripts/${id}/titles`, { text }),
   acceptTitle: (scriptId: number, candidateId: number) =>
     request<{ id: number; text: string }>(
       `/api/scripts/${scriptId}/titles/${candidateId}/accept`,
@@ -201,8 +216,19 @@ export const api = {
     post(`/api/takes/${takeId}/accept?accepted=${accepted}`),
 
   slots: (id: number) => request<Slot[]>(`/api/scripts/${id}/effects`),
-  addSlot: (id: number, body: Omit<Slot, "id" | "source" | "accepted" | "note" | "effect_id" | "slug" | "cost_micros">) =>
-    post<{ id: number }>(`/api/scripts/${id}/effects`, body),
+  addSlot: (
+    id: number,
+    body:
+      | Omit<Slot, "id" | "source" | "accepted" | "note" | "effect_id" | "slug" | "cost_micros">
+      | { at_chunk_ordinal: number; effect_id: number },
+  ) => post<{ id: number }>(`/api/scripts/${id}/effects`, body),
+  /** Move a placement, or change what it asks for — which sends it back to planned. */
+  updateSlot: (
+    slotId: number,
+    body: { at_chunk_ordinal?: number; description?: string; duration_s?: number | null; loop?: boolean },
+  ) => patch<{ id: number; planned: boolean }>(`/api/effects/slots/${slotId}`, body),
+  /** Every sound the project has paid for, most placed first. */
+  effectLibrary: (projectId: number) => request<LibraryEffect[]>(`/api/projects/${projectId}/effects`),
   acceptSlot: (slotId: number, accepted: boolean) =>
     post(`/api/effects/slots/${slotId}/accept?accepted=${accepted}`),
   deleteSlot: (slotId: number) =>
@@ -260,6 +286,33 @@ export const api = {
   /** The zip written beside the episode's folder instead of downloaded. */
   saveArchive: (scriptId: number) => post<SavedArchive>(`/api/exports/${scriptId}/archive`),
 
+  /** Where every episode in a project is, in one request. */
+  episodes: (projectId: number) => request<EpisodeStatus[]>(`/api/projects/${projectId}/episodes`),
+  /** Waveform bars, 0 to 1, from one of the `peaksUrl` addresses. */
+  peaks: (url: string) => request<{ peaks: number[] }>(url),
+  /** The episode's narration as one waveform, for the player. */
+  waveform: (scriptId: number, n = 120) =>
+    request<{ peaks: number[]; runtime_s: number }>(`/api/scripts/${scriptId}/waveform?n=${n}`),
+
+  /** Compare the ledger with ElevenLabs' own figures. Free. */
+  reconcile: (days = 7) => post<Reconciled>(`/api/reconcile?days=${days}`),
+  /** The last comparison with ElevenLabs, if there has been one. */
+  latestReconcile: () => request<Reconciled | null>("/api/reconcile/latest"),
+
+  /** What happened to an episode, newest first. */
+  activity: (scriptId: number) => request<ActivityEvent[]>(`/api/scripts/${scriptId}/activity`),
+  /** Where one episode is: script, audio, check, export, publish. */
+  status: (scriptId: number) => request<EpisodeStatus>(`/api/scripts/${scriptId}/status`),
+
+  /** This month's spend by day and project, and last month's total. */
+  spend: () => request<Spend>("/api/spend"),
+
+  /** What is generating or being checked right now, from here or the command line. */
+  activeRuns: () => request<ActiveRun[]>("/api/runs/active"),
+
+  /** Credits left this billing month. Free; `fresh` skips the server's minute-long cache. */
+  credits: (fresh = false) => request<Credits>(`/api/account/credits${fresh ? "?fresh=true" : ""}`),
+
   streamRun,
 };
 
@@ -300,3 +353,10 @@ export function streamRun(
   source.onerror = () => source.close();
   return () => source.close();
 }
+
+/** Where each kind of waveform is drawn from. */
+export const peaksUrl = {
+  take: (id: number, n = 48) => `/api/peaks/take/${id}?n=${n}`,
+  effect: (id: number, n = 24) => `/api/peaks/effect/${id}?n=${n}`,
+  file: (path: string, n = 48) => `/api/peaks/file?path=${encodeURIComponent(path)}&n=${n}`,
+};

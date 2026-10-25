@@ -1,6 +1,19 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { ChunkRow, Cost, Model, Plan, Project, ScriptSummary, Slot, Timeline, Voice } from "./types";
+import type {
+  ActiveRun,
+  ChunkRow,
+  Cost,
+  Credits,
+  Model,
+  Plan,
+  Project,
+  ScriptSummary,
+  Slot,
+  Spend,
+  Timeline,
+  Voice,
+} from "./types";
 
 /** One place that knows how to load a script's state, so every page shows the
  *  same numbers and a refresh after generating updates all of them at once. */
@@ -73,4 +86,80 @@ export function useCatalogue() {
   }, [refresh]);
 
   return { projects, scripts, models, voices, deletedSpend, refresh };
+}
+
+/** What is left on the ElevenLabs subscription. Asked again, past the server's
+ *  minute-long cache, whenever the spend on record changes - after a run, which
+ *  is exactly when the figure moves. */
+export function useCredits(spend: number): Credits | null {
+  const [credits, setCredits] = useState<Credits | null>(null);
+  const first = useRef(true);
+
+  useEffect(() => {
+    const fresh = !first.current;
+    first.current = false;
+    let alive = true;
+    api
+      .credits(fresh)
+      .then((c) => alive && setCredits(c))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [spend]);
+
+  return credits;
+}
+
+/** What is running now, asked every few seconds while something is and less
+ *  often when nothing is. `onFinished` runs when a run drops off the list, so
+ *  the figures it changed are fetched again without a reload. */
+export function useActiveRuns(onFinished: () => void): ActiveRun[] {
+  const [runs, setRuns] = useState<ActiveRun[]>([]);
+  const finished = useRef(onFinished);
+  finished.current = onFinished;
+  const previous = useRef<string[]>([]);
+
+  useEffect(() => {
+    let alive = true;
+    let timer: number | undefined;
+    async function poll() {
+      let next: ActiveRun[] = [];
+      try {
+        next = await api.activeRuns();
+      } catch {
+        // A server restarting: try again on the slow beat.
+      }
+      if (!alive) return;
+      const keys = next.map((r) => `${r.script_id}:${r.phase}`);
+      if (previous.current.some((key) => !keys.includes(key))) finished.current();
+      previous.current = keys;
+      setRuns(next);
+      timer = window.setTimeout(poll, next.length ? 3000 : 10000);
+    }
+    void poll();
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+  }, []);
+
+  return runs;
+}
+
+/** This month's spend by day and last month's total, fetched again when the
+ *  spend on record changes. */
+export function useSpend(spend: number): Spend | null {
+  const [summary, setSummary] = useState<Spend | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api
+      .spend()
+      .then((s) => alive && setSummary(s))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [spend]);
+  return summary;
 }

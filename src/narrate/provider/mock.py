@@ -17,6 +17,8 @@ from pathlib import Path
 from narrate.audio import make_silence, to_mp3
 from narrate.provider.base import (
     DialogueRequest,
+    InsufficientCredits,
+    ProviderError,
     RetryableError,
     SFXRequest,
     SFXResult,
@@ -57,6 +59,20 @@ class MockProvider:
         self._cache = cache_dir or Path(tempfile.gettempdir()) / "narrate-mock"
         self._cache.mkdir(parents=True, exist_ok=True)
 
+    def _failure(self) -> ProviderError:
+        """The error `failure_mode` names, shaped the way the real API sends it."""
+        if self.failure_mode == "unknown":
+            return UnknownOutcomeError("Mock: simulated read timeout after send.")
+        if self.failure_mode == "credits":
+            # As ElevenLabs really reports it: a 401, told apart by its code.
+            return InsufficientCredits(
+                "Out of credits: This request exceeds your quota of 10000. You have 0 "
+                "credits remaining, while 312 credits are required for this request.",
+                status=401,
+                code="quota_exceeded",
+            )
+        return RetryableError("Mock: simulated 429.", status=429, retry_after_s=0.01)
+
     def _should_fail(self, text: str) -> bool:
         return any(marker in text for marker in self.fail_containing)
 
@@ -72,9 +88,7 @@ class MockProvider:
         await asyncio.sleep(self.latency_s)
 
         if self._should_fail(request.text) or self._should_fail_once(request.text):
-            if self.failure_mode == "unknown":
-                raise UnknownOutcomeError("Mock: simulated read timeout after send.")
-            raise RetryableError("Mock: simulated 429.", status=429, retry_after_s=0.01)
+            raise self._failure()
 
         digest = hashlib.sha256(request.text.encode("utf-8")).hexdigest()[:16]
         path = self._cache / f"{digest}.mp3"
@@ -110,9 +124,7 @@ class MockProvider:
 
         joined = "\n".join(f"{t.voice_id}:{t.text}" for t in request.turns)
         if self._should_fail(joined) or self._should_fail_once(joined):
-            if self.failure_mode == "unknown":
-                raise UnknownOutcomeError("Mock: simulated read timeout after send.")
-            raise RetryableError("Mock: simulated 429.", status=429, retry_after_s=0.01)
+            raise self._failure()
 
         digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
         path = self._cache / f"dlg-{digest}.mp3"

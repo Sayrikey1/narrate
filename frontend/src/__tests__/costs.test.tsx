@@ -29,13 +29,29 @@ const COSTS: Record<number, Cost> = { 10: cost(100_000), 11: cost(0), 20: cost(3
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   api: {
+    peaks: () => Promise.resolve({ peaks: [] }),
     cost: (id: number) => Promise.resolve(COSTS[id]),
     deleted: () => Promise.resolve({ projects: [], scripts: [] }),
+    latestReconcile: () => Promise.resolve(null),
+    reconcile: () =>
+      Promise.resolve({
+        window_start: "2026-10-18T00:00:00+00:00",
+        window_end: "2026-10-25T00:00:00+00:00",
+        local_chars: 31_000,
+        provider_chars: 31_000,
+        local_micros: 3_100_000,
+        drift_pct: 0,
+        within_threshold: true,
+        coverage_pct: 100,
+        verdict: "within 2.0% — ledger agrees with the provider",
+        note: "",
+        checked_at: "2026-10-25T12:00:00+00:00",
+      }),
   },
 }));
 
 function project(id: number, name: string, over: Partial<Project> = {}): Project {
-  return { id, name, voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, cap_micros: null, cap_used_pct: 0, ...over };
+  return { id, name, voice_id: "v", model_id: "eleven_v3", spend_micros: 0, waste_pct: 0, month_micros: 0, default_tags: [], description_boilerplate: "", cap_micros: null, cap_used_pct: 0, ...over };
 }
 
 const PROJECTS = [
@@ -84,6 +100,23 @@ describe("the costs page", () => {
     const row = [...host.querySelectorAll("tbody tr")].find((r) => r.textContent?.includes("HINDSIGHT"));
     expect(row?.textContent).toContain("$0.10");
     expect(row?.textContent).toContain("0.7% of $15");
+  });
+
+  it("checks the ledger against ElevenLabs, for free, when there is a key", async () => {
+    await act(async () => {
+      root.render(
+        <CostsPage
+          projects={PROJECTS}
+          scripts={SCRIPTS}
+          selected={2}
+          credits={{ available: true, used: 1, limit: 10, remaining: 9, resets_at: null, tier: null }}
+        />,
+      );
+    });
+    const check = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Check against ElevenLabs"));
+    await act(async () => check!.click());
+    expect(host.textContent).toContain("✓ Matches ElevenLabs");
+    expect(host.textContent).toContain("31,000 characters on both sides");
   });
 
   it("works out spend per finished minute across the account", async () => {

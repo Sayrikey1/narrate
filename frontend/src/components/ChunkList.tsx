@@ -1,9 +1,10 @@
 import { useState } from "react";
 import type { ChunkRow, Finding, RegenerateBody, Take, Timeline } from "../types";
-import { api, usd } from "../api";
+import { api, usd, peaksUrl } from "../api";
 import { isName, spoken } from "../findings";
 import { formatClock } from "../time";
 import { Player } from "./Player";
+import { usePeaks } from "./Wave";
 import { RegeneratePanel } from "./RegeneratePanel";
 
 /** How far before a flagged word playback starts, so the ear has context. */
@@ -214,10 +215,18 @@ export function ChunkList({
               ? failed.map((take, index) => (
                   <div key={take.id} className="take failed">
                     <span className="tag">take {take.ordinal}</span>
-                    <span className="tag bad">⛔ didn't generate</span>
+                    <span className="tag bad">⛔ {take.error?.headline ?? "didn't generate"}</span>
                     <span className="take-why">
-                      This attempt failed, so there is nothing to play —{" "}
-                      <span className="mono">{usd(take.cost_micros)}</span>.
+                      {take.error ? (
+                        <>
+                          {take.error.detail} {take.error.fix}
+                        </>
+                      ) : (
+                        <>
+                          This attempt failed, so there is nothing to play —{" "}
+                          <span className="mono">{usd(take.cost_micros)}</span>.
+                        </>
+                      )}
                     </span>
                     {index === 0 && onGenerateMissing && (
                       <button type="button" className="primary small" onClick={onGenerateMissing}>
@@ -228,7 +237,8 @@ export function ChunkList({
                 ))
               : failed.length > 0 && (
                   <p className="faint take-history">
-                    {failed.length} earlier attempt{failed.length === 1 ? "" : "s"} failed ·{" "}
+                    {failed.length} earlier attempt{failed.length === 1 ? "" : "s"} failed
+                    {failed[0]?.error ? ` — the last because ${lowerFirst(failed[0].error.headline)}` : ""} ·{" "}
                     <span className="mono">{usd(failed.reduce((sum, t) => sum + t.cost_micros, 0))}</span>
                   </p>
                 )}
@@ -274,6 +284,7 @@ function TakeRow({
   /** Only for the take in the cut: the one whose flag matters. */
   onAccept?: (accepted: boolean) => void;
 }) {
+  const peaks = usePeaks(peaksUrl.take(take.id, 64));
   return (
     <div className={take.in_cut ? "take" : "take other"}>
       {take.in_cut ? (
@@ -282,7 +293,7 @@ function TakeRow({
         <span className="tag">take {take.ordinal}</span>
       )}
       <CheckBadge take={take} />
-      <Player src={api.audioTake(take.id)} duration={take.duration_s} cue={cue} />
+      <Player src={api.audioTake(take.id)} duration={take.duration_s} cue={cue} peaks={peaks} />
       <span className="take-cost">{usd(take.cost_micros)}</span>
       {!take.in_cut && (
         <button type="button" className="small" disabled={busy} onClick={onUse}>
@@ -407,4 +418,9 @@ function Findings({
 function clock(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds));
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+/** "ElevenLabs ran out of credits" to follow "because". */
+function lowerFirst(text: string): string {
+  return /^[A-Z][a-z]/.test(text) && !text.startsWith("ElevenLabs") ? text.charAt(0).toLowerCase() + text.slice(1) : text;
 }

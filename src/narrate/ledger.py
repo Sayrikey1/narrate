@@ -18,7 +18,7 @@ replay history rather than trust a mutable running total.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -460,6 +460,25 @@ def month_start(now: datetime | None = None) -> datetime:
     """First instant of the current calendar month, UTC."""
     moment = now or datetime.now(tz=UTC)
     return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def daily_spend(session: Session, since: datetime) -> dict[date, dict[int | None, int]]:
+    """Spend per UTC day and per project since a date, from the ledger.
+
+    Every charge counts, a deleted project's included: deleting stops spending,
+    it does not un-spend. Summed here rather than in SQL because SQLite has no
+    portable way to take the day of a timestamp written with an offset.
+    """
+    out: dict[date, dict[int | None, int]] = {}
+    rows = session.execute(
+        select(LedgerEntry.ts, LedgerEntry.project_id, LedgerEntry.cost_micros).where(
+            LedgerEntry.ts >= since
+        )
+    ).all()
+    for ts, project_id, cost in rows:
+        day = out.setdefault(ts.date(), {})
+        day[project_id] = day.get(project_id, 0) + int(cost)
+    return out
 
 
 WARN_AT = 0.80

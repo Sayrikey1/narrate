@@ -2201,7 +2201,13 @@ def generate(
     for cue in report.effects_failed:
         console.print(f"  effect {cue.description}: [red]{cue.error}[/red]")
 
-    if report.stopped_reason == "budget":
+    if report.stopped_reason == "credits":
+        console.print(
+            "[yellow]Run stopped: ElevenLabs is out of credits.[/yellow] "
+            "[dim]Nothing more was sent. Top up or wait for the monthly reset, then run it "
+            "again - finished chunks are kept.[/dim]"
+        )
+    elif report.stopped_reason == "budget":
         console.print("[yellow]Run stopped at this run's spending cap.[/yellow]")
     elif report.stopped_reason == "monthly_cap":
         console.print(

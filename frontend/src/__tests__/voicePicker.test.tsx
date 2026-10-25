@@ -31,6 +31,7 @@ const VOICES: Voice[] = [
 
 vi.mock("../api", () => ({
   api: {
+    peaks: () => Promise.resolve({ peaks: [] }),
     voices: () => Promise.resolve(VOICES),
     voicePreview: (id: string) => `/api/voices/${id}/preview`,
   },

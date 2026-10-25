@@ -94,7 +94,7 @@ const project: Project = {
   model_id: "eleven_v3",
   spend_micros: 0,
   waste_pct: 0,
-  month_micros: 0,
+  month_micros: 0, default_tags: [], description_boilerplate: "",
   cap_micros: null,
   cap_used_pct: 0,
 };

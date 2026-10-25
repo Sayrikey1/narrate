@@ -33,6 +33,7 @@ from narrate.db.session import session_scope
 from narrate.ledger import SECONDS, record_generation_row
 from narrate.money import micros_from_seconds
 from narrate.provider.base import (
+    InsufficientCredits,
     ProviderError,
     SFXProvider,
     SFXRequest,
@@ -336,6 +337,16 @@ async def generate_slots(
             break
         try:
             result = await provider.generate_effect(request)
+        except InsufficientCredits as exc:
+            # Every further request would fail the same way, unbilled but
+            # pointless: this cue and the rest fail with the reason, unsent.
+            note(f"effect {description!r}: failed — {exc.message}; no further effects are sent")
+            for _, (_, rest) in list(pending.items())[list(pending).index(key) :]:
+                outcomes += [
+                    EffectOutcome(member_id, name, "failed", error=exc.message)
+                    for member_id, name in rest
+                ]
+            break
         except ProviderError as exc:
             note(f"effect {description!r}: failed — {exc.message}")
             # One failed generation fails every slot that wanted that cue.

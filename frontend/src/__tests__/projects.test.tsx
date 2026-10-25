@@ -6,18 +6,19 @@ import { EpisodeTable } from "../components/EpisodeTable";
 import { PickUp } from "../components/PickUp";
 import { ProjectCards } from "../components/ProjectCards";
 import { ProjectSettings } from "../components/ProjectSettings";
-import type { ChunkRow, Cost, Model, Project, ScriptSummary, Take, Timeline } from "../types";
+import type { ChunkRow, EpisodeStatus, Model, Project, ScriptSummary, Take, Timeline } from "../types";
 
 const updateProject = vi.fn(async () => ({ rejected_settings: [] }));
-const costs: Record<number, Partial<Cost>> = {};
+const statuses: EpisodeStatus[] = [];
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   api: {
+    peaks: () => Promise.resolve({ peaks: [] }),
     voices: () => Promise.resolve([]),
     voicePreview: (id: string) => `/api/voices/${id}/preview`,
     updateProject: (...args: unknown[]) => updateProject(...(args as [])),
-    cost: (id: number) => Promise.resolve(costs[id]),
+    episodes: () => Promise.resolve(statuses),
   },
 }));
 
@@ -70,7 +71,7 @@ function project(id: number, name: string, model_id: string, voice_id: string, o
     voice_id,
     spend_micros: 0,
     waste_pct: 0,
-    month_micros: 0,
+    month_micros: 0, default_tags: [], description_boilerplate: "",
     cap_micros: null,
     cap_used_pct: 0,
     ...over,
@@ -113,6 +114,29 @@ describe("the project settings", () => {
       select.dispatchEvent(new Event("change", { bubbles: true }));
     });
     expect(host.textContent).toContain("billed again");
+  });
+
+  it("save the channel's default tags and footer with the rest", async () => {
+    const channel = project(4, "Channel", "eleven_v3", "voice-4", {
+      default_tags: ["history"],
+      description_boilerplate: "Subscribe.",
+    });
+    await render(<ProjectSettings project={channel} models={MODELS} onChanged={() => {}} />);
+
+    const tags = [...host.querySelectorAll<HTMLInputElement>("input")].find((i) => i.value === "history")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(tags, "history, business");
+      tags.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await submit();
+
+    expect(updateProject).toHaveBeenCalledWith(
+      4,
+      expect.objectContaining({
+        default_tags: ["history", " business"],
+        description_boilerplate: "Subscribe.",
+      }),
+    );
   });
 
   it("send an emptied cap as zero, which removes it", async () => {
@@ -169,33 +193,72 @@ describe("the project cards", () => {
 });
 
 describe("the episode table", () => {
-  it("says what each episode has left to generate", async () => {
-    const outstanding = (chunks: number, cost_micros: number) => ({
-      chunks,
-      chars: chunks * 1000,
-      effects: 0,
-      effect_seconds: 0,
-      cost_micros,
-    });
-    costs[20] = { cost_micros: 0, outstanding: outstanding(3, 300_000) };
-    costs[21] = { cost_micros: 900_000, outstanding: outstanding(1, 100_000) };
-    costs[22] = { cost_micros: 1_200_000, outstanding: outstanding(0, 0) };
-    const episodes: ScriptSummary[] = [20, 21, 22].map((id) => ({
-      id,
-      project_id: 1,
-      title: `0${id}`,
+  function status(script_id: number, over: Partial<EpisodeStatus> = {}): EpisodeStatus {
+    return {
+      script_id,
       chunks: 3,
-      chars: 3000,
-      model_id: null,
-    }));
+      with_audio: 3,
+      failed: [],
+      flagged: 0,
+      review: 0,
+      unchecked: 0,
+      exported_at: null,
+      export_current: false,
+      title_chosen: false,
+      chapters_usable: false,
+      runtime_s: 125,
+      spent_micros: 900_000,
+      outstanding_chunks: 0,
+      outstanding_micros: 0,
+      last_activity: new Date().toISOString(),
+      needs_you: false,
+      done: false,
+      ...over,
+    };
+  }
+  const episodes: ScriptSummary[] = [20, 21, 22, 23].map((id) => ({
+    id,
+    project_id: 1,
+    title: `0${id}`,
+    chunks: 3,
+    chars: 3000,
+    model_id: null,
+  }));
 
-    await render(<EpisodeTable projectName="HINDSIGHT" episodes={episodes} />);
-    const rows = [...host.querySelectorAll("tbody tr")].map((r) => r.textContent);
+  beforeEach(() => {
+    statuses.splice(
+      0,
+      statuses.length,
+      status(20, { with_audio: 0, spent_micros: 0, outstanding_chunks: 3, outstanding_micros: 300_000 }),
+      status(21, { flagged: 1, needs_you: true }),
+      status(22, { exported_at: new Date().toISOString(), export_current: true, done: true }),
+      status(23, { exported_at: "2026-10-01T10:00:00+00:00", export_current: false, needs_you: true }),
+    );
+  });
 
-    expect(rows[0]).toContain("Script only — about $0.30 to generate");
-    expect(rows[1]).toContain("1 of 3 chunks to generate — about $0.10");
-    expect(rows[1]).toContain("$0.9000");
-    expect(rows[2]).toContain("Every chunk has audio");
+  const rows = () => [...host.querySelectorAll("tbody tr")].map((r) => r.textContent);
+  const byId = () => Object.fromEntries(statuses.map((r) => [r.script_id, r]));
+
+  it("says where each episode is, most pressing first", async () => {
+    await render(<EpisodeTable projectName="HINDSIGHT" episodes={episodes} statuses={byId()} />);
+
+    expect(rows()[0]).toContain("Script only — about $0.30 to generate");
+    expect(rows()[1]).toContain("1 flagged");
+    expect(rows()[2]).toContain("Exported today");
+    expect(rows()[3]).toContain("Export out of date");
+    expect(rows()[1]).toContain("2:05");
+    // Five bars an episode: script, audio, check, export, publish.
+    expect(host.querySelectorAll("tbody tr:first-child .pipeline-bar").length).toBe(5);
+  });
+
+  it("filters to what needs you", async () => {
+    await render(<EpisodeTable projectName="HINDSIGHT" episodes={episodes} statuses={byId()} />);
+    const needs = [...host.querySelectorAll("button")].find((b) => b.textContent?.startsWith("Needs you"));
+    expect(needs?.textContent).toContain("2");
+
+    await act(async () => needs!.click());
+    expect(rows()).toHaveLength(2);
+    expect(rows().join(" ")).not.toContain("Script only");
   });
 });
 

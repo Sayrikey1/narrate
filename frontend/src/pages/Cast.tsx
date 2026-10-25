@@ -157,7 +157,12 @@ export function CastPage({
                       </span>
                       <div>
                         <code>{member.name}:</code>
-                        <span className="faint">{member.note || "Lines written with this name"}</span>
+                        <span className="faint">
+                          {member.lines
+                            ? `${member.lines} line${member.lines === 1 ? "" : "s"} · ${member.chars.toLocaleString()} chars · ${member.episodes} episode${member.episodes === 1 ? "" : "s"}`
+                            : `No lines yet — write ${member.name}: in a script`}
+                        </span>
+                        {member.note && <span className="faint">{member.note}</span>}
                       </div>
                     </div>
                     <VoiceRow voice={voiceOf(member.voice_id)} fallback={member.voice_id} hear={member.name} />

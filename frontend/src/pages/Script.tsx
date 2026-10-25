@@ -8,6 +8,7 @@ import { GeneratePanel } from "../components/GeneratePanel";
 import { CloseIcon, SparkleIcon } from "../components/Icon";
 import { RegeneratePanel } from "../components/RegeneratePanel";
 import { ReplacePanel } from "../components/ReplacePanel";
+import { History } from "../components/History";
 import { Stepper } from "../components/Stepper";
 import { TimelineView } from "../components/Timeline";
 import { TrackView } from "../components/TrackView";
@@ -18,6 +19,8 @@ import type {
   AudioFormatInfo,
   ChunkRow,
   Cost,
+  Credits,
+  EpisodeStatus,
   ExportResult,
   Model,
   Project,
@@ -39,6 +42,7 @@ export function ScriptPage({
   chunks,
   slots,
   cost,
+  credits,
   onRefresh,
 }: {
   scriptId: number;
@@ -50,6 +54,7 @@ export function ScriptPage({
   chunks: ChunkRow[];
   slots: Slot[];
   cost: Cost | null;
+  credits: Credits | null;
   onRefresh: () => void;
 }) {
   const [formats, setFormats] = useState<AudioFormatInfo[]>([]);
@@ -129,6 +134,16 @@ export function ScriptPage({
       .then(setFormats)
       .catch(() => undefined);
   }, []);
+
+  // Whether the last export is still current, for the stepper: asked again
+  // whenever the timeline moves or an export lands.
+  const [status, setStatus] = useState<EpisodeStatus | null>(null);
+  useEffect(() => {
+    api
+      .status(scriptId)
+      .then(setStatus)
+      .catch(() => setStatus(null));
+  }, [scriptId, timeline, exported]);
 
   // The publish pack's state feeds the last step. Reloaded with the timeline,
   // which changes whenever anything this page does lands.
@@ -409,7 +424,7 @@ export function ScriptPage({
         />
       )}
 
-      <Stepper chunks={chunks} timeline={timeline} exported={exported} publish={publish} />
+      <Stepper chunks={chunks} timeline={timeline} exported={exported} publish={publish} status={status} />
 
       {error && (
         <Notice tone="error" title="That run did not finish">
@@ -425,6 +440,7 @@ export function ScriptPage({
               slots={slots}
               missing={missing}
               cost={cost}
+              credits={credits}
               busy={busy}
               running={busy && logFrom === "generate"}
               log={logFrom === "generate" ? log : []}
@@ -582,6 +598,8 @@ export function ScriptPage({
             </h2>
             <CostPanel cost={cost} projectName={project?.name} />
           </section>
+
+          <History scriptId={scriptId} refreshKey={status} />
         </div>
       </div>
     </>

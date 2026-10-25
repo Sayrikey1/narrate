@@ -244,6 +244,27 @@ async def test_budget_cap_stops_the_run(
     assert report.succeeded == []
 
 
+async def test_running_out_of_credits_stops_the_run(
+    engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
+) -> None:
+    """Once the account is empty every request fails the same way, so the rest
+    are not sent - however ElevenLabs words it (a 401, here, as it really is)."""
+    _, script_id = project_and_script
+    with session_scope(engine) as session:
+        chunks = chunks_of(session, script_id)
+
+    provider = MockProvider(
+        fail_containing={c.text[:20] for c in chunks}, failure_mode="credits", latency_s=0
+    )
+    report = await _run(
+        engine, script_id, settings, registry, provider, dry_run=False, concurrency=1
+    )
+
+    assert report.stopped_reason == "credits"
+    assert len(provider.calls) == 1
+    assert len(chunks) > 1
+
+
 async def test_first_take_becomes_the_cut_automatically(
     engine: Engine, project_and_script: tuple[int, int], settings: Settings, registry: Registry
 ) -> None:

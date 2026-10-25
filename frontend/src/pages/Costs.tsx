@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, usd } from "../api";
 import { ChevronDownIcon } from "../components/Icon";
-import { initial } from "../components/Rail";
+import { SpendPerDay } from "../components/SpendPerDay";
+import { initial, resetDay } from "../components/Rail";
 import { Link, scriptPath } from "../router";
 import { Loadable, Notice } from "../ui/feedback";
 import { PageHeader } from "../ui/layout";
-import type { Cost, Deleted, Project, ScriptSummary } from "../types";
+import type { Cost, Credits, Deleted, Project, Reconciled, ScriptSummary, Spend } from "../types";
 
 const KIND_LABEL: Record<string, string> = {
   generation: "🎙️ Narration",
@@ -25,11 +26,17 @@ const KIND_LABEL: Record<string, string> = {
 export function CostsPage({
   projects,
   scripts,
+  credits,
+  spend,
   selected,
   onChanged,
 }: {
   projects: Project[];
   scripts: ScriptSummary[];
+  /** What is left on the ElevenLabs subscription; absent without a key. */
+  credits?: Credits | null;
+  /** This month's spend by day, and last month's total. */
+  spend?: Spend | null;
   /** The project in hand, whose episodes are listed first. */
   selected: number | null;
   /** After a restore, so the rest of the app sees it again. */
@@ -94,8 +101,12 @@ export function CostsPage({
   const wasted =
     projects.reduce((sum, p) => sum + Math.round((p.spend_micros * p.waste_pct) / 100), 0) +
     deletedProjects.reduce((sum, p) => sum + p.wasted_micros, 0);
-  const month = projects.reduce((sum, p) => sum + p.month_micros, 0);
+  // The ledger's own month when it is in, deleted projects' charges included.
+  const month = spend?.month_micros ?? projects.reduce((sum, p) => sum + p.month_micros, 0);
   const monthName = new Date().toLocaleString("en-GB", { month: "long" });
+  const lastMonthName = spend
+    ? new Date(`${spend.last_month_start}T00:00:00Z`).toLocaleString("en-GB", { month: "long", timeZone: "UTC" })
+    : "";
 
   // Per finished minute, across the episodes that have finished audio: each
   // one's spend over its minutes, the minutes being what its own rate implies.
@@ -128,7 +139,17 @@ export function CostsPage({
         <div className="stat-tile">
           <span className="stat-tile-label">📅 {monthName} so far</span>
           <span className="stat-tile-figure mono">{usd(month, 2)}</span>
-          <span className="stat-tile-note">what each project's cap is measured against</span>
+          <span className="stat-tile-note">
+            {spend && spend.last_month_micros > 0 ? (
+              <>
+                {month >= spend.last_month_micros ? "↑" : "↓"}{" "}
+                {Math.abs(Math.round(((month - spend.last_month_micros) / spend.last_month_micros) * 100))}% on{" "}
+                {lastMonthName}'s <span className="mono">{usd(spend.last_month_micros, 2)}</span>
+              </>
+            ) : (
+              "what each project's cap is measured against"
+            )}
+          </span>
         </div>
         <div className="stat-tile">
           <span className="stat-tile-label">🗑️ Wasted on re-rolls</span>
@@ -137,6 +158,22 @@ export function CostsPage({
             {total ? `${((wasted / total) * 100).toFixed(1)}% of everything spent` : "nothing spent yet"}
           </span>
         </div>
+        {credits?.available && (
+          <div className="stat-tile">
+            <span className="stat-tile-label">🔋 ElevenLabs credits left</span>
+            <span className="stat-tile-figure mono">{credits.remaining.toLocaleString()}</span>
+            <div
+              className={credits.limit && credits.remaining / credits.limit < 0.1 ? "meter warn" : "meter plain"}
+              aria-hidden
+            >
+              <div style={{ width: `${credits.limit ? (credits.remaining / credits.limit) * 100 : 0}%` }} />
+            </div>
+            <span className="stat-tile-note">
+              of {credits.limit.toLocaleString()} this billing month
+              {credits.resets_at ? ` · resets ${resetDay(credits.resets_at)}` : ""}
+            </span>
+          </div>
+        )}
         {perMinute > 0 && (
           <div className="stat-tile">
             <span className="stat-tile-label">⏱️ Per finished minute</span>
@@ -150,6 +187,8 @@ export function CostsPage({
 
       <div className="row">
         <div className="grow">
+          {spend && spend.days.length > 0 && <SpendPerDay spend={spend} projects={projects} />}
+
           <section className="panel" aria-labelledby="proj-h">
             <div className="card-head">
               <h2 id="proj-h" className="card-title">
@@ -300,6 +339,7 @@ export function CostsPage({
                 </dd>
               </div>
             </dl>
+            {credits?.available && <MatchesElevenLabs />}
             <p className="note flush account-note">
               🔒 Every figure comes from an append-only record, so a re-roll can never quietly
               disappear from it.
@@ -354,6 +394,62 @@ export function CostsPage({
         </div>
       </div>
     </>
+  );
+}
+
+/** Whether the ledger agrees with what ElevenLabs says it billed, and a check
+ *  that costs nothing: it reads the account's usage figures. */
+function MatchesElevenLabs() {
+  const [result, setResult] = useState<Reconciled | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .latestReconcile()
+      .then(setResult)
+      .catch(() => undefined);
+  }, []);
+
+  async function check() {
+    setChecking(true);
+    setError(null);
+    try {
+      setResult(await api.reconcile());
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  const checked = result ? new Date(result.checked_at) : null;
+  return (
+    <div className="reconcile">
+      {result && (
+        <>
+          <span className={result.within_threshold ? "reconcile-verdict ok" : "reconcile-verdict warn"}>
+            {result.within_threshold ? "✓ Matches ElevenLabs" : "⚠ Doesn't match ElevenLabs"}
+          </span>
+          <span className="faint">
+            {result.within_threshold
+              ? `${result.local_chars.toLocaleString()} characters on both sides`
+              : result.verdict}{" "}
+            · last 7 days, checked{" "}
+            {checked!.toLocaleDateString("en-GB", { day: "numeric", month: "short" })}
+          </span>
+          {!result.within_threshold && result.note && <span className="faint">{result.note}</span>}
+        </>
+      )}
+      <button type="button" className="small" disabled={checking} onClick={() => void check()}>
+        {checking ? "Checking…" : result ? "Check again — free" : "Check against ElevenLabs — free"}
+      </button>
+      {error && (
+        <span className="error" role="alert">
+          {error}
+        </span>
+      )}
+    </div>
   );
 }
 

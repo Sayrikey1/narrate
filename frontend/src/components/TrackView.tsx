@@ -1,10 +1,11 @@
 import { Fragment, useMemo, useState } from "react";
-import { api, usd } from "../api";
+import { api, usd, peaksUrl } from "../api";
 import { spoken } from "../findings";
 import { formatClock } from "../time";
 import * as transport from "../transport";
 import type { ChunkRow, Timeline, TimelineEntry } from "../types";
 import { Player } from "./Player";
+import { usePeaks } from "./Wave";
 import { useTransport } from "./Transport";
 
 /** The running order as two lanes over one ruler.
@@ -231,6 +232,14 @@ function statusOf(
 
 function Detail({ timeline, index, chunk }: { timeline: Timeline; index: number; chunk?: ChunkRow }) {
   const entry = timeline.entries.find((e) => e.index === index);
+  // Before the early return: a hook runs on every render or not at all.
+  const peaks = usePeaks(
+    entry?.kind === "narration" && entry.take_id
+      ? peaksUrl.take(entry.take_id, 96)
+      : entry?.effect_id
+        ? peaksUrl.effect(entry.effect_id, 48)
+        : null,
+  );
   if (!entry) return null;
   const src =
     entry.kind === "narration" && entry.take_id
@@ -264,7 +273,7 @@ function Detail({ timeline, index, chunk }: { timeline: Timeline; index: number;
       <p className="track-quote">“{spoken(chunk?.text ?? entry.label)}”</p>
       {status?.text && <span className={status.tone}>{status.text}</span>}
       {src ? (
-        <Player src={src} duration={entry.duration_s} wide />
+        <Player src={src} duration={entry.duration_s} wide peaks={peaks} />
       ) : (
         <span className="faint">Not generated yet — nothing to play.</span>
       )}

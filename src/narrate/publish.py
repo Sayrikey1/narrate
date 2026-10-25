@@ -541,6 +541,10 @@ def render_publish_json(timeline: Timeline, context: PublishContext | None = Non
         # The same text the markdown shows to paste, so "Copy" copies that.
         "description_box": description_box(ctx, chapters),
         "tags": list(ctx.all_tags),
+        # The two halves of `tags`, so a page can edit the episode's own and
+        # leave the channel's to the project.
+        "episode_tags": list(ctx.tags),
+        "channel_tags": [t for t in ctx.all_tags if t not in ctx.tags],
         "chapters": {
             "usable": chapters.usable,
             "problems": chapters.problems,

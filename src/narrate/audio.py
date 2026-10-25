@@ -8,9 +8,12 @@ diagnosis ("Invalid data found when processing input") into a guessing game.
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import subprocess
+import sys
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -272,6 +275,41 @@ def mix(
 
 # The integrated-loudness line of ebur128's closing summary.
 _INTEGRATED = re.compile(r"^\s*I:\s+(-?[\d.]+|-?inf)\s+LUFS", re.MULTILINE)
+
+
+def peaks(path: Path, buckets: int = 64, sample_rate: int = 2000) -> list[float]:
+    """How loud each of `buckets` equal slices of a file is, 0 to 1 — the bars
+    of a waveform.
+
+    The average loudness of the slice (its RMS), not its single loudest sample:
+    eight seconds of speech always contain one loud syllable, so peaks drew every
+    bar near the top, where RMS lets pauses and quieter passages show. Decoded to
+    mono 16-bit at a low rate — a few dozen bars need nothing finer, and a
+    seventeen-minute master decodes in a moment — and scaled to the loudest
+    slice, so a quiet take still shows its shape.
+    """
+    ffmpeg = require_ffmpeg()
+    command = [
+        ffmpeg, "-hide_banner", "-nostats", "-v", "error", "-i", str(path),
+        "-ac", "1", "-ar", str(sample_rate), "-f", "s16le", "-",
+    ]  # fmt: skip
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise FFmpegFailed(command, result.stderr.decode(errors="replace"))
+    samples = array("h")
+    samples.frombytes(result.stdout[: len(result.stdout) // 2 * 2])
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return [0.0] * buckets
+    size = len(samples) / buckets
+    levels = []
+    for i in range(buckets):
+        start = int(i * size)
+        piece = samples[start : max(int((i + 1) * size), start + 1)]
+        levels.append(math.sqrt(sum(x * x for x in piece) / len(piece)) if piece else 0.0)
+    top = max(levels) or 1.0
+    return [round(value / top, 3) for value in levels]
 
 
 def loudness_lufs(path: Path) -> float | None:

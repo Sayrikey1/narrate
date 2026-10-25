@@ -474,3 +474,21 @@ def test_reconciliation_ignores_seconds_and_tokens(
 
     assert chars == 1000
     assert micros == 100_000  # the effect and the suggestion are excluded
+
+
+def test_spend_is_summed_per_day_and_project(engine: Engine) -> None:
+    from datetime import UTC, date, datetime
+
+    with session_scope(engine) as session:
+        for ts, project, cost in (
+            (datetime(2026, 9, 30, 23, 0, tzinfo=UTC), 1, 500),
+            (datetime(2026, 10, 2, 9, 0, tzinfo=UTC), 1, 1_000),
+            (datetime(2026, 10, 2, 18, 0, tzinfo=UTC), 2, 250),
+            (datetime(2026, 10, 2, 19, 0, tzinfo=UTC), 1, 4_000),
+        ):
+            session.add(LedgerEntry(ts=ts, project_id=project, cost_micros=cost))
+
+    with session_scope(engine) as session:
+        days = ledger.daily_spend(session, datetime(2026, 10, 1, tzinfo=UTC))
+
+    assert days == {date(2026, 10, 2): {1: 5_000, 2: 250}}

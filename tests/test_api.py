@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy import Engine, select
 
 from narrate.api import create_app
 from narrate.db.models import Script
@@ -272,6 +274,81 @@ def test_an_unaccepted_slot_is_not_generated(client: TestClient, script: dict[st
     ).json()
     assert all(o["status"] == "skipped_unaccepted" for o in payload["outcomes"])
     assert payload["cost_micros"] == 0
+
+
+PLAIN = "A plain episode with nothing in it but words.\n\nAnd a second paragraph of them."
+
+
+def _slots(client: TestClient, script_id: int) -> list[dict[str, Any]]:
+    return list(client.get(f"/api/scripts/{script_id}/effects").json())
+
+
+@needs_ffmpeg
+def test_a_library_sound_is_placed_free_and_ready(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    """Placed as it is: linked at once, so nothing is generated or charged."""
+    script_id, project_id = script["script_id"], script["project_id"]
+    client.post(f"/api/scripts/{script_id}/effects/generate", json={"dry_run": False})
+    [sound] = client.get(f"/api/projects/{project_id}/effects").json()
+    assert (sound["placements"], sound["episodes"]) == (2, 1)
+
+    other = client.post(
+        "/api/scripts", json={"project_id": project_id, "title": "Two", "text": PLAIN}
+    ).json()["id"]
+    client.post(
+        f"/api/scripts/{other}/effects", json={"effect_id": sound["id"], "at_chunk_ordinal": 1}
+    )
+
+    [placed] = _slots(client, other)
+    assert placed["effect_id"] == sound["id"]
+    assert placed["description"] == sound["description"]
+    [again] = client.get(f"/api/projects/{project_id}/effects").json()
+    assert (again["placements"], again["episodes"]) == (3, 2)
+
+
+@needs_ffmpeg
+def test_a_sound_from_another_project_cannot_be_placed(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    client.post(f"/api/scripts/{script['script_id']}/effects/generate", json={"dry_run": False})
+    [sound] = client.get(f"/api/projects/{script['project_id']}/effects").json()
+    elsewhere = client.post("/api/projects", json={"name": "Elsewhere", "voice_id": "v1"}).json()
+    other = client.post(
+        "/api/scripts", json={"project_id": elsewhere["id"], "title": "Two", "text": PLAIN}
+    ).json()["id"]
+
+    refused = client.post(
+        f"/api/scripts/{other}/effects", json={"effect_id": sound["id"], "at_chunk_ordinal": 1}
+    )
+    assert refused.status_code == 404
+
+
+@needs_ffmpeg
+def test_moving_a_placement_keeps_its_sound_and_changing_it_does_not(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    client.post(f"/api/scripts/{script_id}/effects/generate", json={"dry_run": False})
+    slot = _slots(client, script_id)[0]
+    assert slot["effect_id"] is not None
+
+    moved = client.patch(f"/api/effects/slots/{slot['id']}", json={"at_chunk_ordinal": 2}).json()
+    assert moved["planned"] is False
+
+    changed = client.patch(
+        f"/api/effects/slots/{slot['id']}", json={"description": "a different sound"}
+    ).json()
+    assert changed["planned"] is True
+    after = next(s for s in _slots(client, script_id) if s["id"] == slot["id"])
+    assert (after["at_chunk_ordinal"], after["effect_id"]) == (2, None)
+
+    too_long = client.patch(f"/api/effects/slots/{slot['id']}", json={"duration_s": 45})
+    nowhere = client.patch(f"/api/effects/slots/{slot['id']}", json={"at_chunk_ordinal": 99})
+    assert (too_long.status_code, nowhere.status_code) == (422, 422)
+    # An explicit null is "leave the length to the generator".
+    auto = client.patch(f"/api/effects/slots/{slot['id']}", json={"duration_s": None})
+    assert auto.status_code == 200
 
 
 # -- export and audio -------------------------------------------------------
@@ -746,6 +823,388 @@ def test_one_generate_produces_speech_and_effects(
     assert done["effects_generated"] == 1
     assert done["effects_reused"] == 1
     assert done["blocked"] is False
+
+
+def test_a_failed_take_says_why_in_plain_words(
+    client: TestClient, script: dict[str, int], engine: Engine
+) -> None:
+    """The chunk list carries a reason a person can act on, not the raw error."""
+    from narrate.db.models import Chunk, Take
+    from narrate.db.session import session_scope
+
+    with session_scope(engine) as session:
+        chunk = session.scalars(select(Chunk).where(Chunk.script_id == script["script_id"])).first()
+        assert chunk is not None
+        session.add(
+            Take(
+                chunk_id=chunk.id,
+                ordinal=1,
+                idempotency_key="k",
+                model_id="eleven_v3",
+                voice_id="v1",
+                submitted_text=chunk.text,
+                submitted_chars=len(chunk.text),
+                status="failed",
+                error_json=json.dumps(
+                    {
+                        "message": "Could not reach the provider: [Errno 8] nodename nor "
+                        "servname provided, or not known",
+                        "status": None,
+                        "code": None,
+                        "request_id": None,
+                    }
+                ),
+            )
+        )
+
+    chunks = client.get(f"/api/scripts/{script['script_id']}/chunks").json()
+    take = chunks[0]["takes"][0]
+    assert take["error"]["headline"] == "Couldn't reach ElevenLabs"
+    assert "connection" in take["error"]["fix"]
+
+
+class _Subscription:
+    """ElevenLabs' subscription and usage endpoints, answering with `reply` and
+    `usage`, or raising them."""
+
+    reply: object = None
+    usage: object = None
+
+    def __init__(self, _settings: object) -> None:
+        pass
+
+    async def subscription(self) -> object:
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+    async def usage_by_product(self, *_args: object, **_kwargs: object) -> object:
+        if isinstance(self.usage, Exception):
+            raise self.usage
+        return self.usage
+
+    async def aclose(self) -> None:
+        pass
+
+
+@pytest.fixture
+def keyed(
+    engine: Engine, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    """A client talking to "ElevenLabs" - the fake above - with a key set."""
+    from pydantic import SecretStr
+
+    monkeypatch.setenv("NARRATE_PROVIDER", "elevenlabs")
+    monkeypatch.setattr("narrate.api.ElevenLabsProvider", _Subscription)
+    with TestClient(
+        create_app(engine, settings.model_copy(update={"api_key": SecretStr("k")}))
+    ) as c:
+        yield c
+
+
+def test_credits_left_come_from_the_subscription(keyed: TestClient) -> None:
+    _Subscription.reply = {
+        "character_count": 58_780,
+        "character_limit": 100_000,
+        "next_character_count_reset_unix": 1_793_491_200,
+        "tier": "creator",
+    }
+    credits = keyed.get("/api/account/credits").json()
+
+    assert credits["available"] is True
+    assert (credits["remaining"], credits["limit"], credits["used"]) == (41_220, 100_000, 58_780)
+    assert credits["resets_at"].startswith("2026-11-0")
+
+
+def test_credits_say_why_when_elevenlabs_cannot_be_asked(keyed: TestClient) -> None:
+    from narrate.provider.base import RetryableError
+
+    _Subscription.reply = RetryableError("Could not reach the provider: [Errno 8] nodename")
+    credits = keyed.get("/api/account/credits").json()
+
+    assert credits == {"available": False, "reason": "Couldn't reach ElevenLabs"}
+
+
+def test_credits_are_not_asked_for_on_the_mock_provider(client: TestClient) -> None:
+    credits = client.get("/api/account/credits").json()
+    assert credits["available"] is False
+    assert "nothing is being spent" in credits["reason"]
+
+
+def _running(engine: Engine, script_id: int, started: timedelta, made: int = 1) -> None:
+    """A run recorded as running, started `started` ago, with `made` takes."""
+    from narrate.db.models import Chunk, Run, Take, utcnow
+    from narrate.db.session import session_scope
+
+    with session_scope(engine) as session:
+        run = Run(
+            script_id=script_id,
+            model_id="eleven_v3",
+            status="running",
+            started_at=utcnow() - started,
+        )
+        session.add(run)
+        session.flush()
+        chunk = session.scalars(select(Chunk).where(Chunk.script_id == script_id)).first()
+        assert chunk is not None
+        for n in range(made):
+            session.add(
+                Take(
+                    chunk_id=chunk.id,
+                    run_id=run.id,
+                    ordinal=n + 1,
+                    idempotency_key=f"k{n}",
+                    model_id="eleven_v3",
+                    voice_id="v1",
+                    submitted_text=chunk.text,
+                    submitted_chars=len(chunk.text),
+                    cost_micros=1_000,
+                    created_at=utcnow() - started,
+                )
+            )
+
+
+def test_a_run_in_progress_shows_how_far_it_has_got(
+    client: TestClient, script: dict[str, int], engine: Engine
+) -> None:
+    """From the database, so a run started on the command line shows too."""
+    _running(engine, script["script_id"], timedelta(seconds=30))
+
+    [run] = client.get("/api/runs/active").json()
+    todo = client.get(f"/api/scripts/{script['script_id']}/cost").json()["outstanding"]["chunks"]
+    assert run["title"] == "Episode"
+    assert run["phase"] == "narration"
+    assert (run["done"], run["total"], run["spent_micros"]) == (1, 1 + todo, 1_000)
+
+
+def test_a_run_that_crashed_is_not_shown_as_generating(
+    client: TestClient, script: dict[str, int], engine: Engine
+) -> None:
+    """Left "running" with nothing made for an hour: not generating any more."""
+    _running(engine, script["script_id"], timedelta(hours=1))
+    assert client.get("/api/runs/active").json() == []
+
+
+def test_nothing_running_is_an_empty_list(client: TestClient) -> None:
+    assert client.get("/api/runs/active").json() == []
+
+
+def test_spend_comes_day_by_day_with_last_months_total(client: TestClient, engine: Engine) -> None:
+    """Every charge on the ledger, a deleted project's too."""
+    from narrate.db.models import LedgerEntry, utcnow
+    from narrate.db.session import session_scope
+    from narrate.ledger import month_start
+
+    now = utcnow()
+    with session_scope(engine) as session:
+        session.add(LedgerEntry(ts=now, project_id=7, cost_micros=1_200))
+        session.add(
+            LedgerEntry(ts=month_start(now) - timedelta(hours=1), project_id=7, cost_micros=900)
+        )
+
+    spend = client.get("/api/spend").json()
+    today = spend["days"][-1]
+
+    assert spend["month_start"] == month_start(now).date().isoformat()
+    assert len(spend["days"]) == now.day
+    assert today == {"date": now.date().isoformat(), "micros": 1_200, "by_project": {"7": 1_200}}
+    assert (spend["month_micros"], spend["last_month_micros"]) == (1_200, 900)
+
+
+@needs_ffmpeg
+def test_an_episodes_status_follows_it_through_the_pipeline(
+    client: TestClient, script: dict[str, int], engine: Engine
+) -> None:
+    """Script only, generated, exported, and out of date once the cut moves."""
+    from narrate.db.models import Chunk, Cut, Take
+    from narrate.db.session import session_scope
+
+    script_id = script["script_id"]
+
+    def status() -> dict[str, Any]:
+        [row] = client.get(f"/api/projects/{script['project_id']}/episodes").json()
+        assert row == client.get(f"/api/scripts/{script_id}/status").json()
+        return dict(row)
+
+    before = status()
+    assert before["with_audio"] == 0
+    assert before["outstanding_chunks"] == before["chunks"] > 0
+    assert (before["needs_you"], before["done"]) == (False, False)
+
+    _run_to_completion(client, script_id)
+    generated = status()
+    assert generated["with_audio"] == generated["chunks"]
+    assert generated["unchecked"] == generated["chunks"]
+    assert generated["exported_at"] is None
+    assert generated["spent_micros"] > 0
+
+    client.post(f"/api/scripts/{script_id}/export")
+    exported = status()
+    assert exported["export_current"] is True
+    assert (exported["needs_you"], exported["done"]) == (False, True)
+
+    # Another take put in the cut: the export now plays the old one.
+    with session_scope(engine) as session:
+        chunk = session.scalars(select(Chunk).where(Chunk.script_id == script_id)).first()
+        assert chunk is not None
+        cut = session.get(Cut, chunk.id)
+        assert cut is not None
+        old = session.get(Take, cut.take_id)
+        assert old is not None
+        newer = Take(
+            chunk_id=chunk.id,
+            ordinal=old.ordinal + 1,
+            idempotency_key=f"{old.idempotency_key}-again",
+            model_id=old.model_id,
+            voice_id=old.voice_id,
+            submitted_text=old.submitted_text,
+            submitted_chars=old.submitted_chars,
+            asset_path=old.asset_path,
+            duration_s=old.duration_s,
+        )
+        session.add(newer)
+        session.flush()
+        cut.take_id = newer.id
+
+    stale = status()
+    assert stale["export_current"] is False
+    assert (stale["needs_you"], stale["done"]) == (True, False)
+
+
+def test_an_unknown_projects_episodes_are_a_404(client: TestClient) -> None:
+    assert client.get("/api/projects/999/episodes").status_code == 404
+
+
+def test_the_description_and_tags_are_edited_in_place(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    pack = client.patch(
+        f"/api/scripts/{script_id}/publish",
+        json={"description": "  Some words.  ", "tags": ["wealth", " Wealth ", "", "money, fast"]},
+    ).json()
+
+    # Trimmed; blank and repeated tags dropped; a comma inside one is not a split.
+    assert pack["data"]["description"] == "Some words."
+    assert pack["data"]["tags"] == ["wealth", "money fast"]
+    assert client.get(f"/api/scripts/{script_id}/publish").json()["data"]["tags"] == [
+        "wealth",
+        "money fast",
+    ]
+
+
+def test_a_title_written_by_hand_is_chosen_and_never_doubled(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    first = client.post(f"/api/scripts/{script_id}/titles", json={"text": "My  Own Title"}).json()
+    again = client.post(f"/api/scripts/{script_id}/titles", json={"text": "My Own Title"}).json()
+
+    title = client.get(f"/api/scripts/{script_id}/publish").json()["data"]["title"]
+    assert first["id"] == again["id"]
+    assert title["chosen"] == "My Own Title"
+    assert [c["text"] for c in title["candidates"]] == ["My Own Title"]
+    assert client.post(f"/api/scripts/{script_id}/titles", json={"text": "  "}).status_code == 422
+
+
+def test_the_channel_defaults_are_set_on_the_project(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    """Every episode's pack carries them, after its own tags."""
+    project_id, script_id = script["project_id"], script["script_id"]
+    client.patch(
+        f"/api/projects/{project_id}",
+        json={"default_tags": ["history", "business"], "description_boilerplate": " Subscribe. "},
+    )
+    client.patch(f"/api/scripts/{script_id}/publish", json={"tags": ["theranos"]})
+
+    listed = {p["id"]: p for p in client.get("/api/projects").json()}[project_id]
+    data = client.get(f"/api/scripts/{script_id}/publish").json()["data"]
+    assert listed["default_tags"] == ["history", "business"]
+    assert listed["description_boilerplate"] == "Subscribe."
+    assert data["tags"] == ["theranos", "history", "business"]
+    assert (data["episode_tags"], data["channel_tags"]) == (["theranos"], ["history", "business"])
+    assert data["boilerplate"] == "Subscribe."
+
+
+def test_an_episodes_history_starts_with_its_script(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    [event] = client.get(f"/api/scripts/{script['script_id']}/activity").json()
+    assert event["kind"] == "created"
+    assert event["text"].startswith("Script added — ")
+    assert event["at"]
+
+
+def test_the_cast_says_how_much_each_speaker_speaks(client: TestClient, project: int) -> None:
+    client.post(f"/api/projects/{project}/cast", json={"name": "Morag", "voice_id": "v-morag"})
+    client.post(f"/api/projects/{project}/cast", json={"name": "Keeper", "voice_id": "v-keeper"})
+    client.post(
+        "/api/scripts",
+        json={
+            "project_id": project,
+            "title": "Dialogue",
+            "text": "The light turned.\n\nMorag: You knew it would end.\n\n"
+            "Morag: And still you stayed.\n\nThe light turned again.",
+        },
+    )
+
+    cast = {m["name"]: m for m in client.get(f"/api/projects/{project}/cast").json()}
+    assert cast["Morag"]["lines"] >= 1
+    assert cast["Morag"]["chars"] > 0
+    assert cast["Morag"]["episodes"] == 1
+    assert (cast["Keeper"]["lines"], cast["Keeper"]["episodes"]) == (0, 0)
+
+
+def test_the_ledger_is_checked_against_elevenlabs(keyed: TestClient, engine: Engine) -> None:
+    """Free, and the answer is kept, so the page can say when it last agreed."""
+    from narrate.db.models import LedgerEntry, utcnow
+    from narrate.db.session import session_scope
+
+    with session_scope(engine) as session:
+        session.add(LedgerEntry(ts=utcnow(), project_id=1, billed_chars=1_000, cost_micros=100))
+    _Subscription.usage = {"columns": ["time", "credits"], "rows": [[0, 1_000]]}
+
+    checked = keyed.post("/api/reconcile").json()
+    assert checked["within_threshold"] is True
+    assert (checked["local_chars"], checked["provider_chars"]) == (1_000, 1_000)
+    assert "agrees" in checked["verdict"]
+    assert keyed.get("/api/reconcile/latest").json()["checked_at"] == checked["checked_at"]
+
+
+def test_reconciling_says_why_when_elevenlabs_cannot_be_asked(keyed: TestClient) -> None:
+    from narrate.provider.base import RetryableError
+
+    _Subscription.usage = RetryableError("Could not reach the provider: [Errno 8]")
+    failed = keyed.post("/api/reconcile")
+    assert failed.status_code == 502
+    assert failed.json()["detail"] == "Couldn't reach ElevenLabs"
+
+
+def test_there_is_nothing_to_reconcile_on_the_mock_provider(client: TestClient) -> None:
+    assert client.post("/api/reconcile").status_code == 400
+    assert client.get("/api/reconcile/latest").json() is None
+
+
+@needs_ffmpeg
+def test_takes_effects_and_episodes_have_waveforms(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    script_id = script["script_id"]
+    _run_to_completion(client, script_id)
+    chunks = client.get(f"/api/scripts/{script_id}/chunks").json()
+    take_id = chunks[0]["takes"][0]["id"]
+
+    assert len(client.get(f"/api/peaks/take/{take_id}", params={"n": 20}).json()["peaks"]) == 20
+    episode = client.get(f"/api/scripts/{script_id}/waveform", params={"n": 60}).json()
+    assert len(episode["peaks"]) == 60
+    assert episode["runtime_s"] > 0
+    assert client.get("/api/peaks/take/999999").status_code == 404
+
+
+def test_a_waveform_path_cannot_leave_the_media_folder(client: TestClient) -> None:
+    """The same check as the file endpoint: no drawing `.env`."""
+    assert client.get("/api/peaks/file", params={"path": "../../.env"}).status_code == 403
 
 
 # -- the SPA fallback -------------------------------------------------------

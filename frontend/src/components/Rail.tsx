@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 import { usd } from "../api";
 import { Link, navigate, scriptPath } from "../router";
 import { Menu } from "../ui/Menu";
-import type { Project, ScriptSummary } from "../types";
+import type { Credits, Project, ScriptSummary } from "../types";
 import {
   BrandMark,
   ChevronDownIcon,
@@ -29,6 +29,7 @@ export function Rail({
   totalSpend,
   flagged,
   effects,
+  credits,
 }: {
   projects: Project[];
   project: Project | null;
@@ -43,6 +44,7 @@ export function Rail({
   flagged: number;
   /** Effect placements, for the count beside Effects. */
   effects: number;
+  credits: Credits | null;
 }) {
   return (
     <aside className="rail" aria-label="Main navigation">
@@ -127,7 +129,12 @@ export function Rail({
         </nav>
       )}
 
-      {project?.cap_micros != null && <CapMeter project={project} />}
+      {(credits?.available || project?.cap_micros != null) && (
+        <div className="rail-meters">
+          {credits?.available && <CreditsMeter credits={credits} />}
+          {project?.cap_micros != null && <CapMeter project={project} />}
+        </div>
+      )}
     </aside>
   );
 }
@@ -199,9 +206,9 @@ function CapMeter({ project }: { project: Project }) {
   const pct = project.cap_used_pct;
   const tone = pct >= 100 ? " danger" : pct >= 80 ? " warn" : "";
   return (
-    <div className="rail-meters">
+    <div className="meter-block">
       <div className="meter-head">
-        <span>Monthly cap</span>
+        <span>💳 Monthly cap</span>
         <span>{pct}%</span>
       </div>
       <div className={`meter${tone}`} aria-hidden>
@@ -212,6 +219,32 @@ function CapMeter({ project }: { project: Project }) {
       </div>
     </div>
   );
+}
+
+/** Credits left on the ElevenLabs subscription: what stops a run partway
+ *  when it runs out, whatever the monthly cap says. */
+export function CreditsMeter({ credits }: { credits: Extract<Credits, { available: true }> }) {
+  const left = credits.limit ? (credits.remaining / credits.limit) * 100 : 0;
+  return (
+    <div className="meter-block">
+      <div className="meter-head">
+        <span>🔋 ElevenLabs credits</span>
+        <span>{credits.remaining.toLocaleString()}</span>
+      </div>
+      <div className={left < 10 ? "meter warn" : "meter plain"} aria-hidden>
+        <div style={{ width: `${Math.min(100, left)}%` }} />
+      </div>
+      <div className="foot">
+        of {credits.limit.toLocaleString()}
+        {credits.resets_at ? ` · resets ${resetDay(credits.resets_at)}` : ""}
+      </div>
+    </div>
+  );
+}
+
+/** "1 Nov". */
+export function resetDay(iso: string): string {
+  return new Date(iso).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
 }
 
 /** The first letter of a name, for its tile, until projects carry an icon. */

@@ -350,7 +350,10 @@ class ElevenLabsProvider:
             raise _classify(response)
 
     async def subscription(self) -> dict[str, Any]:
-        response = await self._client.get("/v1/user/subscription")
+        try:
+            response = await self._client.get("/v1/user/subscription")
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise RetryableError(f"Could not reach the provider: {exc}") from exc
         if response.status_code >= 400:
             raise _classify(response)
         result: dict[str, Any] = response.json()
@@ -371,15 +374,18 @@ class ElevenLabsProvider:
         backwards silently returns an empty window rather than an error, which
         would look like zero provider usage and a 100% drift.
         """
-        response = await self._client.post(
-            "/v1/workspace/analytics/query/usage-by-product-over-time",
-            json={
-                "start_time": int(start.timestamp() * 1000),
-                "end_time": int(end.timestamp() * 1000),
-                "interval_seconds": interval_seconds,
-                "group_by": group_by or ["model"],
-            },
-        )
+        try:
+            response = await self._client.post(
+                "/v1/workspace/analytics/query/usage-by-product-over-time",
+                json={
+                    "start_time": int(start.timestamp() * 1000),
+                    "end_time": int(end.timestamp() * 1000),
+                    "interval_seconds": interval_seconds,
+                    "group_by": group_by or ["model"],
+                },
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            raise RetryableError(f"Could not reach the provider: {exc}") from exc
         if response.status_code >= 400:
             raise _classify(response)
         result: dict[str, Any] = response.json()
@@ -408,11 +414,17 @@ def _audio_mime(path: Path) -> str:
 def _classify(response: httpx.Response) -> ProviderError:
     """Turn an error response into the right exception type.
 
-    Branches on HTTP status, never on the error `code` string: the docs publish
+    Branches on HTTP status, not on the error `code` string: the docs publish
     two different vocabularies for 429 (`rate_limit_exceeded` /
     `concurrent_limit_exceeded` in the API reference,
     `too_many_concurrent_requests` / `system_busy` in the help centre), so the
     code is advisory only.
+
+    The exception is a status that means two things. Running out of credits is
+    a 402 in the docs, but the API answers 401 with `quota_exceeded` — "This
+    request exceeds your quota… You have 45 credits remaining" — and a 401 is
+    otherwise a bad key. Read by status alone, an empty account was reported as
+    an authentication failure, and the run went on failing every chunk.
     """
     status = response.status_code
     code: str | None = None
@@ -439,7 +451,7 @@ def _classify(response: httpx.Response) -> ProviderError:
         "retry_after_s": retry_after,
     }
 
-    if status == 402:
+    if status == 402 or code == "quota_exceeded":
         return InsufficientCredits(
             f"Out of credits: {message}. Top up or lower the run's scope.", **kwargs
         )

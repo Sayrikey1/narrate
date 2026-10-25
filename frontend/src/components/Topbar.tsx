@@ -1,6 +1,7 @@
 import { Fragment } from "react";
-import { Link } from "../router";
-import type { Project, ScriptSummary } from "../types";
+import { usd } from "../api";
+import { Link, scriptPath } from "../router";
+import type { ActiveRun, Project, ScriptSummary } from "../types";
 import { SWITCHER_KEYS } from "./QuickSwitcher";
 import { EpisodeSwitch } from "./Rail";
 
@@ -26,12 +27,15 @@ export function Topbar({
   project,
   episodes,
   episode,
+  runs,
   onSearch,
 }: {
   pattern: string | null;
   project: Project | null;
   episodes: ScriptSummary[];
   episode: ScriptSummary | null;
+  /** What is generating or being checked right now. */
+  runs: ActiveRun[];
   /** Opens the quick switcher. */
   onSearch: () => void;
 }) {
@@ -73,6 +77,7 @@ export function Topbar({
           </Fragment>
         ))}
       </nav>
+      {runs.length > 0 && <RunPill run={runs[0]!} more={runs.length - 1} />}
       <button type="button" className="qs-trigger" onClick={onSearch} aria-keyshortcuts="Meta+K Control+K">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
           <circle cx="11" cy="11" r="7" />
@@ -82,5 +87,30 @@ export function Topbar({
         <kbd className="mono">{SWITCHER_KEYS}</kbd>
       </button>
     </header>
+  );
+}
+
+/** "Generating 012 · 5/8 · $0.84", on every page, until it is done. */
+function RunPill({ run, more }: { run: ActiveRun; more: number }) {
+  const verb = run.phase === "checking" ? "Checking" : "Generating";
+  const progress =
+    run.phase === "narration" && run.total
+      ? `${run.done}/${run.total} · ${usd(run.spent_micros, 2)}`
+      : run.phase === "effects"
+        ? "effects"
+        : "takes";
+  return (
+    <Link
+      className="run-pill"
+      to={scriptPath(run.script_id)}
+      title={`${verb} ${run.title} — open its workbench`}
+    >
+      <span className="run-dot pulse" aria-hidden />
+      <span>
+        {verb} <strong>{run.title}</strong>
+      </span>
+      <span className="mono dim">{progress}</span>
+      {more > 0 && <span className="faint">+{more}</span>}
+    </Link>
   );
 }

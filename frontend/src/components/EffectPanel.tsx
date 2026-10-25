@@ -1,10 +1,11 @@
-import { useState } from "react";
-import { api } from "../api";
+import { useEffect, useState } from "react";
+import { api, peaksUrl } from "../api";
 import { spoken } from "../findings";
 import * as transport from "../transport";
-import type { ChunkRow, Slot, Timeline } from "../types";
+import type { ChunkRow, LibraryEffect, Slot, Timeline } from "../types";
 import { Audition } from "./Audition";
 import { TrashIcon } from "./Icon";
+import { usePeaks, WaveBars } from "./Wave";
 
 /** Where the episode's effects sit over its narration: one block per chunk,
  *  a pin where each effect starts. A pin plays the episode from there.
@@ -68,6 +69,7 @@ export function FxCard({
   others,
   timeline,
   chunk,
+  chunks,
   onChange,
 }: {
   slot: Slot;
@@ -77,23 +79,29 @@ export function FxCard({
   others: number;
   timeline: Timeline | null;
   chunk: ChunkRow | undefined;
+  /** Every chunk, for moving the placement. */
+  chunks: ChunkRow[];
   onChange: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const sound = usePeaks(slot.effect_id ? peaksUrl.effect(slot.effect_id, 12) : null);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const suggestion = !slot.accepted;
   const planned = slot.accepted && !slot.effect_id;
   const starts = timeline?.entries.find((e) => e.slot_id === slot.id)?.start_s;
 
-  async function act(action: () => Promise<unknown>) {
+  async function act(action: () => Promise<unknown>): Promise<boolean> {
     setWorking(true);
     setError(null);
     try {
       await action();
       onChange();
+      return true;
     } catch (e) {
-      setError(String(e));
+      setError(String(e).replace(/^Error:\s*/, ""));
+      return false;
     } finally {
       setWorking(false);
     }
@@ -129,6 +137,7 @@ export function FxCard({
           {slot.effect_id && (
             <span className="fx-sound">
               <Audition src={api.audioEffect(slot.effect_id)} label={slot.description} />
+              {sound && <WaveBars peaks={sound} className="fx-mini" />}
               {slot.slug && (
                 <span className="mono" title={slot.slug}>
                   {slot.slug}
@@ -142,12 +151,31 @@ export function FxCard({
           {!suggestion && (
             <button
               type="button"
+              className="icon-button"
+              aria-label={`Edit ${slot.description}`}
+              title="Edit"
+              aria-expanded={editing}
+              disabled={working}
+              onClick={() => {
+                setEditing((v) => !v);
+                setConfirming(false);
+              }}
+            >
+              <PencilGlyph />
+            </button>
+          )}
+          {!suggestion && (
+            <button
+              type="button"
               className="icon-button danger"
               aria-label={`Remove ${slot.description}`}
               title="Remove"
               aria-expanded={confirming}
               disabled={working}
-              onClick={() => setConfirming((v) => !v)}
+              onClick={() => {
+                setConfirming((v) => !v);
+                setEditing(false);
+              }}
             >
               <TrashIcon size={15} />
             </button>
@@ -175,6 +203,18 @@ export function FxCard({
         </div>
       )}
 
+      {editing && (
+        <EditPlacement
+          slot={slot}
+          chunks={chunks}
+          onCancel={() => setEditing(false)}
+          onSave={async (body) => {
+            const ok = await act(() => api.updateSlot(slot.id, body));
+            if (ok) setEditing(false);
+          }}
+        />
+      )}
+
       {confirming && (
         <div className="confirm" role="alertdialog" aria-label="Remove this placement?">
           <span>
@@ -200,6 +240,198 @@ export function FxCard({
       )}
       {error && <p className="note error flush">{error}</p>}
     </article>
+  );
+}
+
+/** Change where a placement sits, or what it asks for. Moving is free and
+ *  keeps the sound; a new description, length or loop is a different sound,
+ *  made or found in the library with the next Generate. */
+function EditPlacement({
+  slot,
+  chunks,
+  onCancel,
+  onSave,
+}: {
+  slot: Slot;
+  chunks: ChunkRow[];
+  onCancel: () => void;
+  onSave: (body: { at_chunk_ordinal?: number; description?: string; duration_s?: number | null; loop?: boolean }) => void;
+}) {
+  const [description, setDescription] = useState(slot.description);
+  const [chunk, setChunk] = useState(slot.at_chunk_ordinal);
+  const [length, setLength] = useState(slot.duration_s ? String(slot.duration_s) : "");
+  const [loop, setLoop] = useState(slot.loop);
+  const seconds = length.trim() ? Number(length) : null;
+  const newSound =
+    description.trim() !== slot.description || seconds !== slot.duration_s || loop !== slot.loop;
+
+  return (
+    <form
+      className="fx-edit"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onSave({
+          at_chunk_ordinal: chunk,
+          ...(newSound ? { description: description.trim(), duration_s: seconds, loop } : {}),
+        });
+      }}
+    >
+      <label className="fx-edit-wide">
+        <span>Description</span>
+        <input value={description} onChange={(e) => setDescription(e.target.value)} />
+      </label>
+      <label>
+        <span>Starts in</span>
+        <select value={chunk} onChange={(e) => setChunk(Number(e.target.value))}>
+          {chunks.map((c) => (
+            <option key={c.ordinal} value={c.ordinal}>
+              Chunk {c.ordinal} — “{excerpt(c.text, 24)}”
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        <span>Length</span>
+        <input
+          className="mono"
+          type="number"
+          min="0.5"
+          max="30"
+          step="0.5"
+          placeholder="auto"
+          value={length}
+          onChange={(e) => setLength(e.target.value)}
+        />
+      </label>
+      <label className="checkbox">
+        <input type="checkbox" checked={loop} onChange={(e) => setLoop(e.target.checked)} />
+        🔁 Loop
+      </label>
+      <div className="fx-edit-wide fx-edit-actions">
+        <span className="faint">
+          {slot.effect_id && newSound
+            ? "That's a different sound: it goes back to planned, and the next Generate makes it — or reuses one from the library — at the price it shows first."
+            : slot.effect_id
+              ? "Moving it keeps its sound, and is free."
+              : "It's not generated yet, so changing it is free."}
+        </span>
+        <button type="button" className="small" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="submit" className="small primary" disabled={!description.trim()}>
+          Save
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** Every sound the project has paid for. Placing one again costs nothing: it is
+ *  linked as it is, ready without a Generate. */
+export function EffectLibrary({
+  projectId,
+  projectName,
+  scriptId,
+  chunks,
+  refreshKey,
+  onChange,
+}: {
+  projectId: number;
+  projectName: string;
+  scriptId: number;
+  chunks: ChunkRow[];
+  /** Changes when placements change, so the counts follow. */
+  refreshKey: unknown;
+  onChange: () => void;
+}) {
+  const [sounds, setSounds] = useState<LibraryEffect[] | null>(null);
+  const [placing, setPlacing] = useState<number | null>(null);
+  const [chunk, setChunk] = useState(1);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .effectLibrary(projectId)
+      .then((s) => alive && setSounds(s))
+      .catch(() => alive && setSounds([]));
+    return () => {
+      alive = false;
+    };
+  }, [projectId, refreshKey]);
+
+  if (!sounds?.length) return null;
+
+  async function place(effectId: number) {
+    setError(null);
+    try {
+      await api.addSlot(scriptId, { effect_id: effectId, at_chunk_ordinal: chunk });
+      setPlacing(null);
+      onChange();
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+    }
+  }
+
+  return (
+    <section className="panel" aria-labelledby="lib-h">
+      <div className="card-head">
+        <div className="card-head-text">
+          <h2 id="lib-h" className="card-title">
+            📚 Effect library
+          </h2>
+          <p className="card-sub">Every sound {projectName} has paid for. Placing one again costs nothing.</p>
+        </div>
+      </div>
+      <ul className="fx-library">
+        {sounds.map((sound) => (
+          <li key={sound.id}>
+            <div className="fx-library-row">
+              <Audition src={api.audioEffect(sound.id)} label={sound.description} />
+              <span className="fx-library-text">
+                <span className="mono" title={sound.description}>
+                  {sound.slug}
+                </span>
+                <span className="faint">
+                  {sound.placements} placement{sound.placements === 1 ? "" : "s"} · {sound.episodes} episode
+                  {sound.episodes === 1 ? "" : "s"}
+                </span>
+              </span>
+              <button
+                type="button"
+                className="small"
+                aria-expanded={placing === sound.id}
+                onClick={() => setPlacing((p) => (p === sound.id ? null : sound.id))}
+              >
+                Place…
+              </button>
+            </div>
+            {placing === sound.id && (
+              <div className="fx-library-place">
+                <label className="sr-only" htmlFor={`place-${sound.id}`}>
+                  Chunk to place it in
+                </label>
+                <select id={`place-${sound.id}`} value={chunk} onChange={(e) => setChunk(Number(e.target.value))}>
+                  {chunks.map((c) => (
+                    <option key={c.ordinal} value={c.ordinal}>
+                      Chunk {c.ordinal} — “{excerpt(c.text, 24)}”
+                    </option>
+                  ))}
+                </select>
+                <button type="button" className="small primary" onClick={() => void place(sound.id)}>
+                  Place here — free
+                </button>
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+      {error && (
+        <p className="note error flush" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
   );
 }
 
@@ -319,3 +551,11 @@ function clock(seconds: number): string {
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
 }
 
+
+function PencilGlyph() {
+  return (
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M4 20h4L19 9l-4-4L4 16z" />
+    </svg>
+  );
+}

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { claimSolo, releaseSolo } from "../audioBus";
 import { DownloadIcon, PauseIcon, PlayIcon } from "./Icon";
+import { WaveBars } from "./Wave";
 
 /** The one currently playing, so starting a second stops the first.
  *
@@ -33,6 +34,7 @@ export function Player({
   download,
   wide,
   cue,
+  peaks,
 }: {
   src: string;
   /** Known ahead of metadata load, so the bar is right before first play. */
@@ -42,6 +44,8 @@ export function Player({
   /** Jump to `at` seconds and play. A new `nonce` repeats the jump, so the same
    *  spot can be played twice in a row. */
   cue?: { at: number; nonce: number } | null;
+  /** The take's waveform: drawn as the track when it has arrived. */
+  peaks?: number[] | null;
 }) {
   const ref = useRef<HTMLAudioElement | null>(null);
   const scrub = useRef<HTMLDivElement | null>(null);
@@ -145,9 +149,15 @@ export function Player({
         {playing ? <PauseIcon /> : <PlayIcon />}
       </button>
 
-      <div className="player-scrub" ref={scrub} onClick={seek}>
-        <div className="player-track" />
-        <div className="player-fill" style={{ width: `${pct}%` }} />
+      <div className={peaks?.length ? "player-scrub waved" : "player-scrub"} ref={scrub} onClick={seek}>
+        {peaks?.length ? (
+          <WaveBars peaks={peaks} played={pct / 100} />
+        ) : (
+          <>
+            <div className="player-track" />
+            <div className="player-fill" style={{ width: `${pct}%` }} />
+          </>
+        )}
         <div className="player-head" style={{ left: `${pct}%` }} />
       </div>
 

@@ -1,11 +1,12 @@
 import { useId, useState } from "react";
 import type { ReactNode } from "react";
-import { api, bytes } from "../api";
+import { api, bytes, peaksUrl } from "../api";
 import { day, READABLE, type Entry } from "../mediaFiles";
 import { Link, scriptPath } from "../router";
 import { DocumentView } from "../ui/DocumentView";
 import { ChevronDownIcon, DownloadIcon } from "./Icon";
 import { Player } from "./Player";
+import { usePeaks } from "./Wave";
 import type { MediaFile, SavedArchive, ScriptSummary } from "../types";
 
 /** How many of a long list show before "Show N more" — enough to see what is
@@ -25,6 +26,7 @@ export function MediaLibrary({
   wholeProject,
   exportFolder,
   searching,
+  stale,
 }: {
   /** Already scoped, searched, filtered and sorted. */
   entries: Entry[];
@@ -36,6 +38,8 @@ export function MediaLibrary({
   exportFolder: string | null;
   /** A search shows every match rather than the first few of each list. */
   searching: boolean;
+  /** Episodes whose export was made before their cut changed. */
+  stale?: Set<number>;
 }) {
   const current = scripts.find((s) => s.id === currentId);
   const order = [
@@ -60,6 +64,7 @@ export function MediaLibrary({
               open={open}
               exportFolder={exportFolder}
               searching={searching}
+              stale={stale?.has(script.id) ?? false}
             />
           ),
           takes.length > 0 && (
@@ -108,12 +113,15 @@ function ExportGroup({
   open,
   exportFolder,
   searching,
+  stale,
 }: {
   script: ScriptSummary;
   entries: Entry[];
   open: boolean;
   exportFolder: string | null;
   searching: boolean;
+  /** Made before the cut changed: it plays the old takes. */
+  stale: boolean;
 }) {
   const masters = entries.filter((e) => e.kind === "master");
   const pieces = entries.filter((e) => e.kind === "piece");
@@ -128,6 +136,14 @@ function ExportGroup({
         <>
           {day(newest, true)} · {entries.length} file{entries.length === 1 ? "" : "s"} ·{" "}
           <span className="mono">{bytes(total(entries))}</span>
+          {stale && (
+            <>
+              {" "}
+              <span className="pill warn small-pill" title="Export it again from the workbench">
+                out of date — the cut has changed since
+              </span>
+            </>
+          )}
         </>
       }
       action={<ZipAction scriptId={script.id} title={script.title} folder={exportFolder} />}
@@ -224,6 +240,16 @@ function Rows({ entries, first, noun }: { entries: Entry[]; first: number; noun:
 function FileRow({ entry, children }: { entry: Entry; children?: ReactNode }) {
   const { file } = entry;
   const take = entry.kind === "take";
+  const drawn = file.playable && entry.kind !== "piece" && !children;
+  const peaks = usePeaks(
+    !drawn
+      ? null
+      : file.take_id
+        ? peaksUrl.take(file.take_id, 40)
+        : file.effect_id
+          ? peaksUrl.effect(file.effect_id, 24)
+          : peaksUrl.file(file.path, 40),
+  );
   return (
     <div className={["media-row", `media-${entry.kind}`, take && !entry.inCut ? "out" : ""].filter(Boolean).join(" ")}>
       <span className={entry.fx ? "media-tile fx" : "media-tile"} aria-hidden>
@@ -249,7 +275,7 @@ function FileRow({ entry, children }: { entry: Entry; children?: ReactNode }) {
       {!take && <span className="media-row-size mono">{bytes(file.bytes)}</span>}
       {children ??
         (file.playable && entry.kind !== "piece" ? (
-          <Player src={api.mediaUrl(file.path)} duration={file.duration_s} />
+          <Player src={api.mediaUrl(file.path)} duration={file.duration_s} peaks={peaks} />
         ) : null)}
       <a
         className="icon-link"

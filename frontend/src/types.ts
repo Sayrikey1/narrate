@@ -50,6 +50,9 @@ export interface Project {
   waste_pct: number;
   /** This month's charges — what the cap is measured against. */
   month_micros: number;
+  /** The channel's packaging, merged into every episode's publish pack. */
+  default_tags: string[];
+  description_boilerplate: string;
   cap_micros: number | null;
   cap_used_pct: number;
 }
@@ -146,7 +149,95 @@ export interface Take {
    *  `verify_status` and `findings` still say what the check found. */
   verify_accepted: boolean;
   findings: Finding[];
+  /** Why a take has no audio, in words to act on; absent once it worked. */
+  error?: FailureReason | null;
 }
+
+/** The ledger compared with what ElevenLabs says it billed. */
+export interface Reconciled {
+  window_start: string;
+  window_end: string;
+  local_chars: number;
+  provider_chars: number;
+  local_micros: number;
+  drift_pct: number;
+  within_threshold: boolean;
+  coverage_pct: number;
+  verdict: string;
+  note: string;
+  checked_at: string;
+}
+
+/** Something that happened to an episode, read back from its records. */
+export interface ActivityEvent {
+  at: string;
+  kind: string;
+  icon: string;
+  text: string;
+}
+
+/** Where an episode is: script, audio, check, export, publish. */
+export interface EpisodeStatus {
+  script_id: number;
+  chunks: number;
+  with_audio: number;
+  /** Chunks with no audio whose every attempt failed. */
+  failed: number[];
+  flagged: number;
+  review: number;
+  unchecked: number;
+  exported_at: string | null;
+  /** The newest export was made from the cut as it is now. */
+  export_current: boolean;
+  title_chosen: boolean;
+  chapters_usable: boolean;
+  runtime_s: number;
+  spent_micros: number;
+  outstanding_chunks: number;
+  outstanding_micros: number;
+  last_activity: string;
+  needs_you: boolean;
+  done: boolean;
+}
+
+/** This month's spend day by day, and last month's total, from the ledger. */
+export interface Spend {
+  month_start: string;
+  month_micros: number;
+  last_month_start: string;
+  last_month_micros: number;
+  days: { date: string; micros: number; by_project: Record<string, number> }[];
+}
+
+/** Something generating or being checked right now, here or from the CLI. */
+export interface ActiveRun {
+  script_id: number;
+  title: string;
+  phase: "narration" | "effects" | "checking";
+  /** Narration only: chunks done, and done plus still to go. */
+  done: number | null;
+  total: number | null;
+  failed: number;
+  spent_micros: number;
+}
+
+export interface FailureReason {
+  headline: string;
+  detail: string;
+  fix: string;
+}
+
+/** What is left on the ElevenLabs subscription this billing month. */
+export type Credits =
+  | {
+      available: true;
+      used: number;
+      limit: number;
+      remaining: number;
+      resets_at: string | null;
+      tier: string | null;
+    }
+  | { available: false; reason: string };
 
 export type VerifyStatus = "unverified" | "clear" | "review" | "suspect" | "error";
 
@@ -296,6 +387,10 @@ export interface CastMember {
   name: string;
   voice_id: string;
   note: string;
+  /** How much they speak across the project's episodes. */
+  lines: number;
+  chars: number;
+  episodes: number;
 }
 
 /** A starter script: annotated in HTML comments, which are stripped before
@@ -318,6 +413,18 @@ export interface Variant {
   chunks: number;
   chunks_total: number;
   complete: boolean;
+}
+
+/** A sound the project has paid for, and how often it is placed. */
+export interface LibraryEffect {
+  id: number;
+  slug: string;
+  description: string;
+  duration_s: number | null;
+  loop: boolean;
+  cost_micros: number;
+  placements: number;
+  episodes: number;
 }
 
 export interface Slot {
@@ -431,6 +538,9 @@ export interface PublishData {
   /** The description, chapters and channel footer, exactly as pasted. */
   description_box: string;
   tags: string[];
+  /** `tags` in its two halves: the episode's own, and the channel's defaults. */
+  episode_tags: string[];
+  channel_tags: string[];
   chapters: PublishChapters;
   thumbnail: ThumbnailBrief | null;
   briefs: BriefSummary[];

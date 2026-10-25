@@ -1,18 +1,38 @@
-import { useEffect, useState } from "react";
-import { api, usd } from "../api";
+import { useState } from "react";
+import { usd } from "../api";
 import { Link, scriptPath } from "../router";
-import type { Cost, ScriptSummary } from "../types";
+import type { EpisodeStatus, ScriptSummary } from "../types";
 
-/** The project's episodes, each with what is left to generate and what it has
- *  cost so far. */
+type Filter = "all" | "needs" | "progress" | "done";
+
+const FILTERS: [Filter, string][] = [
+  ["all", "All"],
+  ["needs", "Needs you"],
+  ["progress", "In progress"],
+  ["done", "Done"],
+];
+
+/** The project's episodes, each with where it is in the pipeline — script,
+ *  audio, check, export, publish — what it has cost, and when it last moved. */
 export function EpisodeTable({
   projectName,
   episodes,
+  statuses,
+  failed,
 }: {
   projectName: string;
   episodes: ScriptSummary[];
+  /** Each episode's status, by its id; fetched once for the page. */
+  statuses: Record<number, EpisodeStatus>;
+  /** The statuses could not be fetched. */
+  failed?: boolean;
 }) {
-  const costs = useCosts(episodes);
+  const [filter, setFilter] = useState<Filter>("all");
+
+  const group = (s: EpisodeStatus | undefined): Filter =>
+    !s ? "progress" : s.needs_you ? "needs" : s.done ? "done" : "progress";
+  const count = (f: Filter) => (f === "all" ? episodes.length : episodes.filter((e) => group(statuses[e.id]) === f).length);
+  const shown = episodes.filter((e) => filter === "all" || group(statuses[e.id]) === filter);
 
   return (
     <section className="panel" aria-labelledby="eps-h">
@@ -20,34 +40,52 @@ export function EpisodeTable({
         <h2 id="eps-h">
           Episodes in {projectName} <span className="count">{episodes.length}</span>
         </h2>
+        {episodes.length > 0 && (
+          <div className="seg-pill" role="group" aria-label="Filter episodes">
+            {FILTERS.map(([key, label]) => (
+              <button key={key} type="button" aria-pressed={filter === key} onClick={() => setFilter(key)}>
+                {label} <span className="mono chip-count">{count(key)}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
       {episodes.length === 0 ? (
         <div className="empty">
           <strong>No episodes yet</strong>
           Add one with the card on the right — drop a .txt or .md file, or paste the text.
         </div>
+      ) : shown.length === 0 ? (
+        <div className="empty">
+          <strong>None {filter === "needs" ? "need you" : filter === "done" ? "done yet" : "in progress"}</strong>
+          {filter === "needs" ? "Nothing is flagged, failed or out of date." : "Pick another filter to see them."}
+        </div>
       ) : (
         <div className="table-scroll">
           <table className="episodes">
             <caption className="sr-only">
-              Episodes in {projectName}, with what is left to generate and what each has cost
+              Episodes in {projectName}, with where each one is in the pipeline
             </caption>
             <thead>
               <tr>
                 <th scope="col">Episode</th>
-                <th scope="col">Status</th>
+                <th scope="col">Script · Audio · Check · Export · Publish</th>
+                <th scope="col" className="num">
+                  Runtime
+                </th>
                 <th scope="col" className="num">
                   Spent
                 </th>
+                <th scope="col">Updated</th>
                 <th scope="col">
                   <span className="sr-only">Open</span>
                 </th>
               </tr>
             </thead>
             <tbody>
-              {episodes.map((episode) => {
-                const cost = costs[episode.id];
-                const status = cost === undefined ? null : describe(episode, cost);
+              {shown.map((episode) => {
+                const status = statuses[episode.id];
+                const line = status ? describe(status) : null;
                 return (
                   <tr key={episode.id}>
                     <td>
@@ -64,10 +102,25 @@ export function EpisodeTable({
                         </span>
                       </Link>
                     </td>
-                    <td className={status?.tone ?? "faint"}>{status?.text ?? "…"}</td>
-                    <td className="num mono dim">
-                      {cost ? usd(cost.cost_micros) : cost === null ? "—" : "…"}
+                    <td>
+                      {status ? (
+                        <span className="pipeline">
+                          <span className="pipeline-bars" aria-hidden>
+                            {stages(status).map((stage, i) => (
+                              <span key={i} className={`pipeline-bar ${stage}`} />
+                            ))}
+                          </span>
+                          <span className={`pipeline-text ${line!.tone}`}>{line!.text}</span>
+                        </span>
+                      ) : (
+                        <span className="faint">{failed ? "—" : "…"}</span>
+                      )}
                     </td>
+                    <td className="num mono dim">
+                      {status && status.with_audio > 0 ? clock(status.runtime_s) : "—"}
+                    </td>
+                    <td className="num mono dim">{status ? usd(status.spent_micros) : "…"}</td>
+                    <td className="dim nowrap">{status ? ago(status.last_activity) : ""}</td>
                     <td className="num">
                       <Link className="btn small" to={scriptPath(episode.id)}>
                         Open<span className="sr-only"> {episode.title}</span> →
@@ -84,49 +137,71 @@ export function EpisodeTable({
   );
 }
 
-/** Each episode's cost report, fetched together. `null` for one that failed:
- *  its row says "—" rather than holding the rest of the table back. */
-function useCosts(episodes: ScriptSummary[]): Record<number, Cost | null> {
-  const [costs, setCosts] = useState<Record<number, Cost | null>>({});
-  const ids = episodes.map((e) => e.id).join(",");
+type Stage = "done" | "warn" | "bad" | "part" | "off";
 
-  useEffect(() => {
-    let alive = true;
-    for (const id of ids ? ids.split(",").map(Number) : []) {
-      api
-        .cost(id)
-        .then((cost) => alive && setCosts((all) => ({ ...all, [id]: cost })))
-        .catch(() => alive && setCosts((all) => ({ ...all, [id]: null })));
-    }
-    return () => {
-      alive = false;
-    };
-  }, [ids]);
-
-  return costs;
+/** One bar each for script, audio, check, export and publish. */
+export function stages(s: EpisodeStatus): Stage[] {
+  const audio: Stage =
+    s.with_audio === s.chunks && s.chunks > 0 ? "done" : s.failed.length ? "bad" : s.with_audio > 0 ? "part" : "off";
+  const check: Stage =
+    s.flagged || s.review
+      ? "warn"
+      : s.with_audio > 0 && s.unchecked === 0
+        ? "done"
+        : s.unchecked < s.with_audio
+          ? "part"
+          : "off";
+  const exported: Stage = !s.exported_at ? "off" : s.export_current ? "done" : "warn";
+  const publish: Stage = s.title_chosen && s.chapters_usable ? "done" : "off";
+  return ["done", audio, check, exported, publish];
 }
 
-function describe(
-  episode: ScriptSummary,
-  cost: Cost | null,
-): { text: string; tone: string } {
-  if (cost === null) return { text: "—", tone: "faint" };
-  const todo = cost.outstanding;
-  const about = todo ? ` — about ${usd(todo.cost_micros, 2)}` : "";
-  if (!todo || (todo.chunks === 0 && todo.effects === 0)) {
-    return { text: "✅ Every chunk has audio", tone: "ok" };
-  }
-  if (cost.cost_micros === 0 && todo.chunks >= episode.chunks) {
-    return { text: `📝 Script only${about} to generate`, tone: "dim" };
-  }
-  if (todo.chunks > 0) {
+/** The one thing to know about an episode, most pressing first. */
+export function describe(s: EpisodeStatus): { text: string; tone: string } {
+  if (s.failed.length) {
     return {
-      text: `🎙️ ${todo.chunks} of ${episode.chunks} chunk${episode.chunks === 1 ? "" : "s"} to generate${about}`,
-      tone: "warn",
+      text:
+        s.failed.length === 1
+          ? `⛔ Chunk ${s.failed[0]} didn't generate`
+          : `⛔ ${s.failed.length} chunks didn't generate`,
+      tone: "bad",
     };
   }
+  if (s.flagged || s.review) {
+    const parts = [s.flagged && `${s.flagged} flagged`, s.review && `${s.review} worth a listen`].filter(Boolean);
+    return { text: `⚠️ ${parts.join(" · ")}`, tone: "warn" };
+  }
+  if (s.with_audio < s.chunks) {
+    const about = s.outstanding_micros ? ` — about ${usd(s.outstanding_micros, 2)}` : "";
+    return s.with_audio === 0
+      ? { text: `📝 Script only${about} to generate`, tone: "dim" }
+      : { text: `🎙️ ${s.chunks - s.with_audio} of ${s.chunks} chunks to generate${about}`, tone: "warn" };
+  }
+  const unchecked = s.unchecked ? ` · ${s.unchecked} not checked` : "";
+  if (s.exported_at && !s.export_current) {
+    return { text: "♻️ Export out of date — the cut has changed since", tone: "warn" };
+  }
+  if (!s.exported_at) return { text: `✅ Ready to export${unchecked}`, tone: "ok" };
   return {
-    text: `✨ ${todo.effects} effect${todo.effects === 1 ? "" : "s"} to generate${about}`,
-    tone: "warn",
+    text: `${s.title_chosen && s.chapters_usable ? "🚀 Exported — publish pack ready" : `📦 Exported ${ago(s.exported_at)}`}${unchecked}`,
+    tone: "ok",
   };
+}
+
+/** "today", "yesterday", or "23 Oct". */
+export function ago(iso: string): string {
+  const then = new Date(iso);
+  const days = Math.floor((startOfDay(new Date()) - startOfDay(then)) / 86_400_000);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  return then.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+}
+
+function startOfDay(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+function clock(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
 }

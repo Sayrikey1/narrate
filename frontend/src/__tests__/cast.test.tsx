@@ -5,13 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CastPage } from "../pages/Cast";
 import type { CastMember, Project, Voice } from "../types";
 
-const members: CastMember[] = [{ id: 4, name: "Morag", voice_id: "v-george", note: "" }];
+const members: CastMember[] = [
+  { id: 4, name: "Morag", voice_id: "v-george", note: "", lines: 12, chars: 1_840, episodes: 3 },
+];
 const removeCastMember = vi.fn(async () => ({}));
 const setCastMember = vi.fn(async () => ({}));
 
 vi.mock("../api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../api")>()),
   api: {
+    peaks: () => Promise.resolve({ peaks: [] }),
     cast: () => Promise.resolve(members),
     voices: () => Promise.resolve(VOICES),
     voicePreview: (id: string) => `/api/voices/${id}/preview`,
@@ -32,7 +35,7 @@ const project: Project = {
   model_id: "eleven_v3",
   spend_micros: 0,
   waste_pct: 0,
-  month_micros: 0,
+  month_micros: 0, default_tags: [], description_boilerplate: "",
   cap_micros: null,
   cap_used_pct: 0,
 };
@@ -71,6 +74,7 @@ describe("the cast", () => {
     expect(host.textContent).toContain("Narrator");
     expect(host.textContent).toContain("Rachel");
     expect(host.textContent).toContain("Morag:");
+    expect(host.textContent).toContain("12 lines · 1,840 chars · 3 episodes");
     // The name without the blurb.
     expect(host.textContent).toContain("George");
   });

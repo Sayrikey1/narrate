@@ -290,7 +290,7 @@ describe("a take that is right but always flagged", () => {
 
     await click(button("It's fine"));
 
-    expect(fetch.mock.calls[0][0]).toBe("/api/takes/16/accept?accepted=true");
+    expect(fetch.mock.calls.map(([url]) => url).find((url) => String(url).includes("/accept"))).toBe("/api/takes/16/accept?accepted=true");
     expect(onChange).toHaveBeenCalled();
   });
 
@@ -313,7 +313,7 @@ describe("a take that is right but always flagged", () => {
     expect(button("It's fine")).toBeFalsy();
 
     await click(host.querySelector('[aria-label="Flag take 1 again"]'));
-    expect(fetch.mock.calls[0][0]).toBe("/api/takes/16/accept?accepted=false");
+    expect(fetch.mock.calls.map(([url]) => url).find((url) => String(url).includes("/accept"))).toBe("/api/takes/16/accept?accepted=false");
   });
 
   it("is not offered on a take with nothing flagged", async () => {

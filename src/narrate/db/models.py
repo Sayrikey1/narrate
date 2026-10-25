@@ -24,6 +24,12 @@ def utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def as_utc(moment: datetime) -> datetime:
+    """A timestamp as read back from SQLite, which drops the zone it was written
+    in. Everything is written in UTC, so that is the zone it gets back."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
 class Base(DeclarativeBase):
     pass
 

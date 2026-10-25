@@ -3,6 +3,7 @@ import * as transport from "../transport";
 import type { ChunkRow, ScriptSummary, Timeline } from "../types";
 import { PauseIcon, PlayIcon } from "./Icon";
 import { useTransport } from "./Transport";
+import { usePeaks, WaveBars } from "./Wave";
 
 /** The episode last worked on, and what is in its way — so opening the app
  *  starts with the next thing to do rather than a list to search. */
@@ -10,12 +11,16 @@ export function PickUp({
   episode,
   timeline,
   chunks,
+  lastActivity,
 }: {
   episode: ScriptSummary;
   timeline: Timeline | null;
   chunks: ChunkRow[];
+  /** When anything last happened to it, from its records. */
+  lastActivity?: string;
 }) {
   const player = useTransport();
+  const wave = usePeaks(`/api/scripts/${episode.id}/waveform?n=44`);
   const inCut = chunks.flatMap((c) => c.takes.filter((t) => t.in_cut && !t.verify_accepted));
   const suspect = inCut.filter((t) => t.verify_status === "suspect").length;
   const review = inCut.filter((t) => t.verify_status === "review").length;
@@ -34,10 +39,18 @@ export function PickUp({
       : null,
     `${episode.chunks} chunk${episode.chunks === 1 ? "" : "s"}`,
     `${episode.chars.toLocaleString()} chars`,
+    lastActivity ? `last worked on ${workedOn(lastActivity)}` : null,
   ].filter(Boolean);
 
   return (
     <section className="panel pickup" aria-labelledby="pickup-h">
+      {wave && wave.some((p) => p > 0) && (
+        <WaveBars
+          peaks={wave}
+          played={player.duration ? player.position / player.duration : 0}
+          className="pickup-wave"
+        />
+      )}
       <span className="pickup-kicker">⏯️ Pick up where you left off</span>
       <div className="pickup-title">
         <span className="icon-tile sz-70" aria-hidden>
@@ -117,4 +130,14 @@ function holes(missing: number[]): string {
 function clock(seconds: number): string {
   const whole = Math.max(0, Math.floor(seconds));
   return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, "0")}`;
+}
+
+/** "today", "yesterday", or "Fri 23 Oct". */
+function workedOn(iso: string): string {
+  const at = new Date(iso);
+  const today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (at.toDateString() === today.toDateString()) return "today";
+  if (at.toDateString() === yesterday.toDateString()) return "yesterday";
+  return at.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
 }
