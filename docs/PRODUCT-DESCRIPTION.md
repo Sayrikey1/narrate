@@ -808,7 +808,9 @@ project".
 
 - A summary line: "528 files · 3.1 GB on disk".
 - Files in groups, each with a heading, its total size and, for exports, a
-  **⤓ zip** link that downloads the whole export:
+  **⤓ zip** link that downloads the whole export. When an export folder is
+  set, it's a **Save zip** button instead: it saves `004.zip` beside the
+  episode folders and says "Saved 004.zip in hindsight" (or "Replaced…"):
   - **"{script title} — export"**, one group per exported episode (written to
     `assets/exports/`, or to the folder set as `NARRATE_EXPORT_DIR`): masters
     (`Episode.mp3`, `Episode_fx.mp3`, `.wav`…), the timeline-named pieces,

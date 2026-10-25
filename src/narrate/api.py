@@ -19,7 +19,6 @@ import hashlib
 import json
 import tempfile
 import threading
-import zipfile
 from collections.abc import AsyncIterator
 from dataclasses import asdict
 from functools import partial
@@ -1630,6 +1629,9 @@ def create_app(
             "project": media.project_name,
             "files": media.file_count,
             "bytes": media.total_bytes,
+            # Where "Save zip" puts an episode's zip, when exports have a folder
+            # of their own; otherwise the zip is a download.
+            "export_folder": str(config.export_dir) if config.export_dir else None,
             "groups": [
                 {
                     "title": group.title,
@@ -1686,19 +1688,38 @@ def create_app(
         handle = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
         handle.close()
         archive = Path(handle.name)
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            for item in sorted(directory.iterdir()):
-                if item.is_file() and not item.name.startswith("_"):
-                    bundle.write(item, item.name)
+        name = media_mod.archive_name(config, directory, title, script_id)
+        media_mod.write_archive(directory, archive, name)
         background.add_task(archive.unlink, missing_ok=True)
 
-        safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in title).strip("-")
         return FileResponse(
             archive,
             media_type="application/zip",
-            filename=f"{safe or f'script-{script_id}'}.zip",
+            filename=f"{name}.zip",
             background=background,
         )
+
+    @app.post("/api/exports/{script_id}/archive")
+    def save_export_archive(script_id: int) -> dict[str, Any]:
+        """Zip one export into the folder beside it, rather than downloading it.
+
+        With an export folder set, that is where every episode's zip goes —
+        `004.zip` next to `004/` — instead of wherever the browser saves.
+        """
+        with session_scope(db) as session:
+            title = _script(session, script_id).title
+            directory = media_mod.export_dir(session, script_id)
+        if directory is None or not directory.is_dir():
+            raise HTTPException(409, "This script has not been exported yet")
+        name = media_mod.archive_name(config, directory, title, script_id)
+        archive, replaced = media_mod.zip_beside(directory, name)
+        return {
+            "name": archive.name,
+            "folder": str(archive.parent),
+            "unzips_to": name,
+            "replaced": replaced,
+            "bytes": archive.stat().st_size,
+        }
 
     # -- audio -------------------------------------------------------------
 

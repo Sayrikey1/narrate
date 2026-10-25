@@ -450,8 +450,14 @@ def test_the_export_archive_contains_the_whole_export(
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
 
+    assert 'filename="Episode.zip"' in response.headers["content-disposition"]
+
     with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
-        names = set(bundle.namelist())
+        entries = bundle.namelist()
+    # Inside a folder of its own, so it unzips to that folder with any tool —
+    # loose files only land in one as Archive Utility's courtesy.
+    assert all(n.startswith("Episode/") for n in entries)
+    names = {n.removeprefix("Episode/") for n in entries}
     assert "plan.md" in names
     assert exported["master"] in names
     assert set(exported["names"].values()) <= names
@@ -1253,3 +1259,82 @@ def test_two_episodes_with_one_title_do_not_share_a_folder(
 
     assert Path(folders[0]) == own_folder / "UI Ep"
     assert Path(folders[1]) == own_folder / f"UI Ep ({created['id']})"
+
+
+@needs_ffmpeg
+def test_saving_a_zip_puts_it_beside_the_episode_folders(
+    exporting: TestClient, own_folder: Path
+) -> None:
+    """Not wherever the browser saves: `002.zip` next to `002/`, unzipping to
+    exactly that folder — the script filed in it included, the Finder's
+    .DS_Store not."""
+    import zipfile
+
+    project = exporting.post("/api/projects", json={"name": "UI", "voice_id": "v1"}).json()
+    created = exporting.post(
+        "/api/scripts", json={"project_id": project["id"], "title": "002", "text": SCRIPT}
+    ).json()
+    _run_to_completion(exporting, created["id"])
+    exporting.post(f"/api/scripts/{created['id']}/export")
+    (own_folder / "002" / "002_The_Episode.md").write_text("# The Episode")
+    (own_folder / "002" / ".DS_Store").write_bytes(b"\0")
+
+    saved = exporting.post(f"/api/exports/{created['id']}/archive").json()
+
+    assert (saved["name"], saved["unzips_to"], saved["replaced"]) == ("002.zip", "002", False)
+    assert Path(saved["folder"]) == own_folder
+    with zipfile.ZipFile(own_folder / "002.zip") as bundle:
+        entries = bundle.namelist()
+    assert all(n.startswith("002/") for n in entries)
+    assert "002/002_The_Episode.md" in entries
+    assert "002/002.wav" in entries
+    assert "002/.DS_Store" not in entries
+    # The listing tells the page to offer this instead of a download.
+    listing = exporting.get(f"/api/projects/{project['id']}/media").json()
+    assert listing["export_folder"] == str(own_folder)
+
+    again = exporting.post(f"/api/exports/{created['id']}/archive").json()
+    assert again["replaced"] is True
+    assert not list(own_folder.glob(".*.partial"))
+
+
+def test_saving_the_zip_of_an_unexported_script_is_a_conflict(
+    client: TestClient, script: dict[str, int]
+) -> None:
+    assert client.post(f"/api/exports/{script['script_id']}/archive").status_code == 409
+
+
+@needs_ffmpeg
+def test_export_zip_on_the_command_line_packs_the_folder_beside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import zipfile
+
+    from typer.testing import CliRunner
+
+    from narrate import cli
+    from narrate.settings import get_settings
+
+    folder = tmp_path / "episodes"
+    db = tmp_path / "cli.db"
+    monkeypatch.setenv("NARRATE_DB_PATH", str(db))
+    monkeypatch.setenv("NARRATE_DATABASE_URL", f"sqlite:///{db}")
+    monkeypatch.setenv("NARRATE_ASSETS_DIR", str(tmp_path / "assets"))
+    monkeypatch.setenv("NARRATE_EXPORT_DIR", str(folder))
+    monkeypatch.setenv("NARRATE_PROVIDER", "mock")
+    script_file = tmp_path / "007.md"
+    script_file.write_text(SCRIPT)
+    get_settings.cache_clear()
+    try:
+        runner = CliRunner()
+        runner.invoke(cli.app, ["project", "new", "Show", "--voice", "v1"])
+        runner.invoke(cli.app, ["script", "add", str(script_file), "-p", "Show"])
+        runner.invoke(cli.app, ["generate", "1", "--go", "--yes"])
+        result = runner.invoke(cli.app, ["export", "1", "--zip"])
+    finally:
+        get_settings.cache_clear()
+
+    assert result.exit_code == 0, result.output
+    assert "unzips to 007/" in result.output
+    with zipfile.ZipFile(folder / "007.zip") as bundle:
+        assert all(n.startswith("007/") for n in bundle.namelist())

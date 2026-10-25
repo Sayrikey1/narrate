@@ -101,7 +101,19 @@ export interface ProjectMedia {
   project: string;
   files: number;
   bytes: number;
+  /** Where "Save zip" puts an episode's zip, when exports have a folder of
+   *  their own. Null means the zip is a download. */
+  export_folder: string | null;
   groups: MediaGroup[];
+}
+
+/** A zip saved beside its episode's folder: `004.zip`, unzipping to `004/`. */
+export interface SavedArchive {
+  name: string;
+  folder: string;
+  unzips_to: string;
+  replaced: boolean;
+  bytes: number;
 }
 
 export interface ScriptSummary {

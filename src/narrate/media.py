@@ -17,6 +17,7 @@ test.
 from __future__ import annotations
 
 import mimetypes
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -175,6 +176,52 @@ def export_dir(session: Session, script_id: int) -> Path | None:
         .limit(1)
     )
     return Path(path).parent if path else None
+
+
+def archive_name(settings: Settings, directory: Path, title: str, script_id: int) -> str:
+    """What an export's zip, and the folder it unzips to, are called.
+
+    In `export_dir`, the episode folder's own name — "004" — so the zip is that
+    folder, packed. Elsewhere, the episode's title, as the download always was.
+    """
+    if settings.export_dir is not None and (
+        directory.resolve().parent == settings.export_dir.resolve()
+    ):
+        return directory.name
+    safe = "".join(c if c.isalnum() or c in "-_" else "-" for c in title).strip("-")
+    return safe or f"script-{script_id}"
+
+
+def write_archive(directory: Path, target: Path, folder: str) -> Path:
+    """Zip an export so that it unzips as `folder/`, whatever unzips it.
+
+    Loose files at the top of a zip land in a folder only as the tool's
+    courtesy: Archive Utility makes one named after the zip, `unzip` leaves
+    them wherever it ran. Written beside `target` and moved into place, so an
+    interrupted save never leaves half a zip where a whole one was.
+    """
+    partial = target.with_name(f".{target.name}.partial")
+    with zipfile.ZipFile(partial, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for item in sorted(directory.iterdir()):
+            # Working files are not deliverables, and nor is the Finder's
+            # .DS_Store from somebody having opened the folder.
+            if item.is_file() and not item.name.startswith(("_", ".")):
+                bundle.write(item, f"{folder}/{item.name}")
+    partial.replace(target)
+    return target
+
+
+def zip_beside(directory: Path, name: str) -> tuple[Path, bool]:
+    """Pack an export folder into `<name>.zip` beside it — `004.zip` next to `004/`.
+
+    With `export_dir` set that is the same folder for every episode, so the zips
+    are kept together rather than wherever a browser saved each. A zip of the
+    same name is replaced: it is that episode, packed again. Returns the zip,
+    and whether one was replaced.
+    """
+    target = directory.parent / f"{name}.zip"
+    replaced = target.exists()
+    return write_archive(directory, target, name), replaced
 
 
 def project_media(session: Session, project_id: int, settings: Settings) -> ProjectMedia:

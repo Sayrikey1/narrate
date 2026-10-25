@@ -274,7 +274,7 @@ fetching and decoding every take up front — tens of megabytes before a
 | Stitch | The **concat filter**, not the demuxer — inputs are heterogeneous and the filter also sidesteps the encoder-delay gap at every mp3 seam |
 | Formats | `wav`, `mp3`, `m4a` (AAC in MP4, what an NLE imports), `flac`, `opus` |
 | Timeline-named pieces | `Project_HH-MM-SS-mmm_HH-MM-SS-mmm.mp3`, applied at export so a re-roll never renames something already delivered |
-| Zip per export | One download for the whole delivery |
+| Zip per export | One download for the whole delivery, packed inside a folder of its own so it unzips to the episode's folder with any tool. With `NARRATE_EXPORT_DIR`, **Save zip** on the Media page — or `narrate export --zip` — writes it beside the episode folders, `004.zip` next to `004/`, instead of wherever the browser saves |
 | Publish pack | Every export also ships `publish.md` and `publish.json` — the upload side of the same facts |
 
 ### The editing plan

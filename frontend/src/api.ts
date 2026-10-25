@@ -19,6 +19,7 @@ import type {
   ReplacePlan,
   ScriptCreated,
   ScriptSummary,
+  SavedArchive,
   ScriptTemplate,
   Slot,
   Timeline,
@@ -246,6 +247,8 @@ export const api = {
   mediaUrl: (path: string, download = false) =>
     `/api/media/file?path=${encodeURIComponent(path)}${download ? "&download=1" : ""}`,
   archiveUrl: (scriptId: number) => `/api/exports/${scriptId}/archive`,
+  /** The zip written beside the episode's folder instead of downloaded. */
+  saveArchive: (scriptId: number) => post<SavedArchive>(`/api/exports/${scriptId}/archive`),
 
   streamRun,
 };

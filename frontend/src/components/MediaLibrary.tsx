@@ -4,7 +4,7 @@ import { DocumentView } from "../ui/DocumentView";
 import { Empty, Loadable } from "../ui/feedback";
 import { DownloadIcon } from "./Icon";
 import { Player } from "./Player";
-import type { MediaFile, ProjectMedia } from "../types";
+import type { MediaFile, ProjectMedia, SavedArchive } from "../types";
 
 /** Which artifacts are documents rather than audio. `plan.md` is the one that
  *  matters: it is the guide to the edit, and reading it should not require
@@ -73,13 +73,7 @@ export function MediaLibrary({ projectId }: { projectId: number }) {
             <strong>{group.title}</strong>
             <span className="dim">{bytes(group.bytes)}</span>
             {group.kind === "export" && group.files[0]?.script_id != null && (
-              <a
-                className="download"
-                href={api.archiveUrl(group.files[0].script_id)}
-                download
-              >
-                <DownloadIcon /> zip
-              </a>
+              <ZipAction scriptId={group.files[0].script_id} folder={media.export_folder} />
             )}
           </div>
 
@@ -124,6 +118,61 @@ export function MediaLibrary({ projectId }: { projectId: number }) {
           </table>
         </div>
       ))}
+    </>
+  );
+}
+
+/** An export's zip. With exports in a folder of their own it is saved there,
+ *  beside the episode folders — `004.zip` next to `004/` — so every zip ends up
+ *  in one place rather than wherever the browser saves. Otherwise, a download.
+ *  Either way it unzips to the episode's folder. */
+function ZipAction({ scriptId, folder }: { scriptId: number; folder: string | null }) {
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState<SavedArchive | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!folder) {
+    return (
+      <a className="download" href={api.archiveUrl(scriptId)} download>
+        <DownloadIcon /> zip
+      </a>
+    );
+  }
+  const where = folder.split("/").filter(Boolean).pop() ?? folder;
+
+  async function save() {
+    setSaving(true);
+    setSaved(null);
+    setError(null);
+    try {
+      setSaved(await api.saveArchive(scriptId));
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        className="ghost small"
+        onClick={() => void save()}
+        disabled={saving}
+        title={`Saves the zip in ${folder}, beside the episode folders, replacing one of the same name`}
+      >
+        <DownloadIcon /> {saving ? "Saving…" : "Save zip"}
+      </button>
+      {saved && (
+        <span className="faint" role="status">
+          {saved.replaced ? "Replaced" : "Saved"} {saved.name} in {where}
+        </span>
+      )}
+      {error && (
+        <span className="error" role="alert">
+          {error}
+        </span>
+      )}
     </>
   );
 }

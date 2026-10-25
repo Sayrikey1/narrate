@@ -3137,6 +3137,11 @@ def export(
     no_mix: bool = typer.Option(
         False, "--no-mix", help="Skip the _fx masters (the episode with its effects mixed in)."
     ),
+    zip_: bool = typer.Option(
+        False,
+        "--zip",
+        help="Also pack the export into a zip beside its folder: 004.zip, which unzips to 004/.",
+    ),
 ) -> None:
     """Stitch the cut, name every piece by timeline position, and write the plan.
 
@@ -3243,6 +3248,16 @@ def export(
         why = "--no-mix" if no_mix else "mix_effects is off, or no effect audio could be read"
         body.append(f"Effects   {result.effects} placed on the timeline (not mixed: {why})")
     console.print(Panel("\n".join(body), title="[green]Exported[/green]", expand=False))
+
+    if zip_:
+        with session_scope(engine) as session:
+            title = _require_script(session, script_id).title
+        name = media_mod.archive_name(settings, result.out_dir, title, script_id)
+        archive, replaced = media_mod.zip_beside(result.out_dir, name)
+        console.print(
+            f"Zip       {archive} — unzips to {name}/"
+            + (" [dim](replaced the earlier one)[/dim]" if replaced else "")
+        )
 
     if result.planned:
         console.print(
