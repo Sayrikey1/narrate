@@ -13,6 +13,7 @@ export function DocumentView({
   filename,
   downloadUrl,
   onRowActivate,
+  activeAt,
   aside,
 }: {
   source: string;
@@ -21,6 +22,8 @@ export function DocumentView({
   /** Where the real file lives. Absent for a document rendered from memory. */
   downloadUrl?: string;
   onRowActivate?: (cells: string[]) => void;
+  /** The playhead, so the rows playing now are marked. */
+  activeAt?: number | null;
   /** An extra panel beside the outline — the plan uses it for its analysis. */
   aside?: React.ReactNode;
 }) {
@@ -70,7 +73,7 @@ export function DocumentView({
             </a>
           </div>
         </div>
-        <Markdown source={source} onRowActivate={onRowActivate} />
+        <Markdown source={source} onRowActivate={onRowActivate} activeAt={activeAt} />
       </div>
 
       <aside className="doc-side">

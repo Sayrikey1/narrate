@@ -63,6 +63,7 @@ function pack(over: Partial<Publish["data"]> = {}): Publish {
       },
       description: "Some words.",
       boilerplate: "",
+      description_box: "Some words.\n\nChapters:\n0:00 The Hook\n1:46 The Middle\n3:26 The End",
       tags: ["wealth", "money"],
       chapters: {
         usable: true,
@@ -160,11 +161,11 @@ describe("the publish pack page", () => {
     await act(async () => packaging.click());
 
     const buttons = [...host.querySelectorAll("button")].filter(
-      (b) => b.textContent === "choose",
+      (b) => b.textContent === "Choose",
     );
     // Two candidates, one already chosen.
     expect(buttons).toHaveLength(1);
-    expect(host.textContent).toContain("chosen");
+    expect(host.textContent).toContain("✓ Chosen");
   });
 
   it("says what to do when no thumbnail brief exists", async () => {
@@ -198,6 +199,26 @@ describe("the publish pack page", () => {
     await act(async () => packaging.click());
 
     expect(host.textContent).toContain("Extrapolated");
+  });
+
+  it("opens on the packaging, where the decisions are", async () => {
+    stubFetch(pack());
+    await render(<PublishPage scriptId={1} script={null} />);
+    const selected = host.querySelector('[role=tab][aria-selected="true"]');
+    expect(selected?.textContent).toBe("Packaging");
+    expect(host.textContent).toContain("YouTube will accept these");
+  });
+
+  it("copies the description exactly as the pack assembles it", async () => {
+    stubFetch(pack());
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    await render(<PublishPage scriptId={1} script={null} />);
+
+    const copy = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Copy the description"));
+    await act(async () => copy?.click());
+    expect(writeText).toHaveBeenCalledWith(pack().data.description_box);
+    expect(host.textContent).toContain("✓ Copied");
   });
 
   it("surfaces a failed load instead of an empty page", async () => {

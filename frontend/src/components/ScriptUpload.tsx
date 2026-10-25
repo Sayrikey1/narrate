@@ -1,25 +1,28 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { api } from "../api";
 import type { Project, ScriptTemplate } from "../types";
-import { DownloadIcon, UploadIcon } from "./Icon";
+import { DownloadIcon } from "./Icon";
 
 const ACCEPT = ".txt,.md,.markdown,.text";
 
-/** Add a script by dropping a file, browsing for one, or pasting.
+/** Add an episode by dropping a file, browsing for one, or pasting.
  *
  *  All three land on the same ingestion, so a marker stripped one way is
  *  stripped every way. The server validates extension, size and that the bytes
- *  really are UTF-8 — an extension proves nothing. */
+ *  really are UTF-8 — an extension proves nothing.
+ *
+ *  The drop target is the file input's own label, and the input is visually
+ *  hidden rather than `hidden`: it stays in the tab order, so the keyboard can
+ *  reach "browse" as well as a pointer can. */
 export function ScriptUpload({
-  projects,
-  preselect,
+  project,
   onCreated,
 }: {
-  projects: Project[];
-  preselect: number | null;
+  /** The episode goes into this one — the project selected on the page. */
+  project: Project | null;
   onCreated: (scriptId: number) => void;
 }) {
-  const input = useRef<HTMLInputElement | null>(null);
+  const id = useId();
   const [over, setOver] = useState(false);
   const [pasting, setPasting] = useState(false);
   const [text, setText] = useState("");
@@ -28,16 +31,15 @@ export function ScriptUpload({
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const projectId = preselect ?? projects[0]?.id ?? null;
-
-  if (!projects.length) {
+  if (!project) {
     return (
       <div className="empty">
         <strong>No projects yet</strong>
-        Create one above, then add a script to it.
+        Create one with <em>New project</em> above, then add an episode to it.
       </div>
     );
   }
+  const projectId = project.id;
 
   function report(created: { id: number; chunks: number; slots: number; warnings: string[] }) {
     setResult(
@@ -49,7 +51,6 @@ export function ScriptUpload({
   }
 
   async function send(file: File) {
-    if (projectId === null) return;
     setBusy(true);
     setError(null);
     setResult(null);
@@ -64,7 +65,7 @@ export function ScriptUpload({
   }
 
   async function sendPasted() {
-    if (projectId === null || !text.trim()) return;
+    if (!text.trim()) return;
     setBusy(true);
     setError(null);
     setResult(null);
@@ -87,32 +88,42 @@ export function ScriptUpload({
 
   return (
     <>
-      <div className="field">
-        <label>Project</label>
-        <select
-          value={projectId ?? ""}
-          onChange={(e) => onCreated(-Number(e.target.value))}
-          disabled
-          title="Scripts are added to the selected project"
-        >
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
+      <div className="adds-to">
+        Adds to <span className="pill plain">{project.name}</span>
+        <a className="link-quiet" href="#projects-h">
+          change
+        </a>
       </div>
 
       <div className="field">
-        <label>Title (optional — the filename is used otherwise)</label>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Episode 14" />
+        <label htmlFor={`${id}-title`}>
+          Title <span className="label-note">— optional, the filename is used otherwise</span>
+        </label>
+        <input
+          id={`${id}-title`}
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          placeholder="Episode 14"
+        />
       </div>
 
       {!pasting ? (
         <>
-          <div
+          <input
+            id={`${id}-file`}
+            className="sr-only file-input"
+            type="file"
+            accept={ACCEPT}
+            disabled={busy}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) void send(file);
+              e.target.value = "";
+            }}
+          />
+          <label
+            htmlFor={`${id}-file`}
             className={`dropzone${over ? " over" : ""}`}
-            onClick={() => input.current?.click()}
             onDragOver={(e) => {
               e.preventDefault();
               setOver(true);
@@ -125,30 +136,24 @@ export function ScriptUpload({
               if (file) void send(file);
             }}
           >
-            <UploadIcon />
+            <span className="dropzone-icon" aria-hidden>
+              📄<span>✨</span>
+            </span>
             <strong>{busy ? "Reading…" : "Drop a script here"}</strong>
-            <span className="hint">.txt · .md · .markdown — or click to browse</span>
-          </div>
-          <input
-            ref={input}
-            type="file"
-            accept={ACCEPT}
-            hidden
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) void send(file);
-              e.target.value = "";
-            }}
-          />
+            <span className="hint">
+              .txt · .md · .markdown — or <span className="browse">browse</span>
+            </span>
+          </label>
           <button className="ghost small paste-toggle" onClick={() => setPasting(true)}>
-            or paste the text instead
+            ✍️ or paste the text instead
           </button>
         </>
       ) : (
         <>
           <div className="field">
-            <label>Script</label>
+            <label htmlFor={`${id}-text`}>Script</label>
             <textarea
+              id={`${id}-text`}
               value={text}
               onChange={(e) => setText(e.target.value)}
               placeholder={
@@ -158,7 +163,7 @@ export function ScriptUpload({
           </div>
           <div className="toolbar">
             <button className="primary" disabled={busy || !text.trim()} onClick={sendPasted}>
-              Add script
+              Add episode
             </button>
             <button className="ghost small" onClick={() => setPasting(false)}>
               upload a file instead
@@ -167,16 +172,18 @@ export function ScriptUpload({
         </>
       )}
 
-      {result && <p className="note ok">Added — {result}</p>}
-      {error && <p className="note error">{error}</p>}
+      {result && (
+        <p className="note ok" role="status">
+          Added — {result}
+        </p>
+      )}
+      {error && (
+        <p className="note error" role="alert">
+          {error}
+        </p>
+      )}
 
       <TemplateLinks />
-
-      <p className="note">
-        <code>[SFX: description, 4s]</code> places an effect; <code>[@ 02:15]</code> marks a
-        target time. Both are stripped before anything is sent, so they are never spoken or
-        billed.
-      </p>
     </>
   );
 }
@@ -204,7 +211,10 @@ function TemplateLinks() {
 
   return (
     <div className="templates">
-      <span className="dim">Not sure of the format? Start from a template:</span>
+      <span className="dim">
+        Not sure of the format? Start from a template — every note in it is stripped before
+        sending, so it generates as-is.
+      </span>
       <div className="toolbar">
         {templates.map((template) => (
           <a
@@ -218,10 +228,6 @@ function TemplateLinks() {
           </a>
         ))}
       </div>
-      <span className="faint">
-        Annotated throughout, and every note is stripped before anything is sent —
-        so it generates as-is.
-      </span>
     </div>
   );
 }

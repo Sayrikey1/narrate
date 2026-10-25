@@ -40,3 +40,6 @@ build/
 # macOS
 .DS_Store
 trash
+
+# The design team's mock-ups: a reference to build from, not part of the app.
+narrate-studio.zip

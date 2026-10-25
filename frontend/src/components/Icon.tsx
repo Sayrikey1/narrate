@@ -96,3 +96,85 @@ export const AutoThemeIcon = ({ size = 13, className }: Props) => (
     <path d="M8 13.4A5.4 5.4 0 0 0 8 2.6z" fill="currentColor" stroke="none" />
   </svg>
 );
+
+/* Drawn on a 24-unit grid, as the studio design draws them. */
+const grid = (size: number, className?: string, strokeWidth = 2) => ({
+  width: size,
+  height: size,
+  viewBox: "0 0 24 24",
+  fill: "none" as const,
+  stroke: "currentColor",
+  strokeWidth,
+  strokeLinecap: "round" as const,
+  strokeLinejoin: "round" as const,
+  className: ["icon", className].filter(Boolean).join(" "),
+  "aria-hidden": true,
+});
+
+/** The logo: four bars of a waveform on a lime tile. Lime in both themes —
+ *  it is the mark, not the accent drawn for contrast. */
+export const BrandMark = ({ size = 34 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 34 34" aria-hidden>
+    <rect width="34" height="34" rx="10" fill="var(--ac)" />
+    <rect x="8" y="13" width="3" height="8" rx="1.5" fill="#0B0F0D" />
+    <rect x="13.5" y="8" width="3" height="18" rx="1.5" fill="#0B0F0D" />
+    <rect x="19" y="5" width="3" height="24" rx="1.5" fill="#0B0F0D" />
+    <rect x="24.5" y="11" width="3" height="12" rx="1.5" fill="#0B0F0D" />
+  </svg>
+);
+
+export const ChevronsIcon = ({ size = 16, className }: Props) => (
+  <svg {...grid(size, className)}>
+    <path d="M8 9l4-4 4 4M8 15l4 4 4-4" />
+  </svg>
+);
+
+export const ChevronDownIcon = ({ size = 12, className }: Props) => (
+  <svg {...grid(size, className, 2.4)}>
+    <path d="M6 9l6 6 6-6" />
+  </svg>
+);
+
+export const CloseIcon = ({ size = 16, className }: Props) => (
+  <svg {...grid(size, className)}>
+    <path d="M6 6l12 12M18 6L6 18" />
+  </svg>
+);
+
+export const SparkleIcon = ({ size = 16, className }: Props) => (
+  <svg {...grid(size, className)} fill="currentColor" stroke="none">
+    <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z" />
+  </svg>
+);
+
+export const PrevIcon = ({ size = 16, className }: Props) => (
+  <svg {...grid(size, className)} fill="currentColor" stroke="none">
+    <path d="M18 6v12L9 12z M6 6h2v12H6z" />
+  </svg>
+);
+
+export const NextIcon = ({ size = 16, className }: Props) => (
+  <svg {...grid(size, className)} fill="currentColor" stroke="none">
+    <path d="M6 6v12l9-6z M16 6h2v12h-2z" />
+  </svg>
+);
+
+export const SystemThemeIcon = ({ size = 17, className }: Props) => (
+  <svg {...grid(size, className, 1.8)}>
+    <circle cx="12" cy="12" r="8" />
+    <path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor" />
+  </svg>
+);
+
+export const LightThemeIcon = ({ size = 17, className }: Props) => (
+  <svg {...grid(size, className, 1.8)}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4L6 18M18 6l1.4-1.4" />
+  </svg>
+);
+
+export const DarkThemeIcon = ({ size = 17, className }: Props) => (
+  <svg {...grid(size, className, 1.8)}>
+    <path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z" />
+  </svg>
+);

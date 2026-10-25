@@ -16,17 +16,31 @@ export function PageHeader({
   title,
   subtitle,
   actions,
+  icon,
+  kicker,
 }: {
   title: string;
   subtitle?: ReactNode;
   /** Buttons and links for the page as a whole. */
   actions?: ReactNode;
+  /** An emoji in a large tile beside the title. */
+  icon?: string;
+  /** A short line above the title: what the page is part of. */
+  kicker?: ReactNode;
 }) {
   return (
     <div className="page-head">
-      <div>
-        <h1 className="page-title">{title}</h1>
-        {subtitle && <span className="faint">{subtitle}</span>}
+      <div className="page-head-main">
+        {icon && (
+          <span className="icon-tile sz-76" aria-hidden>
+            {icon}
+          </span>
+        )}
+        <div className="page-head-text">
+          {kicker && <span className="page-kicker">{kicker}</span>}
+          <h1 className="page-title">{title}</h1>
+          {subtitle && <p className="page-sub">{subtitle}</p>}
+        </div>
       </div>
       {actions && <div className="toolbar">{actions}</div>}
     </div>

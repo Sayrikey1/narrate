@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
-import type { ChunkRow, Cost, Model, Plan, Project, ScriptSummary, Slot, Timeline } from "./types";
+import type { ChunkRow, Cost, Model, Plan, Project, ScriptSummary, Slot, Timeline, Voice } from "./types";
 
 /** One place that knows how to load a script's state, so every page shows the
  *  same numbers and a refresh after generating updates all of them at once. */
@@ -49,17 +49,28 @@ export function useCatalogue() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [scripts, setScripts] = useState<ScriptSummary[]>([]);
   const [models, setModels] = useState<Model[]>([]);
+  const [voices, setVoices] = useState<Voice[]>([]);
+  // What deleted projects cost still counts, so the total the menu shows agrees
+  // with the one on the Costs page.
+  const [deletedSpend, setDeletedSpend] = useState(0);
 
   const refresh = useCallback(async () => {
     const [p, s] = await Promise.all([api.projects(), api.scripts()]);
     setProjects(p);
     setScripts(s);
+    api
+      .deleted()
+      .then((d) => setDeletedSpend(d.projects.reduce((sum, x) => sum + x.spend_micros, 0)))
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
     void refresh();
     api.models().then(setModels).catch(() => undefined);
+    // Names for voice ids. Optional: without a key the list is empty and ids
+    // are shown instead.
+    api.voices().then(setVoices).catch(() => undefined);
   }, [refresh]);
 
-  return { projects, scripts, models, refresh };
+  return { projects, scripts, models, voices, deletedSpend, refresh };
 }

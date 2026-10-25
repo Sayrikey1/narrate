@@ -1,7 +1,8 @@
-import { Fragment, useState } from "react";
-import type { ChunkRow, Finding, RegenerateBody, Take } from "../types";
+import { useState } from "react";
+import type { ChunkRow, Finding, RegenerateBody, Take, Timeline } from "../types";
 import { api, usd } from "../api";
-import { CheckIcon } from "./Icon";
+import { isName, spoken } from "../findings";
+import { formatClock } from "../time";
 import { Player } from "./Player";
 import { RegeneratePanel } from "./RegeneratePanel";
 
@@ -10,24 +11,41 @@ const LEAD_IN_S = 1.5;
 
 /** Chunks with their takes. Auditioning and promoting a take into the cut is
  *  the loop this screen exists for — and, when a take is not what was written,
- *  hearing exactly where and generating it again. */
+ *  hearing exactly where and generating it again, or saying it is fine. */
 export function ChunkList({
   chunks,
   scriptId,
+  timeline,
   onChange,
   onRegenerate,
+  onGenerateMissing,
   busy,
 }: {
   chunks: ChunkRow[];
   scriptId: number;
+  /** For each chunk's place in the episode, when known. */
+  timeline?: Timeline | null;
   onChange: () => void;
   onRegenerate: (body: RegenerateBody) => Promise<void>;
+  /** Open the generate panel for a chunk with no audio. */
+  onGenerateMissing?: () => void;
   busy: boolean;
 }) {
   const [open, setOpen] = useState<number | null>(null);
   // Per take: where its player should jump to, and a nonce so the same spot
   // can be played twice.
   const [cues, setCues] = useState<Record<number, { at: number; nonce: number }>>({});
+  // Chunks whose every take is shown, not only the latest few.
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
+
+  function toggleAll(ordinal: number) {
+    setExpanded((prior) => {
+      const next = new Set(prior);
+      if (next.has(ordinal)) next.delete(ordinal);
+      else next.add(ordinal);
+      return next;
+    });
+  }
 
   if (!chunks.length) {
     return (
@@ -67,87 +85,75 @@ export function ChunkList({
     }));
   }
 
+  const entries = new Map(
+    (timeline?.entries ?? [])
+      .filter((e) => e.kind === "narration" && e.chunk_ordinal !== null)
+      .map((e) => [e.chunk_ordinal as number, e]),
+  );
+
   return (
-    <table className="chunks">
-      <thead>
-        <tr>
-          <th className="num">#</th>
-          <th className="num">Chars</th>
-          <th>Opening</th>
-          <th>Takes</th>
-        </tr>
-      </thead>
-      <tbody>
-        {chunks.map((chunk) => (
-          <Fragment key={chunk.ordinal}>
-            <tr className={open === chunk.ordinal ? "regen-open" : undefined}>
-              <td className="num dim">{chunk.ordinal}</td>
-              <td className="num mono">{chunk.chars.toLocaleString()}</td>
-              <td>
-                {chunk.text.slice(0, 90)}
-                {chunk.text.length > 90 ? "…" : ""}
-                {chunk.source === "hard" && (
-                  <div className="note warn">split mid-sentence — consider adjusting</div>
-                )}
-              </td>
-              <td>
-                {chunk.takes.length === 0 && <span className="faint">not generated</span>}
-                {chunk.takes.map((take) => (
-                  <div key={take.id} className="take">
-                    <div className="take-row">
-                      <span className={take.in_cut ? "tag cut" : "tag"}>
-                        {take.in_cut && <CheckIcon />}
-                        take {take.ordinal}
-                      </span>
-                      <CheckBadge take={take} />
-                      <span className="faint mono">
-                        {take.duration_s ? `${take.duration_s.toFixed(2)}s · ` : ""}
-                        {usd(take.cost_micros)}
-                      </span>
-                      <Player
-                        src={api.audioTake(take.id)}
-                        duration={take.duration_s}
-                        cue={cues[take.id] ?? null}
-                      />
-                      {!take.in_cut && take.status === "succeeded" && (
-                        <button
-                          className="small"
-                          disabled={busy}
-                          onClick={() => promote(chunk.ordinal, take.ordinal)}
-                        >
-                          use this
-                        </button>
-                      )}
-                      {flaggedByCheck(take) &&
-                        (take.verify_accepted ? (
-                          <button
-                            className="ghost small"
-                            onClick={() => void accept(take, false)}
-                            aria-label={`Flag take ${take.ordinal} again`}
-                            title="Report this take as flagged again"
-                          >
-                            undo
-                          </button>
-                        ) : (
-                          <button
-                            className="ghost small"
-                            onClick={() => void accept(take, true)}
-                            title="You listened and it is right — a name the check cannot spell, say. Stops it being flagged; what was found stays below."
-                          >
-                            It's fine
-                          </button>
-                        ))}
-                    </div>
-                    <Findings take={take} onHear={(f) => hear(take, f)} />
-                  </div>
-                ))}
-                {chunk.takes.length > 0 && open !== chunk.ordinal && (
+    <div className="chunk-list">
+      {chunks.map((chunk) => {
+        const entry = entries.get(chunk.ordinal);
+        const succeeded = chunk.takes.filter((t) => t.status === "succeeded");
+        const noAudio = succeeded.length === 0 && chunk.takes.length > 0;
+        // The take in the cut first, with what the check found: it is the one
+        // the episode plays. The others are there to listen to and swap in.
+        const cut = succeeded.find((t) => t.in_cut);
+        const others = succeeded.filter((t) => !t.in_cut).sort((a, b) => b.ordinal - a.ordinal);
+        const showAll = expanded.has(chunk.ordinal);
+        const shownOthers = showAll ? others : others.slice(0, MOST_OTHERS);
+        const failed = chunk.takes
+          .filter((t) => t.status !== "succeeded")
+          .sort((a, b) => b.ordinal - a.ordinal);
+        const isOpen = open === chunk.ordinal;
+
+        return (
+          <article
+            key={chunk.ordinal}
+            aria-label={`Chunk ${chunk.ordinal}`}
+            className={["chunk", isOpen ? "open" : "", noAudio ? "failed" : ""].filter(Boolean).join(" ")}
+          >
+            <div className="chunk-head">
+              <span className="chunk-num">{chunk.ordinal}</span>
+              <div className="chunk-text">
+                <span>
+                  “{opening(chunk.text)}”
+                </span>
+                <span className="chunk-meta">
+                  <span className="mono">{chunk.chars.toLocaleString()}</span> chars
+                  {entry && entry.duration_s > 0 && (
+                    <>
+                      {" · "}
+                      {formatClock(entry.start_s)} – {formatClock(entry.end_s)}
+                    </>
+                  )}
+                  {entry?.drift_s ? (
+                    <span className={Math.abs(entry.drift_s) > 10 ? "warn" : undefined}>
+                      {" · "}🎯 aimed at {formatClock(entry.target_s ?? 0)}, landed{" "}
+                      {entry.drift_s > 0 ? "+" : ""}
+                      {entry.drift_s.toFixed(1)}s
+                    </span>
+                  ) : null}
+                  {chunk.source === "hard" && (
+                    <span className="warn"> · split mid-sentence — consider adjusting</span>
+                  )}
+                </span>
+              </div>
+              {chunk.takes.length > 0 &&
+                (isOpen ? (
+                  <button type="button" className="small" onClick={() => close(chunk.ordinal)} aria-expanded>
+                    Cancel
+                  </button>
+                ) : (
                   <button
+                    type="button"
                     className="ghost small regen-toggle"
                     // aria-disabled rather than disabled: a disabled button cannot
                     // take focus, and focus returns here when the panel closes —
                     // including just after a regeneration has started.
                     aria-disabled={busy}
+                    aria-expanded={false}
                     data-regen={chunk.ordinal}
                     onClick={() => {
                       if (!busy) setOpen(chunk.ordinal);
@@ -156,27 +162,161 @@ export function ChunkList({
                   >
                     Regenerate…
                   </button>
+                ))}
+            </div>
+
+            {chunk.takes.length === 0 && (
+              <div className="take other">
+                <span className="faint">Not generated yet.</span>
+                {onGenerateMissing && (
+                  <button type="button" className="primary small" onClick={onGenerateMissing}>
+                    Generate it…
+                  </button>
                 )}
-              </td>
-            </tr>
-            {open === chunk.ordinal && (
-              <tr className="regen-row">
-                <td colSpan={4}>
-                  <RegeneratePanel
-                    scriptId={scriptId}
-                    chunks={[chunk]}
-                    busy={busy}
-                    onRun={onRegenerate}
-                    onClose={() => close(chunk.ordinal)}
-                  />
-                </td>
-              </tr>
+              </div>
             )}
-          </Fragment>
-        ))}
-      </tbody>
-    </table>
+
+            {cut && (
+              <div className="take-block">
+                <TakeRow
+                  take={cut}
+                  busy={busy}
+                  cue={cues[cut.id] ?? null}
+                  onUse={() => promote(chunk.ordinal, cut.ordinal)}
+                  onAccept={(accepted) => void accept(cut, accepted)}
+                />
+                <Findings take={cut} text={chunk.text} onHear={(f) => hear(cut, f)} />
+              </div>
+            )}
+            {shownOthers.map((take) => (
+              <TakeRow
+                key={take.id}
+                take={take}
+                busy={busy}
+                cue={cues[take.id] ?? null}
+                onUse={() => promote(chunk.ordinal, take.ordinal)}
+              />
+            ))}
+            {others.length > MOST_OTHERS && (
+              <button
+                type="button"
+                className="ghost small more-takes"
+                aria-expanded={showAll}
+                onClick={() => toggleAll(chunk.ordinal)}
+              >
+                {showAll
+                  ? "Show fewer takes"
+                  : `Show ${others.length - MOST_OTHERS} more take${others.length - MOST_OTHERS === 1 ? "" : "s"}`}
+              </button>
+            )}
+
+            {noAudio
+              ? failed.map((take, index) => (
+                  <div key={take.id} className="take failed">
+                    <span className="tag">take {take.ordinal}</span>
+                    <span className="tag bad">⛔ didn't generate</span>
+                    <span className="take-why">
+                      This attempt failed, so there is nothing to play —{" "}
+                      <span className="mono">{usd(take.cost_micros)}</span>.
+                    </span>
+                    {index === 0 && onGenerateMissing && (
+                      <button type="button" className="primary small" onClick={onGenerateMissing}>
+                        Generate it…
+                      </button>
+                    )}
+                  </div>
+                ))
+              : failed.length > 0 && (
+                  <p className="faint take-history">
+                    {failed.length} earlier attempt{failed.length === 1 ? "" : "s"} failed ·{" "}
+                    <span className="mono">{usd(failed.reduce((sum, t) => sum + t.cost_micros, 0))}</span>
+                  </p>
+                )}
+
+            {isOpen && (
+              <RegeneratePanel
+                scriptId={scriptId}
+                chunks={[chunk]}
+                busy={busy}
+                onRun={onRegenerate}
+                onClose={() => close(chunk.ordinal)}
+              />
+            )}
+          </article>
+        );
+      })}
+    </div>
   );
+}
+
+/** Takes besides the one in the cut shown before "Show more". */
+const MOST_OTHERS = 2;
+
+/** The first words of a chunk as they are heard. */
+function opening(text: string): string {
+  const words = spoken(text);
+  return words.length > 140 ? `${words.slice(0, 140).trim()}…` : words;
+}
+
+/** One take: whether it is in the cut, how it checked, a player, and what can
+ *  be done with it — swap it in, or, in the cut and flagged, say it is fine. */
+function TakeRow({
+  take,
+  busy,
+  cue,
+  onUse,
+  onAccept,
+}: {
+  take: Take;
+  busy: boolean;
+  cue: { at: number; nonce: number } | null;
+  onUse: () => void;
+  /** Only for the take in the cut: the one whose flag matters. */
+  onAccept?: (accepted: boolean) => void;
+}) {
+  return (
+    <div className={take.in_cut ? "take" : "take other"}>
+      {take.in_cut ? (
+        <span className="tag cut">✓ take {take.ordinal} · in the cut</span>
+      ) : (
+        <span className="tag">take {take.ordinal}</span>
+      )}
+      <CheckBadge take={take} />
+      <Player src={api.audioTake(take.id)} duration={take.duration_s} cue={cue} />
+      <span className="take-cost">{usd(take.cost_micros)}</span>
+      {!take.in_cut && (
+        <button type="button" className="small" disabled={busy} onClick={onUse}>
+          use this
+        </button>
+      )}
+      {onAccept &&
+        flaggedByCheck(take) &&
+        (take.verify_accepted ? (
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => onAccept(false)}
+            aria-label={`Flag take ${take.ordinal} again`}
+            title="Report this take as flagged again"
+          >
+            undo
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="ghost small"
+            onClick={() => onAccept(true)}
+            title="You listened and it is right — a name the check cannot spell, say. Stops it being flagged; what was found stays below."
+          >
+            It's fine
+          </button>
+        ))}
+    </div>
+  );
+}
+
+function flaggedByCheck(take: Take): boolean {
+  return take.verify_status === "suspect" || take.verify_status === "review";
 }
 
 /** A take's verification, in words. There is no tick: "no issues found"
@@ -195,13 +335,13 @@ function CheckBadge({ take }: { take: Take }) {
     case "suspect":
       return (
         <span className="tag bad" title="Words missing, added or garbled — listen below">
-          flagged · {fails}
+          🚩 flagged · {fails}
         </span>
       );
     case "review":
       return (
         <span className="tag warn" title="Probably fine, worth a listen">
-          review
+          👀 review
         </span>
       );
     case "clear":
@@ -217,15 +357,20 @@ function CheckBadge({ take }: { take: Take }) {
   }
 }
 
-function flaggedByCheck(take: Take): boolean {
-  return take.verify_status === "suspect" || take.verify_status === "review";
-}
-
 /** Enough to act on. A take that is mostly wrong — truncated, or silent —
  *  can produce dozens of findings, and the first few say what needs saying. */
 const MOST_FINDINGS = 4;
 
-function Findings({ take, onHear }: { take: Take; onHear: (f: Finding) => void }) {
+function Findings({
+  take,
+  text,
+  onHear,
+}: {
+  take: Take;
+  /** The chunk's words, to tell a name from an ordinary word. */
+  text: string;
+  onHear: (f: Finding) => void;
+}) {
   const problems = take.findings.filter((f) => f.severity !== "info");
   if (!problems.length) return null;
   const shown = problems.slice(0, MOST_FINDINGS);
@@ -236,6 +381,7 @@ function Findings({ take, onHear }: { take: Take; onHear: (f: Finding) => void }
       {shown.map((finding, index) => (
         <li key={index} className={finding.severity}>
           <button
+            type="button"
             className="finding-time"
             onClick={() => onHear(finding)}
             title="Play this take from just before the spot"
@@ -245,15 +391,15 @@ function Findings({ take, onHear }: { take: Take; onHear: (f: Finding) => void }
           </button>
           <span>
             {finding.summary}
-            {finding.note && <span className="faint"> — {finding.note}</span>}
+            {finding.note ? (
+              <span className="faint"> — {finding.note}</span>
+            ) : isName(finding, text) ? (
+              <span className="faint"> — names are often misheard, so listen before re-rolling</span>
+            ) : null}
           </span>
         </li>
       ))}
-      {hidden > 0 && (
-        <li className="faint">
-          and {hidden} more on this take.
-        </li>
-      )}
+      {hidden > 0 && <li className="faint">and {hidden} more on this take.</li>}
     </ul>
   );
 }

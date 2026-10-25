@@ -124,6 +124,31 @@ describe("the table earns being a component", () => {
     ]);
   });
 
+  it("gives a timed row a play button, which runs the row once", () => {
+    const onRow = vi.fn();
+    render(PLAN, onRow);
+    const play = host.querySelector<HTMLButtonElement>('button[aria-label="Play from 00:00:19.960"]');
+    expect(play?.textContent).toBe("▶ 00:00:19.960");
+
+    act(() => play!.click());
+    // Once: the button's click is not also the row's.
+    expect(onRow).toHaveBeenCalledTimes(1);
+    expect(onRow.mock.calls[0]![0][1]).toBe("00:00:19.960");
+  });
+
+  it("marks the rows under the playhead", () => {
+    const timed = `| Start | End | Track |
+|---|---|---|
+| 00:00:00.000 | 00:00:10.000 | narration |
+| 00:00:02.000 | 00:00:04.000 | effect |
+| 00:00:10.400 | 00:00:20.000 | narration |
+`;
+    act(() => root.render(<Markdown source={timed} onRowActivate={vi.fn()} activeAt={3} />));
+    const playing = [...host.querySelectorAll("tbody tr")].map((tr) => tr.classList.contains("playing"));
+    // The narration and the effect over it are both what plays at 0:03.
+    expect(playing).toEqual([true, true, false]);
+  });
+
   it("marks the sorted column for assistive technology", () => {
     render(PLAN);
     act(() => host.querySelectorAll<HTMLButtonElement>(".md-sort")[2]!.click());

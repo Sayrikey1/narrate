@@ -48,6 +48,8 @@ export interface Project {
   model_id: string;
   spend_micros: number;
   waste_pct: number;
+  /** This month's charges — what the cap is measured against. */
+  month_micros: number;
   cap_micros: number | null;
   cap_used_pct: number;
 }
@@ -87,6 +89,8 @@ export interface MediaFile {
   take_id: number | null;
   effect_id: number | null;
   script_id: number | null;
+  /** When the file was last written, in Unix seconds. */
+  modified: number;
 }
 
 export interface MediaGroup {
@@ -424,6 +428,8 @@ export interface PublishData {
   title: PublishTitle;
   description: string;
   boilerplate: string;
+  /** The description, chapters and channel footer, exactly as pasted. */
+  description_box: string;
   tags: string[];
   chapters: PublishChapters;
   thumbnail: ThumbnailBrief | null;

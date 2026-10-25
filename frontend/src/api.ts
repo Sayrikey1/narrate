@@ -185,7 +185,14 @@ export const api = {
 
   generate: (
     id: number,
-    body: { dry_run: boolean; only?: number[]; force?: boolean; with_effects?: boolean },
+    body: {
+      dry_run: boolean;
+      only?: number[];
+      force?: boolean;
+      with_effects?: boolean;
+      /** A hard stop: the server spends no more than this, whatever the price. */
+      max_spend_usd?: number;
+    },
   ) => post<GenerateStarted>(`/api/scripts/${id}/generate`, body),
   setCut: (id: number, chunk_ordinal: number, take_ordinal: number) =>
     post(`/api/scripts/${id}/cut`, { chunk_ordinal, take_ordinal }),
@@ -218,12 +225,15 @@ export const api = {
     pieceFormat?: string,
     /** Export one voice's performance instead of the cut. */
     variant?: { voice_id: string; label?: string },
+    /** False writes the plain masters only; unset follows the server's setting. */
+    mix?: boolean,
   ) =>
     post<ExportResult>(`/api/scripts/${id}/export`, {
       formats: formats ?? null,
       piece_format: pieceFormat ?? null,
       voice_id: variant?.voice_id ?? null,
       variant_label: variant?.label ?? null,
+      mix: mix ?? null,
     }),
 
   audioTake: (takeId: number) => `/api/audio/take/${takeId}`,

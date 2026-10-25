@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
-import { Badge, Empty, Loadable, Notice } from "../ui/feedback";
-import { Card } from "../ui/layout";
-import { DataTable, type Column } from "../ui/Table";
+import { Loadable } from "../ui/feedback";
 import { DownloadIcon } from "./Icon";
+import { splitName, voiceFace } from "./VoicePicker";
 import type { Variant, Voice } from "../types";
 
 /** Every voice this script has been performed in, each exportable on its own.
@@ -18,7 +17,16 @@ import type { Variant, Voice } from "../types";
  *  master would have a silent hole where the missing lines are. Saying which
  *  lines are missing is more use than greying out a button.
  */
-export function Variants({ scriptId, onExported }: { scriptId: number; onExported?: () => void }) {
+export function Variants({
+  scriptId,
+  title,
+  onExported,
+}: {
+  scriptId: number;
+  /** The episode's title, for the card's subtitle. */
+  title?: string;
+  onExported?: () => void;
+}) {
   const [variants, setVariants] = useState<Variant[]>([]);
   const [voices, setVoices] = useState<Voice[]>([]);
   const [loading, setLoading] = useState(true);
@@ -42,7 +50,11 @@ export function Variants({ scriptId, onExported }: { scriptId: number; onExporte
 
   // A voice id is opaque; the name is what a person recognises. Falls back to
   // the id, because a voice deleted from the account still has takes here.
-  const nameOf = (id: string) => voices.find((v) => v.voice_id === id)?.name ?? id;
+  const voiceOf = (id: string) => voices.find((v) => v.voice_id === id);
+  const nameOf = (id: string) => {
+    const voice = voiceOf(id);
+    return voice ? splitName(voice.name)[0] : id;
+  };
 
   async function exportVariant(variant: Variant) {
     setBusy(variant.voice_id);
@@ -62,102 +74,83 @@ export function Variants({ scriptId, onExported }: { scriptId: number; onExporte
     }
   }
 
-  const columns: readonly Column<Variant>[] = [
-    {
-      header: "Voice",
-      cell: (v) => (
-        <>
-          <strong>{nameOf(v.voice_id)}</strong>{" "}
-          <span className="dim mono">{v.voice_id.slice(0, 12)}</span>
-        </>
-      ),
-    },
-    {
-      header: "Coverage",
-      align: "num",
-      cell: (v) => (
-        <span className="mono">
-          {v.chunks}/{v.chunks_total}
-        </span>
-      ),
-    },
-    {
-      header: "",
-      cell: (v) =>
-        v.complete ? (
-          <Badge tone="ok">complete</Badge>
-        ) : (
-          <Badge tone="warn">{v.chunks_total - v.chunks} missing</Badge>
-        ),
-    },
-    {
-      header: "",
-      align: "num",
-      cell: (v) =>
-        v.complete ? (
-          <button
-            className="small"
-            disabled={busy !== null}
-            onClick={() => void exportVariant(v)}
-            title={`Stitch ${nameOf(v.voice_id)}'s performance into its own master`}
-          >
-            <DownloadIcon /> {busy === v.voice_id ? "Exporting…" : "Export"}
-          </button>
-        ) : (
-          <span className="faint">—</span>
-        ),
-    },
-  ];
-
   return (
-    <Card title="Versions">
+    <section className="panel" aria-labelledby="versions-h">
+      <div className="card-head">
+        <div className="card-head-text">
+          <h2 id="versions-h" className="card-title">
+            🗣️ Voice versions
+          </h2>
+          <p className="card-sub">
+            {title ? `${title} performed` : "Performed"} in each voice it's been generated in.
+          </p>
+        </div>
+      </div>
       <Loadable loading={loading} error={error} rows={2} onRetry={load}>
-        <DataTable
-          compact
-          columns={columns}
-          rows={variants}
-          rowKey={(v) => v.voice_id}
-          caption="Voices this script has been generated in"
-          empty={{
-            title: "Nothing generated yet",
-            body: "Generate the script and the voice it was made in appears here.",
-          }}
-        />
-        {variants.length > 1 ? (
-          <Notice>
-            Each of these exports to its own folder, so neither overwrites the
-            other. Nothing extra was stored to make this possible — a take
-            already records the voice that made it.
-          </Notice>
+        {variants.length === 0 ? (
+          <div className="empty">
+            <strong>Nothing generated yet</strong>
+            Generate the script and the voice it was made in appears here.
+          </div>
         ) : (
-          variants.length === 1 && (
-            <Notice>
-              To get a second version, change the project's voice and generate
-              again with <strong>force</strong>. The existing takes are kept, and
-              both versions become exportable from here.
-            </Notice>
-          )
+          <div className="versions">
+            {variants.map((v) => {
+              const voice = voiceOf(v.voice_id);
+              const missing = v.chunks_total - v.chunks;
+              return (
+                <div key={v.voice_id} className="version">
+                  <div className="version-head">
+                    <span className="voice-face" aria-hidden>
+                      {voice ? voiceFace(voice) : "?"}
+                    </span>
+                    <span className="version-name">
+                      <strong>{nameOf(v.voice_id)}</strong>
+                      <span className="mono faint">{v.voice_id.slice(0, 10)}…</span>
+                    </span>
+                    {v.complete ? (
+                      <span className="pill ok">
+                        ✓ {v.chunks}/{v.chunks_total}
+                      </span>
+                    ) : (
+                      <span className="pill warn">
+                        {v.chunks}/{v.chunks_total} · {missing} missing
+                      </span>
+                    )}
+                  </div>
+                  <div className={v.complete ? "meter" : "meter warn"} aria-hidden>
+                    <div style={{ width: `${(v.chunks / Math.max(1, v.chunks_total)) * 100}%` }} />
+                  </div>
+                  {v.complete && (
+                    <button
+                      className="small version-export"
+                      disabled={busy !== null}
+                      onClick={() => void exportVariant(v)}
+                      title={`Stitch ${nameOf(v.voice_id)}'s performance into its own master`}
+                    >
+                      <DownloadIcon /> {busy === v.voice_id ? "Exporting…" : "Export this version"}
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         )}
-        {variants.some((v) => !v.complete) && (
-          <Notice tone="warn">
-            A voice missing some chunks cannot be exported — the master would have
-            a silent gap. Generate the missing lines in that voice first.
-          </Notice>
+        {done && (
+          <p className="note ok flush" role="status">
+            Exported {done}
+          </p>
         )}
-        {done && <Notice tone="ok">Exported {done}</Notice>}
+        {variants.length > 0 && (
+          <p className="note flush">
+            {variants.some((v) => !v.complete)
+              ? "A voice that's missing chunks can't be exported — the master would have a silent gap. "
+              : ""}
+            {variants.length > 1
+              ? "Each complete version exports to its own folder, so neither overwrites the other."
+              : "For a second version, change the project's voice and generate again with force. The takes you have are kept, and both versions export from here."}
+          </p>
+        )}
       </Loadable>
-    </Card>
-  );
-}
-
-/** Standalone empty state for a script with nothing generated. */
-export function NoVariants() {
-  return (
-    <Card title="Versions">
-      <Empty title="Nothing generated yet">
-        Generate the script, and every voice you generate it in becomes a version
-        you can export separately.
-      </Empty>
-    </Card>
+    </section>
   );
 }

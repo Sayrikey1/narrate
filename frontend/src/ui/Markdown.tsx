@@ -24,8 +24,12 @@ import { useMemo, useState } from "react";
 export interface MarkdownProps {
   source: string;
   /** Called when a table row is clicked, with its cells as plain text.
-   *  The plan's running order uses this to seek the transport. */
+   *  The plan's running order uses this to play from that moment; a row with
+   *  a timecode gets a button for it, so a keyboard can do the same. */
   onRowActivate?: (cells: string[]) => void;
+  /** The playhead, in seconds. A row whose first two timecodes — its start
+   *  and end — bracket it is marked as playing. */
+  activeAt?: number | null;
   /** Extra classes on the wrapper. */
   className?: string;
 }
@@ -53,14 +57,14 @@ export function outlineOf(source: string): Outline[] {
     });
 }
 
-export function Markdown({ source, onRowActivate, className }: MarkdownProps) {
+export function Markdown({ source, onRowActivate, activeAt, className }: MarkdownProps) {
   const tokens = useMemo(() => marked.lexer(source), [source]);
   const ids = useMemo(() => new Map(outlineOf(source).map((h) => [h.text, h.id])), [source]);
 
   return (
     <div className={["md", className].filter(Boolean).join(" ")}>
       {tokens.map((token, index) => (
-        <Block key={index} token={token} ids={ids} onRowActivate={onRowActivate} />
+        <Block key={index} token={token} ids={ids} onRowActivate={onRowActivate} activeAt={activeAt} />
       ))}
     </div>
   );
@@ -70,10 +74,12 @@ function Block({
   token,
   ids,
   onRowActivate,
+  activeAt,
 }: {
   token: Token;
   ids: Map<string, string>;
   onRowActivate?: (cells: string[]) => void;
+  activeAt?: number | null;
 }) {
   switch (token.type) {
     case "heading": {
@@ -95,7 +101,9 @@ function Block({
       );
 
     case "table":
-      return <MarkdownTable token={token as Tokens.Table} onRowActivate={onRowActivate} />;
+      return (
+        <MarkdownTable token={token as Tokens.Table} onRowActivate={onRowActivate} activeAt={activeAt} />
+      );
 
     case "list": {
       const list = token as Tokens.List;
@@ -194,9 +202,11 @@ function slug(text: string): string {
 function MarkdownTable({
   token,
   onRowActivate,
+  activeAt,
 }: {
   token: Tokens.Table;
   onRowActivate?: (cells: string[]) => void;
+  activeAt?: number | null;
 }) {
   const [sort, setSort] = useState<{ column: number; desc: boolean } | null>(null);
 
@@ -249,19 +259,48 @@ function MarkdownTable({
           </tr>
         </thead>
         <tbody>
-          {ordered.map((cells, rowIndex) => (
-            <tr
-              key={rowIndex}
-              className={onRowActivate ? "md-row-action" : undefined}
-              onClick={onRowActivate ? () => onRowActivate(cells.map((c) => c.text)) : undefined}
-            >
-              {cells.map((cell, index) => (
-                <td key={index} className={token.align[index] ?? undefined}>
-                  <Inline text={cell.md} />
-                </td>
-              ))}
-            </tr>
-          ))}
+          {ordered.map((cells, rowIndex) => {
+            const texts = cells.map((c) => c.text);
+            // The first timecode is where the row starts, the second where it
+            // ends — the running order's Start and End, whatever else moves.
+            const times = texts.map(clockOf);
+            const start = times.findIndex((t) => t !== null);
+            const end = start < 0 ? -1 : times.findIndex((t, i) => i > start && t !== null);
+            const playing =
+              activeAt != null &&
+              start >= 0 &&
+              end >= 0 &&
+              times[start]! <= activeAt &&
+              activeAt < times[end]!;
+            return (
+              <tr
+                key={rowIndex}
+                className={[onRowActivate ? "md-row-action" : "", playing ? "playing" : ""].filter(Boolean).join(" ") || undefined}
+                onClick={onRowActivate ? () => onRowActivate(texts) : undefined}
+              >
+                {cells.map((cell, index) => (
+                  <td key={index} className={token.align[index] ?? undefined}>
+                    {onRowActivate && index === start ? (
+                      <button
+                        type="button"
+                        className="md-play mono"
+                        aria-label={`Play from ${cell.text}`}
+                        onClick={(event) => {
+                          // The row's own click would run it a second time.
+                          event.stopPropagation();
+                          onRowActivate(texts);
+                        }}
+                      >
+                        ▶ {cell.text}
+                      </button>
+                    ) : (
+                      <Inline text={cell.md} />
+                    )}
+                  </td>
+                ))}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -280,14 +319,19 @@ function compare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" });
 }
 
-function numeric(value: string): number | null {
+/** A timecode as seconds — `00:01:38.320` or `4:31` — or `null`. */
+function clockOf(value: string): number | null {
   const clock = /^(\d{1,2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?$/.exec(value.trim());
-  if (clock) {
-    const [, a, b, c] = clock;
-    return c === undefined
-      ? Number(a) * 60 + Number(b)
-      : Number(a) * 3600 + Number(b) * 60 + Number(c);
-  }
+  if (!clock) return null;
+  const [, a, b, c] = clock;
+  return c === undefined
+    ? Number(a) * 60 + Number(b)
+    : Number(a) * 3600 + Number(b) * 60 + Number(c);
+}
+
+function numeric(value: string): number | null {
+  const clock = clockOf(value);
+  if (clock !== null) return clock;
   // `$0.0346`, `35.52s`, `1,928` — a figure wearing a unit.
   const bare = value.trim().replace(/[$,]/g, "").replace(/(s|ms|cr|%)$/i, "");
   if (bare && /^-?\d+(\.\d+)?$/.test(bare)) return Number(bare);

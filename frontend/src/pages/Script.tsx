@@ -1,16 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { api, usd } from "../api";
 import { ChunkList } from "../components/ChunkList";
+import { CostPanel } from "../components/CostPanel";
 import { DeletePanel } from "../components/DeletePanel";
+import { ExportCard } from "../components/ExportCard";
+import { GeneratePanel } from "../components/GeneratePanel";
+import { CloseIcon, SparkleIcon } from "../components/Icon";
 import { RegeneratePanel } from "../components/RegeneratePanel";
 import { ReplacePanel } from "../components/ReplacePanel";
-import { CostPanel } from "../components/CostPanel";
-import { DownloadIcon, SparkIcon } from "../components/Icon";
+import { Stepper } from "../components/Stepper";
 import { TimelineView } from "../components/Timeline";
 import { TrackView } from "../components/TrackView";
-import { Link, navigate, scriptPath } from "../router";
+import { navigate } from "../router";
 import { Empty, Notice } from "../ui/feedback";
-import { Card, PageHeader, Split } from "../ui/layout";
+import { PageHeader } from "../ui/layout";
 import type {
   AudioFormatInfo,
   ChunkRow,
@@ -18,19 +21,23 @@ import type {
   ExportResult,
   Model,
   Project,
+  Publish,
   RegenerateBody,
   ScriptSummary,
+  Slot,
   Timeline,
 } from "../types";
 
-/** The working page: generate, watch the timeline, choose takes, export. */
+/** The workbench: generate, listen, check, fix, choose takes, export. */
 export function ScriptPage({
   scriptId,
   script,
   project,
   model,
+  voiceName,
   timeline,
   chunks,
+  slots,
   cost,
   onRefresh,
 }: {
@@ -38,23 +45,32 @@ export function ScriptPage({
   script: ScriptSummary | null;
   project: Project | null;
   model: Model | undefined;
+  voiceName: string | null;
   timeline: Timeline | null;
   chunks: ChunkRow[];
+  slots: Slot[];
   cost: Cost | null;
   onRefresh: () => void;
 }) {
   const [formats, setFormats] = useState<AudioFormatInfo[]>([]);
   const [chosen, setChosen] = useState<string[]>(["wav", "mp3"]);
-  const [withEffects, setWithEffects] = useState(true);
+  const [mix, setMix] = useState(true);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<string[]>([]);
+  // Which panel the log belongs to: the generate panel shows its own run;
+  // a check or a regeneration gets a card of its own.
+  const [logFrom, setLogFrom] = useState<"generate" | "other" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [exported, setExported] = useState<ExportResult | null>(null);
+  const [publish, setPublish] = useState<Publish | null>(null);
+  // `#generate` and `#fix` open those panels on arrival, which is where the
+  // Projects page sends "Generate what's missing" and "Fix what's flagged".
+  const [generating, setGenerating] = useState(() => window.location.hash === "#generate");
   const [episodePanel, setEpisodePanel] = useState<"none" | "replace" | "delete">("none");
   // Cancelling a panel hands focus back to the button that opened it.
   const replaceTrigger = useRef<HTMLButtonElement | null>(null);
   const deleteTrigger = useRef<HTMLButtonElement | null>(null);
-  const [detail, setDetail] = useState(false);
+  const [timing, setTiming] = useState(false);
 
   // Suspect and to-review alike: the aim is an episode with nothing to hear —
   // less what a person has listened to and said is fine, which regenerating
@@ -68,18 +84,44 @@ export function ScriptPage({
     ),
   );
   const flagged = flaggedRows.map((c) => c.ordinal);
+  const cutOf = (c: ChunkRow) => c.takes.find((t) => t.in_cut);
+  const suspects = flaggedRows.filter((c) => cutOf(c)?.verify_status === "suspect").length;
+  const toReview = flaggedRows.length - suspects;
   const [fixing, setFixing] = useState(false);
   const fixButton = useRef<HTMLButtonElement | null>(null);
+  const askedToFix = useRef(window.location.hash === "#fix");
   // Nothing left to fix closes the panel, rather than leaving it to reopen by
-  // itself the next time something is flagged.
+  // itself the next time something is flagged. Asked for by the link, it opens
+  // once the chunks are in — and only if there is something to fix by then.
   useEffect(() => {
+    if (askedToFix.current && chunks.length) {
+      askedToFix.current = false;
+      if (flagged.length) setFixing(true);
+    }
     if (!flagged.length) setFixing(false);
-  }, [flagged.length]);
+  }, [flagged.length, chunks.length]);
+
+  const missing = (timeline?.entries ?? [])
+    .filter((e) => e.kind === "narration" && !e.generated)
+    .map((e) => e.chunk_ordinal ?? 0);
 
   function closeFixing() {
     setFixing(false);
     requestAnimationFrame(() => fixButton.current?.focus());
   }
+
+  function openGenerate() {
+    setGenerating(true);
+    requestAnimationFrame(() =>
+      document.getElementById("generate")?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    );
+  }
+
+  useEffect(() => {
+    if (generating) openGenerate();
+    // Only on arrival: the button scrolls for itself afterwards.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     api
@@ -88,14 +130,25 @@ export function ScriptPage({
       .catch(() => undefined);
   }, []);
 
-  async function generate(dryRun: boolean) {
+  // The publish pack's state feeds the last step. Reloaded with the timeline,
+  // which changes whenever anything this page does lands.
+  useEffect(() => {
+    api
+      .publish(scriptId)
+      .then(setPublish)
+      .catch(() => setPublish(null));
+  }, [scriptId, timeline]);
+
+  async function generate(withEffects: boolean, maxUsd: number) {
     setBusy(true);
     setError(null);
     setLog([]);
+    setLogFrom("generate");
     try {
       const started = await api.generate(scriptId, {
-        dry_run: dryRun,
+        dry_run: false,
         with_effects: withEffects,
+        max_spend_usd: maxUsd,
       });
       const p = started.projection;
       setLog([
@@ -103,7 +156,7 @@ export function ScriptPage({
         ...(p.effects
           ? [`effects   ${p.effects} cue(s), ${p.effect_seconds}s — ${usd(p.effect_micros)}`]
           : []),
-        `total ${usd(p.total_micros)}`,
+        `at most ${usd(p.total_micros)}`,
         "",
       ]);
       api.streamRun(
@@ -114,15 +167,15 @@ export function ScriptPage({
           if (result.error) setError(String(result.error));
           if (result.blocked) {
             setError(
-              "Blocked by the project's monthly cap — the whole run, narration and cues. " +
-                "Raise the cap, or turn effects off for this run.",
+              "Blocked by the project's monthly cap — the whole run, narration and effects. " +
+                "Raise the cap, or leave the effects out of this run.",
             );
           }
           setLog((prior) => [
             ...prior,
-            `${result.succeeded} chunk(s) · ${result.effects_generated} cue(s) generated` +
+            `${result.succeeded} chunk(s) · ${result.effects_generated} effect(s) generated` +
               (result.effects_reused ? `, ${result.effects_reused} reused` : "") +
-              ` · ${usd(Number(result.spent_micros ?? 0))}`,
+              ` · spent ${usd(Number(result.spent_micros ?? 0))}`,
           ]);
           onRefresh();
         },
@@ -150,6 +203,7 @@ export function ScriptPage({
   async function verify() {
     setBusy(true);
     setError(null);
+    setLogFrom("other");
     try {
       const started = await api.verify(scriptId);
       setLog([`Checking takes against the script (${started.mode}) — nothing is sent anywhere.`]);
@@ -177,6 +231,7 @@ export function ScriptPage({
   async function regenerate(body: RegenerateBody) {
     setBusy(true);
     setError(null);
+    setLogFrom("other");
     try {
       // The rebuild writes the formats chosen on this page, so no master is
       // left behind still playing the old take.
@@ -244,7 +299,7 @@ export function ScriptPage({
     setBusy(true);
     setError(null);
     try {
-      setExported(await api.export(scriptId, chosen));
+      setExported(await api.export(scriptId, chosen, undefined, undefined, mix));
       onRefresh();
     } catch (e) {
       setError(String(e));
@@ -253,38 +308,52 @@ export function ScriptPage({
     }
   }
 
+  const title = script?.title ?? `Script ${scriptId}`;
+
   return (
     <>
       <PageHeader
-        title={script?.title ?? `Script ${scriptId}`}
+        icon="🎙️"
+        title={title}
         subtitle={
           <>
             {project?.name}
-            {script ? ` · ${script.chunks} chunks · ${script.chars.toLocaleString()} chars` : ""}
+            {script && (
+              <>
+                {" · "}
+                {script.chunks} chunk{script.chunks === 1 ? "" : "s"} ·{" "}
+                <span className="mono">{script.chars.toLocaleString()}</span> chars
+              </>
+            )}
+            {voiceName && ` · 🗣️ ${voiceName}`}
+            {model && ` · ${model.label}`}
           </>
         }
         actions={
           <>
-            <button disabled={busy} onClick={() => generate(true)}>
-              Dry run
-            </button>
-            <button className="primary" disabled={busy} onClick={() => generate(false)}>
-              <SparkIcon /> {busy ? "Working…" : "Generate"}
+            <button
+              type="button"
+              className="large"
+              disabled={busy || !chunks.some((c) => c.takes.length)}
+              onClick={verify}
+              title="Transcribe the takes and compare them with the script. Nothing is sent anywhere."
+            >
+              🔍 Check takes <span className="btn-note">free</span>
             </button>
             <button
-              disabled={busy || !timeline?.complete}
-              onClick={doExport}
-              title={
-                timeline?.complete
-                  ? "Stitch the cut and write the plan"
-                  : "Every chunk needs a take before there is anything to stitch"
-              }
+              type="button"
+              className="primary large"
+              disabled={busy}
+              aria-expanded={generating}
+              onClick={() => (generating ? setGenerating(false) : openGenerate())}
             >
-              <DownloadIcon /> Export
+              <SparkleIcon />
+              {busy && logFrom === "generate" ? "Generating…" : "Generate…"}
             </button>
             <button
               ref={replaceTrigger}
-              className="ghost"
+              type="button"
+              className="ghost large"
               disabled={busy}
               aria-expanded={episodePanel === "replace"}
               onClick={() => setEpisodePanel((v) => (v === "replace" ? "none" : "replace"))}
@@ -293,7 +362,8 @@ export function ScriptPage({
             </button>
             <button
               ref={deleteTrigger}
-              className="ghost danger"
+              type="button"
+              className="ghost danger large"
               disabled={busy}
               aria-expanded={episodePanel === "delete"}
               onClick={() => setEpisodePanel((v) => (v === "delete" ? "none" : "delete"))}
@@ -314,6 +384,7 @@ export function ScriptPage({
           }}
           onDone={(plan) => {
             setEpisodePanel("none");
+            setLogFrom("other");
             setLog([
               `Script replaced: ${plan.kept} chunk(s) kept with their takes, ${plan.new} new` +
                 (plan.retired ? `, ${plan.retired} dropped` : "") +
@@ -338,55 +409,123 @@ export function ScriptPage({
         />
       )}
 
+      <Stepper chunks={chunks} timeline={timeline} exported={exported} publish={publish} />
+
       {error && (
         <Notice tone="error" title="That run did not finish">
           {error}
         </Notice>
       )}
 
-      <Split
-        main={
-          <>
-            <Card>
-              {timeline && timeline.entries.length > 0 ? (
-                <TrackView timeline={timeline} costMicros={cost?.cost_micros} />
-              ) : (
-                <Empty title="Nothing on the timeline yet">
-                  Press Generate — it produces the narration and its effect cues in
-                  one run, and the monthly cap is checked against both together.
-                </Empty>
-              )}
-            </Card>
+      <div className="bench">
+        <div className="bench-main">
+          {generating && (
+            <GeneratePanel
+              scriptId={scriptId}
+              slots={slots}
+              missing={missing}
+              cost={cost}
+              busy={busy}
+              running={busy && logFrom === "generate"}
+              log={logFrom === "generate" ? log : []}
+              onGenerate={generate}
+              onClose={() => {
+                setGenerating(false);
+                if (!busy && logFrom === "generate") {
+                  setLog([]);
+                  setLogFrom(null);
+                }
+              }}
+            />
+          )}
 
-            <Card
-              title="Chunks and takes"
-              actions={
-                <>
-                  <button
-                    className="ghost small"
-                    disabled={busy || !chunks.some((c) => c.takes.length)}
-                    onClick={verify}
-                    title="Transcribe the takes and compare them with the script. Free."
-                  >
-                    Check takes
-                  </button>
-                  <button
-                    className="ghost small"
-                    onClick={() => setDetail((v) => !v)}
-                    aria-expanded={detail}
-                  >
-                    {detail ? "hide the table" : "show the table"}
-                  </button>
-                </>
-              }
-            >
-              {flagged.length > 0 && (
-                <Notice tone="warn" title={`${flagged.length} take(s) in the cut are flagged`}>
-                  Words missing, added or changed in chunk {flagged.join(", ")}. Press ▶ beside
-                  each finding to hear the spot, or fix them all at once.{" "}
+          {logFrom === "other" && log.length > 0 && (
+            <section className="panel panel-stack" aria-labelledby="run-h">
+              <div className="card-head">
+                <h2 className="card-title" id="run-h">
+                  🧾 Latest run
+                </h2>
+                <button
+                  type="button"
+                  className="round"
+                  aria-label="Close the run log"
+                  disabled={busy}
+                  onClick={() => {
+                    setLog([]);
+                    setLogFrom(null);
+                  }}
+                >
+                  <CloseIcon />
+                </button>
+              </div>
+              <div className="log" role="status" aria-live="polite">
+                {log.join("\n")}
+              </div>
+            </section>
+          )}
+
+          <section className="panel" aria-label="Track">
+            {timeline && timeline.entries.length > 0 ? (
+              <TrackView timeline={timeline} chunks={chunks} costMicros={cost?.cost_micros} />
+            ) : (
+              <Empty title="Nothing on the timeline yet">
+                Press Generate — it produces the narration and its effects in one run, and the
+                monthly cap is checked against both together.
+              </Empty>
+            )}
+          </section>
+
+          <section className="panel panel-stack" aria-labelledby="chunks-h">
+            <div className="card-head">
+              <h2 className="card-title" id="chunks-h">
+                🧩 Chunks &amp; takes
+              </h2>
+              <div className="toolbar">
+                <button
+                  type="button"
+                  className="small"
+                  disabled={busy || !chunks.some((c) => c.takes.length)}
+                  onClick={verify}
+                  title="Transcribe the takes and compare them with the script. Free."
+                >
+                  🔍 Check new takes · free
+                </button>
+                <button
+                  type="button"
+                  className="small"
+                  onClick={() => setTiming((v) => !v)}
+                  aria-expanded={timing}
+                >
+                  {timing ? "Hide timing table" : "Show timing table"}
+                </button>
+              </div>
+            </div>
+
+            {flagged.length > 0 && (
+              <div className="notice error banner">
+                <span className="banner-icon" aria-hidden>
+                  🚩
+                </span>
+                <div className="banner-body">
+                  <strong>
+                    {suspects > 0
+                      ? `${suspects} take${suspects === 1 ? "" : "s"} in the cut ${suspects === 1 ? "is" : "are"} flagged`
+                      : ""}
+                    {suspects > 0 && toReview > 0 ? ", and " : ""}
+                    {toReview > 0
+                      ? `${toReview}${suspects > 0 ? "" : ` take${toReview === 1 ? "" : "s"} in the cut`} ${toReview === 1 ? "is" : "are"} worth a listen`
+                      : ""}
+                  </strong>
+                  <span className="dim">
+                    Words missing, added or changed in chunk{flagged.length === 1 ? "" : "s"}{" "}
+                    {flagged.join(", ")}. Press ▶ beside a finding to hear the exact spot — or fix
+                    them all at once.
+                  </span>
+                </div>
+                <div className="banner-actions">
                   <button
                     ref={fixButton}
-                    className="small"
+                    type="button"
                     aria-expanded={fixing}
                     aria-disabled={busy}
                     onClick={() => {
@@ -395,113 +534,56 @@ export function ScriptPage({
                   >
                     {fixing ? "Cancel" : "Fix all flagged…"}
                   </button>
-                </Notice>
-              )}
-              {fixing && flaggedRows.length > 0 && (
-                <RegeneratePanel
-                  scriptId={scriptId}
-                  chunks={flaggedRows}
-                  busy={busy}
-                  onRun={regenerate}
-                  onClose={closeFixing}
-                />
-              )}
-              <ChunkList
-                chunks={chunks}
+                </div>
+              </div>
+            )}
+            {fixing && flaggedRows.length > 0 && (
+              <RegeneratePanel
                 scriptId={scriptId}
+                chunks={flaggedRows}
                 busy={busy}
-                onChange={onRefresh}
-                onRegenerate={regenerate}
+                onRun={regenerate}
+                onClose={closeFixing}
               />
-              {detail && (
-                <div className="card-section">
-                  <TimelineView timeline={timeline} />
-                </div>
-              )}
-            </Card>
-          </>
-        }
-        aside={
-          <>
-            <Card title="This run">
-              <label className="checkbox">
-                <input
-                  type="checkbox"
-                  checked={withEffects}
-                  disabled={busy}
-                  onChange={(e) => setWithEffects(e.target.checked)}
-                />
-                Include effect cues
-              </label>
-              <Notice>
-                One Generate covers narration and the accepted cues, and the
-                monthly cap is checked against both together.{" "}
-                <Link to={scriptPath(scriptId, "/effects")}>Manage cues →</Link>
-              </Notice>
+            )}
 
-              {model?.continuity_mode === "none" && (
-                <Notice tone="warn">
-                  {model.label} has no cross-chunk continuity — neither request
-                  stitching nor text conditioning — so seams between chunks are
-                  unavoidable.
-                </Notice>
-              )}
+            <ChunkList
+              chunks={chunks}
+              scriptId={scriptId}
+              timeline={timeline}
+              busy={busy}
+              onChange={onRefresh}
+              onRegenerate={regenerate}
+              onGenerateMissing={openGenerate}
+            />
+            {timing && <TimelineView timeline={timeline} />}
+          </section>
+        </div>
 
-              {formats.length > 0 && (
-                <fieldset className="chip-set">
-                  <legend>Export formats</legend>
-                  <div className="chips">
-                    {formats.map((format) => {
-                      const on = chosen.includes(format.key);
-                      return (
-                        <button
-                          key={format.key}
-                          type="button"
-                          // Was a <span onClick>, so it could not be reached or
-                          // toggled by keyboard at all. `aria-pressed` is what
-                          // makes a toggle announce its state.
-                          className={`chip${on ? " on" : ""}`}
-                          aria-pressed={on}
-                          title={format.note}
-                          onClick={() =>
-                            setChosen((prior) =>
-                              prior.includes(format.key)
-                                ? prior.filter((k) => k !== format.key)
-                                : [...prior, format.key],
-                            )
-                          }
-                        >
-                          {format.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </fieldset>
-              )}
+        <div className="bench-side">
+          <ExportCard
+            scriptId={scriptId}
+            timeline={timeline}
+            chunks={chunks}
+            formats={formats}
+            chosen={chosen}
+            onChoose={setChosen}
+            mix={mix}
+            onMix={setMix}
+            busy={busy}
+            exported={exported}
+            onExport={doExport}
+            onGenerate={openGenerate}
+          />
 
-              {log.length > 0 && (
-                <div className="log card-section" role="status" aria-live="polite">
-                  {log.join("\n")}
-                </div>
-              )}
-
-              {exported && (
-                <Notice tone="ok">
-                  Exported {Object.keys(exported.masters).join(", ")}
-                  {exported.effects_mixed > 0 &&
-                    `, each also with its ${exported.effects_mixed} effect(s) mixed in (_fx)`}{" "}
-                  —{" "}
-                  <Link to={scriptPath(scriptId, "/media")}>see the files →</Link>
-                </Notice>
-              )}
-            </Card>
-
-            <Card title="Cost">
-              <CostPanel cost={cost} />
-            </Card>
-          </>
-        }
-      />
+          <section className="panel panel-stack" aria-labelledby="cost-h">
+            <h2 className="card-title" id="cost-h">
+              💰 What {title} has cost
+            </h2>
+            <CostPanel cost={cost} projectName={project?.name} />
+          </section>
+        </div>
+      </div>
     </>
   );
 }

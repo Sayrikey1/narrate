@@ -136,11 +136,7 @@ describe("regenerating is priced before it is paid for", () => {
     await click(button("Price it"));
     expect(button("Regenerate for up to")).toBeTruthy();
 
-    const select = host.querySelector("select") as HTMLSelectElement;
-    await act(async () => {
-      select.value = "2";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await click(button("Try again, up to 2"));
 
     expect(button("Regenerate for up to")).toBeFalsy();
     expect(button("Price it")).toBeTruthy();
@@ -182,11 +178,7 @@ describe("found in review", () => {
     );
     await click(button("Price it"));
 
-    const select = host.querySelector("select") as HTMLSelectElement;
-    await act(async () => {
-      select.value = "1";
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await click(button("Stop — one try"));
     await act(async () => {
       answer(new Response(JSON.stringify(quote()), { status: 200 }));
     });

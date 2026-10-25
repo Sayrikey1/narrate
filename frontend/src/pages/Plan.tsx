@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { api, usd } from "../api";
-import { DownloadIcon } from "../components/Icon";
+import { useTransport } from "../components/Transport";
+import { Link, scriptPath } from "../router";
 import * as transport from "../transport";
 import { DocumentView } from "../ui/DocumentView";
 import { Badge, Empty, Notice, Stat } from "../ui/feedback";
@@ -34,6 +35,7 @@ export function PlanPage({
   plan: Plan | null;
 }) {
   const [tab, setTab] = useState<"document" | "analysis">("document");
+  const player = useTransport();
 
   if (!plan?.markdown) {
     return (
@@ -49,9 +51,23 @@ export function PlanPage({
     );
   }
 
+  // The first chunk without audio: everything after it moves when it lands.
+  const hole = plan.data.entries.find((e) => e.kind === "narration" && !e.generated);
+
   return (
     <>
       <Head scriptId={scriptId} script={script} />
+
+      {hole && (
+        <div className="notice warn banner-line" role="note">
+          <span aria-hidden>⏳</span>
+          <span>
+            <strong>Chunk {hole.chunk_ordinal} has no audio yet,</strong> so timings from{" "}
+            {formatClock(hole.start_s)} on are provisional.{" "}
+            <Link to={`${scriptPath(scriptId)}#generate`}>Generate it on the workbench</Link>.
+          </span>
+        </div>
+      )}
 
       <Tabs
         label="How to read the plan"
@@ -65,7 +81,8 @@ export function PlanPage({
           <DocumentView
             source={plan.markdown}
             filename="plan.md"
-            onRowActivate={(cells) => seekTo(cells)}
+            onRowActivate={(cells) => playFrom(cells)}
+            activeAt={player.playing || player.position > 0 ? player.position : null}
             aside={<Summary plan={plan} />}
           />
         ) : (
@@ -84,15 +101,16 @@ const TABS = [
 function Head({ scriptId, script }: { scriptId: number; script: ScriptSummary | null }) {
   return (
     <PageHeader
+      kicker={`${script?.title ?? "This episode"} · for whoever cuts the video`}
       title="Editing plan"
-      subtitle={`${script?.title ?? ""} — what plays when, and where a cue still belongs`}
+      subtitle="What plays when, and where an effect still belongs."
       actions={
         <>
-          <a className="download" href={api.scriptDownloadUrl(scriptId, "md")} download>
-            <DownloadIcon /> script .md
+          <a className="btn large" href={api.scriptDownloadUrl(scriptId, "md")} download>
+            ⤓ Script .md
           </a>
-          <a className="download" href={api.scriptDownloadUrl(scriptId, "txt")} download>
-            <DownloadIcon /> script .txt
+          <a className="btn large" href={api.scriptDownloadUrl(scriptId, "txt")} download>
+            ⤓ Script .txt
           </a>
         </>
       }
@@ -100,16 +118,17 @@ function Head({ scriptId, script }: { scriptId: number; script: ScriptSummary | 
   );
 }
 
-/** Clicking a row in the running order moves the playhead there.
+/** A row in the running order plays the episode from its start.
  *
  *  The first cell that parses as a timecode wins, so this keeps working if the
  *  plan's column order changes — matching on position would break silently the
  *  first time a column is inserted. */
-function seekTo(cells: string[]): void {
+function playFrom(cells: string[]): void {
   for (const cell of cells) {
     const seconds = parseStamp(cell);
     if (seconds === null) continue;
     transport.seek(seconds);
+    transport.play();
     return;
   }
 }
