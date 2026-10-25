@@ -56,11 +56,12 @@ class Settings(BaseSettings):
     # copied from elsewhere. NARRATE_STT_MODEL_DIR, in the environment or .env.
     stt_model_dir: Path | None = None
 
-    @field_validator("stt_model_dir", mode="before")
+    @field_validator("stt_model_dir", "export_dir", mode="before")
     @classmethod
     def _unset_when_empty(cls, value: object) -> object:
         # `NARRATE_STT_MODEL_DIR=` would otherwise parse as Path("."), and a
-        # model download would land in whichever directory the command ran in.
+        # model download would land in whichever directory the command ran in;
+        # an empty export directory would do the same with every export.
         if isinstance(value, str) and not value.strip():
             return None
         return value
@@ -77,6 +78,12 @@ class Settings(BaseSettings):
     # dialect other than SQLite is supported or tested today.
     database_url: str | None = None
     assets_dir: Path = PROJECT_ROOT / "assets"
+    # Where exports are written, when not in `assets_dir`. Each episode gets a
+    # folder in it named by its number — "002" — or, with no number in its
+    # title, by project and title, because it sits beside other work, where
+    # `script-8` would mean nothing. Unset, exports stay in
+    # `assets/exports/script-<id>`.
+    export_dir: Path | None = None
 
     # Conservative by default, as PRD §7 requires. Raised only after
     # `narrate models --sync` reports the account's real ceiling, since

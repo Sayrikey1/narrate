@@ -1655,7 +1655,10 @@ def create_app(
         `../../.env` and hand over the API key.
         """
         try:
-            resolved = media_mod.resolve_media_path(path, config)
+            with session_scope(db) as session:
+                resolved = media_mod.resolve_export_file(session, path)
+            if resolved is None:
+                resolved = media_mod.resolve_media_path(path, config)
         except media_mod.OutsideMediaRoot as exc:
             raise HTTPException(403, str(exc)) from exc
         if not resolved.is_file():

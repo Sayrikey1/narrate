@@ -91,12 +91,15 @@ class MediaFile:
     script_id: int | None = None
 
     @classmethod
-    def of(cls, path: Path, root: Path, kind: str, **extra: object) -> MediaFile:
+    def of(
+        cls, path: Path, root: Path, kind: str, *, address: str | None = None, **extra: object
+    ) -> MediaFile:
         return cls(
             name=path.name,
             # Relative to the media root: an absolute path in a URL invites
-            # exactly the traversal the resolver exists to refuse.
-            path=str(path.relative_to(root)),
+            # exactly the traversal the resolver exists to refuse. A file
+            # outside the root has an `address` instead.
+            path=address or str(path.relative_to(root)),
             kind=kind,
             bytes=path.stat().st_size,
             playable=path.suffix.lower() in AUDIO_SUFFIXES,
@@ -135,6 +138,30 @@ class ProjectMedia:
         )
 
 
+# An export written to `export_dir` sits outside the media root, in a folder
+# beside other work — which may hold anything, this project's `.env` included.
+# So it is addressed by episode and file name, never by path, and only a file
+# directly inside that episode's recorded export folder can be served.
+EXPORT_PREFIX = "@export/"
+
+
+def resolve_export_file(session: Session, candidate: str) -> Path | None:
+    """The file `@export/<script id>/<name>` stands for; None for any other path."""
+    if not candidate.startswith(EXPORT_PREFIX):
+        return None
+    script, _, name = candidate.removeprefix(EXPORT_PREFIX).partition("/")
+    if not script.isdigit() or name != Path(name).name or name.startswith("."):
+        raise OutsideMediaRoot(f"{candidate!r} is not a file in an export")
+    directory = export_dir(session, int(script))
+    if directory is None:
+        raise OutsideMediaRoot(f"Script {script} has not been exported")
+    path = (directory / name).resolve()
+    # Resolved, so a link inside the folder cannot point out of it.
+    if path.parent != directory.resolve():
+        raise OutsideMediaRoot(f"{candidate!r} is not a file in an export")
+    return path
+
+
 def export_dir(session: Session, script_id: int) -> Path | None:
     """Where a script's export was written.
 
@@ -168,10 +195,14 @@ def project_media(session: Session, project_id: int, settings: Settings) -> Proj
         group = MediaGroup(title=f"{script.title} — export")
         # Masters first, then the timeline-named pieces in chronological order
         # (their names sort that way by construction), then the plan.
+        inside = directory.resolve().is_relative_to(root)
         for path in sorted(directory.iterdir(), key=lambda p: (p.suffix != ".wav", p.name)):
             if not path.is_file() or path.name.startswith("_"):
                 continue
-            group.files.append(MediaFile.of(path, root, kind="export", script_id=script.id))
+            address = None if inside else f"{EXPORT_PREFIX}{script.id}/{path.name}"
+            group.files.append(
+                MediaFile.of(path, root, kind="export", script_id=script.id, address=address)
+            )
         if group.files:
             media.exports.append(group)
 

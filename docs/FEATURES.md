@@ -349,6 +349,7 @@ The differentiating requirement, not a reporting afterthought.
 | `db list` | Every narrate database on the machine, what is in each, and whether any of it was **real** money |
 | `db adopt` | Copies into the managed location, checkpointing the write-ahead log first and verifying row counts. **Deletes nothing** |
 | Media | `assets/`, browsable and downloadable per project |
+| Exports | `assets/exports/script-<id>`, or `NARRATE_EXPORT_DIR` — one folder per episode, named by its number (`002`, `01_The_…` → `001`), or by project and title when the title has no number. The Media page still lists, plays and zips them, serving only files directly inside a recorded export folder, since that directory may hold anything else |
 | Migrations | Alembic, `batch_alter_table` throughout because SQLite cannot `ALTER` in place |
 
 Why this exists: a project directory is not a data directory. Three stray

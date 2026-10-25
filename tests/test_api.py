@@ -1142,3 +1142,114 @@ def test_a_model_change_that_would_strand_the_projects_tags_is_refused(
     )
     assert cleared.status_code == 200
     assert cleared.json()["model_id"] == "eleven_multilingual_v2"
+
+
+# -- exporting to a folder of the user's own ---------------------------------
+
+
+@pytest.fixture
+def own_folder(tmp_path: Path) -> Path:
+    folder = tmp_path / "projects"
+    # The folder holds other work — this project's checkout, `.env` and all.
+    (folder / "backend").mkdir(parents=True)
+    (folder / "backend" / ".env").write_text("ELEVEN_API=secret")
+    return folder
+
+
+@pytest.fixture
+def exporting(
+    engine: Engine, settings: Settings, own_folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    monkeypatch.setenv("NARRATE_PROVIDER", "mock")
+    with TestClient(
+        create_app(engine, settings.model_copy(update={"export_dir": own_folder}))
+    ) as c:
+        yield c
+
+
+@needs_ffmpeg
+def test_an_export_to_a_folder_of_ones_own_is_named_and_still_browsable(
+    exporting: TestClient, own_folder: Path
+) -> None:
+    project = exporting.post("/api/projects", json={"name": "UI", "voice_id": "v1"}).json()
+    created = exporting.post(
+        "/api/scripts", json={"project_id": project["id"], "title": "Ep 2", "text": SCRIPT}
+    ).json()
+    _run_to_completion(exporting, created["id"])
+
+    result = exporting.post(f"/api/scripts/{created['id']}/export").json()
+
+    # Named by project and title: `script-1` would mean nothing beside other work.
+    assert Path(result["out_dir"]) == own_folder / "UI Ep 2"
+    assert (own_folder / "UI Ep 2" / "plan.md").is_file()
+
+    payload = exporting.get(f"/api/projects/{project['id']}/media").json()
+    group = next(g for g in payload["groups"] if g["kind"] == "export")
+    wav = next(f for f in group["files"] if f["name"].endswith(".wav"))
+    assert wav["path"].startswith("@export/")
+    assert exporting.get("/api/media/file", params={"path": wav["path"]}).status_code == 200
+    assert exporting.get(f"/api/exports/{created['id']}/archive").status_code == 200
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    "attack",
+    [
+        "@export/{id}/../backend/.env",
+        "@export/{id}/../../projects/backend/.env",
+        "@export/{id}/.env",
+        "@export/{id}/sub/plan.md",
+        "@export/../backend/.env",
+        "@export/999/plan.md",
+    ],
+)
+def test_only_a_file_inside_an_export_folder_is_served_from_ones_own(
+    exporting: TestClient, attack: str
+) -> None:
+    project = exporting.post("/api/projects", json={"name": "UI", "voice_id": "v1"}).json()
+    created = exporting.post(
+        "/api/scripts", json={"project_id": project["id"], "title": "Ep", "text": SCRIPT}
+    ).json()
+    _run_to_completion(exporting, created["id"])
+    exporting.post(f"/api/scripts/{created['id']}/export")
+
+    response = exporting.get("/api/media/file", params={"path": attack.format(id=created["id"])})
+
+    assert response.status_code == 403
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("title", "folder"),
+    [("002", "002"), ("01_The_43_Billion_Decision", "001"), ("12 Angry Men", "012")],
+)
+def test_a_numbered_episode_exports_to_its_three_digit_number(
+    exporting: TestClient, own_folder: Path, title: str, folder: str
+) -> None:
+    """The "004" an episode's zip download is called, and its other folders."""
+    project = exporting.post("/api/projects", json={"name": "UI", "voice_id": "v1"}).json()
+    created = exporting.post(
+        "/api/scripts", json={"project_id": project["id"], "title": title, "text": SCRIPT}
+    ).json()
+    _run_to_completion(exporting, created["id"])
+
+    result = exporting.post(f"/api/scripts/{created['id']}/export").json()
+
+    assert Path(result["out_dir"]) == own_folder / folder
+
+
+@needs_ffmpeg
+def test_two_episodes_with_one_title_do_not_share_a_folder(
+    exporting: TestClient, own_folder: Path
+) -> None:
+    project = exporting.post("/api/projects", json={"name": "UI", "voice_id": "v1"}).json()
+    folders = []
+    for _ in range(2):
+        created = exporting.post(
+            "/api/scripts", json={"project_id": project["id"], "title": "Ep", "text": SCRIPT}
+        ).json()
+        _run_to_completion(exporting, created["id"])
+        folders.append(exporting.post(f"/api/scripts/{created['id']}/export").json()["out_dir"])
+
+    assert Path(folders[0]) == own_folder / "UI Ep"
+    assert Path(folders[1]) == own_folder / f"UI Ep ({created['id']})"

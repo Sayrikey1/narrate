@@ -19,6 +19,17 @@ HAS_FFMPEG = shutil.which("ffmpeg") is not None
 needs_ffmpeg = pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg is not installed")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_export_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's `.env` out of the tests' exports.
+
+    `NARRATE_EXPORT_DIR` there points at a real folder, and every test that
+    exported wrote an episode into it — nine of them, the first time. The
+    environment outranks `.env`, and empty means unset.
+    """
+    monkeypatch.setenv("NARRATE_EXPORT_DIR", "")
+
+
 @pytest.fixture
 def engine() -> Iterator[Engine]:
     eng = make_engine(":memory:")

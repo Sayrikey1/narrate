@@ -346,9 +346,8 @@ def export_script(
         safe_title = _safe_title(timeline.script_title, script_id)
         if slug:
             safe_title = f"{safe_title}__{slug}"
+        target = out_dir or episode_dir(session, settings, timeline, slug)
 
-    default_dir = f"script-{script_id}" + (f"-{slug}" if slug else "")
-    target = out_dir or (settings.assets_dir / "exports" / default_dir)
     target.mkdir(parents=True, exist_ok=True)
 
     # Timeline-named deliverables. Applied here rather than at generation, so a
@@ -518,8 +517,8 @@ def write_plan_only(
         timeline = build_timeline(session, script_id, gap_seconds=settings.gap_seconds)
         context = gather_context(session, script_id) if timeline.narration else PlanContext()
         body = render_plan(timeline, session, None, context)
+        path = out or episode_dir(session, settings, timeline) / "plan.md"
 
-    path = out or (settings.assets_dir / "exports" / f"script-{script_id}" / "plan.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     return path
@@ -540,8 +539,8 @@ def write_publish_pack_only(
         context = gather_publish(session, script_id)
         body = render_publish_pack(timeline, context)
         data = render_publish_json(timeline, context)
+        path = out or episode_dir(session, settings, timeline) / "publish.md"
 
-    path = out or (settings.assets_dir / "exports" / f"script-{script_id}" / "publish.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
     path.with_suffix(".json").write_text(data, encoding="utf-8")
@@ -553,6 +552,38 @@ def _piece_format(key: str) -> AudioFormat | None:
     if key in ("", "source", "same"):
         return None
     return parse_formats([key])[0]
+
+
+def episode_dir(session: Session, settings: Settings, timeline: Timeline, slug: str = "") -> Path:
+    """The folder an episode exports to.
+
+    In narrate's own assets folder, by id: nothing else lives there. In
+    `export_dir`, which sits beside other work, by the episode's number when
+    its title starts with one — "002", "01_The_43_Billion…" — written with
+    three digits, the "002" its zip download and its other folders use.
+    Otherwise by project and title. A second episode that would land in the
+    same folder gets its id added rather than writing over the first's files.
+    """
+    script_id = timeline.script_id
+    if settings.export_dir is None:
+        return (
+            settings.assets_dir / "exports" / (f"script-{script_id}" + (f"-{slug}" if slug else ""))
+        )
+    number = re.match(r"\s*(\d{1,3})(?!\d)", timeline.script_title)
+    name = (
+        number.group(1).zfill(3)
+        if number
+        else "".join(
+            c if c.isalnum() or c in "-_ " else "_"
+            for c in f"{timeline.project_name} {timeline.script_title}"
+        ).strip()[:80]
+    )
+    if slug:
+        name = f"{name} ({slug})"
+    folder = settings.export_dir / name
+    others = session.scalars(select(Export.path).where(Export.script_id != script_id)).all()
+    taken = any(Path(path).parent == folder for path in others)
+    return settings.export_dir / f"{name} ({script_id})" if taken else folder
 
 
 def _safe_title(title: str, script_id: int) -> str:
